@@ -3,6 +3,18 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-11 — 0.2.2: RDMA lanes no longer leak
+
+- Lanes of replaced or half-built links held their QP and registered ring
+  for the life of the process: after a week dodo, emu and kiwi each had
+  ~130k QPs and rhea gathered ~8k within hours of a restart, starving other
+  RDMA users. Dead lanes are now released by the expiry sweep once a 10 s
+  grace has passed (`replaced_links_release_their_lanes`).
+- `cargo test` mounts ten FUSE test clusters at once, each with 64 io_uring
+  queues: under a 1024 open-file soft limit (an ssh login) queues fail with
+  EMFILE and the tests hang. `scripts/build.sh --check` now raises the soft
+  limit to the hard one first; the daemon runs with LimitNOFILE=1048576.
+
 ## 2026-09-28 — The real cluster; transfers written directly; placing models
 
 - Installed with Homebrew from a local tap on all seven hosts

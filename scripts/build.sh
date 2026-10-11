@@ -46,6 +46,9 @@ case "${1:-}" in
     fi
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
+    # The FUSE tests mount ten clusters at once, each with 64 io_uring
+    # queues; a 1024 soft limit (an ssh login) runs out of descriptors.
+    ulimit -Sn "$(ulimit -Hn)" 2>/dev/null || true
     cargo test --workspace
     exit 0 ;;
   "") ;;
