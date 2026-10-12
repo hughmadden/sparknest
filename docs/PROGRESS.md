@@ -19,9 +19,16 @@ what is next. Keep entries short; link to benchmarks and ADRs.
   with 1–2 streams, oliver needs 4–8; oliver tuned (NIC buffers, WSL MTU
   1500); `tcp_slow_start_after_idle=0` on every host. Jumbo frames do not
   pass the LAN switching yet.
-- Next: TCP bulk lanes (parallel connections, sendfile), then the Off-grid
-  placement mode, offload to off-grid hosts, HF spread exclusion, moving a
-  host between roles.
+- TCP lanes (ADR-048): 4 authenticated connections per peer, dialled by
+  the off-grid host, answers sent with MSG_MORE + sendfile; readahead and
+  replication use them through a `Bulk` interface beside RDMA. 1.15–1.20
+  GB/s (line rate) to oliver and kakapo.
+- Placement (ADR-049): Place over fabric hosts only; an Off-grid mode in
+  the Place dialog and `nest plan --offgrid`; offload to an off-grid host;
+  HF spread downloads skip them. `nest cluster role HOST offgrid|fabric`
+  moves a host (ADR-050). `scripts/add-offgrid.sh` onboards one.
+- Next: release, fabric hosts listening on the LAN (`add-offgrid.sh
+  fabric-lan` + rolling restart), then kakapo and oliver join.
 
 ## 2026-10-11 — 0.2.2: RDMA lanes no longer leak
 

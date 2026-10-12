@@ -38,6 +38,7 @@ case "${1:-}" in
     fi
     python3 -m unittest discover -s tools/hf-fetch -p 'test_*.py'
     # The restart rule: exactly one command line, and valid sudoers syntax.
+    bash -n scripts/add-offgrid.sh
     allow=tools/allow-restart/sparknest-allow-restart
     bash -n "$allow"
     "$allow" --print ci | grep -qx "$(id -un) ALL=(root) NOPASSWD: $(command -v systemctl) restart sparknestd@ci"
