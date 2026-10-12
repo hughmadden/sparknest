@@ -38,7 +38,10 @@ Windows adapter "Ethernet 7" Receive/Transmit Buffers 4096; WSL eth0 MTU
 Tailscale adapter's 1280; a route keeps 1280 for 100.64.0.0/10);
 `.wslconfig` has `kernelCommandLine=fuse.enable_uring=1`. All LAN NICs
 support jumbo frames (atlantic max 16334, r8127 max 9194, Windows 9014),
-not enabled yet.
+but the LAN switching between oliver's PC and raptor does not pass them
+(2026-10-12: with both ends at MTU 9000, a 4000-byte don't-fragment ping
+from Windows to raptor was dropped). Everything stays at 1500 until the
+switch ports allow jumbo; a host at 9000 talking TCP to it would hang.
 
 ## Fabric
 
