@@ -21,12 +21,15 @@ off-grid host.
 |---|---|---|---|---|
 | ostrich <- raptor | 9.41 Gb/s, 0 retr | 9.41 | 9.41 | 9.41 |
 | ostrich -> raptor | 9.41, 0 retr | 9.41 | 9.41 | 9.41 |
+| kakapo <- raptor | 7.86, 162 retr | 9.41 | 9.41 | 9.39 |
+| kakapo -> raptor | 7.67, 280 retr | 7.81 | 9.41 | 9.41 |
 | oliver <- raptor | 5.14 Gb/s, 2.2k retr | 7.70 | 8.99 | 9.51, 8.8k retr |
 | oliver -> raptor | 6.49 | 6.67 | 9.31 | 9.32 |
 | oliver <- ostrich | 4.48, 2.7k retr | 6.55 | 9.18 | 9.57, 10.6k retr |
 | oliver -> ostrich | 6.70 | 8.00 | 9.32 | 9.32 |
 
-A Spark on Linux fills the link with one stream and no loss. Oliver
+ostrich fills the link with one stream and no loss; kakapo (same NIC,
+but 1.3 ms RTT against ostrich's 0.5 ms) needs two. Oliver
 needs four streams for ~9.2 Gb/s and eight for ~9.5; receiving, it drops
 packets heavily (retransmits on the sender), so single streams stall in
 congestion avoidance. Parallel streams hide the loss.
