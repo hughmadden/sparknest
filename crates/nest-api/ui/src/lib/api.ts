@@ -109,6 +109,8 @@ export interface NodeStatus {
   name: string;
   info?: NodeInfo;
   error?: string;
+  /** On the LAN only, not the RDMA fabric (ADR-047). */
+  offgrid?: boolean;
 }
 export interface Status {
   leader?: number;

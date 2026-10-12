@@ -1,8 +1,9 @@
 <script lang="ts">
-  // Where a model (or any selection) should live: on several hosts with a
-  // replica factor (1/hosts spreads it, 1 copies it everywhere), gathered on
-  // one host, or in an archive. Hosts and archives are planned and shown as
-  // an editable plan before anything moves.
+  // Where a model (or any selection) should live: on several fabric hosts
+  // with a replica factor (1/hosts spreads it, 1 copies it everywhere),
+  // gathered on one host, as full copies on off-grid hosts (on the LAN
+  // only, ADR-047), or in an archive. Placements are planned and shown as an
+  // editable plan before anything moves.
   import { get, post, type Plan, type Readiness, type HostUsage } from "../lib/api";
   import { app, startJob, singleFlight } from "../lib/state.svelte";
   import { human } from "../lib/format";
@@ -10,10 +11,11 @@
   import { portal } from "../lib/portal";
   import PlanPreview from "./PlanPreview.svelte";
 
-  type Mode = "multi" | "single" | "archive";
+  type Mode = "multi" | "single" | "offgrid" | "archive";
   let mode = $state<Mode>("multi");
   let multi = $state<string[]>([]);
   let single = $state("");
+  let picked = $state<string[]>([]);
   let store = $state("");
   let keepLive = $state(false);
   let factor = $state(1);
@@ -22,8 +24,13 @@
   let busy = $state(false);
   let stats = $state<{ hosts: Readiness[]; usage: Record<string, HostUsage> } | null>(null);
 
-  // Hosts in the cluster's order.
-  const hosts = $derived((app.status?.nodes ?? []).filter((n) => n.info).map((n) => n.name));
+  // Fabric hosts and off-grid hosts, in the cluster's order.
+  const hosts = $derived((app.status?.nodes ?? []).filter((n) => n.info && !n.offgrid).map((n) => n.name));
+  const offgrid = $derived((app.status?.nodes ?? []).filter((n) => n.offgrid).map((n) => n.name));
+  const full = (h: string) => {
+    const r = stats?.hosts.find((x) => x.host === h);
+    return !!r && r.bytes > 0 && r.missing_bytes === 0;
+  };
   const read = (h: string) => {
     const u = stats?.usage?.[h];
     return u ? u.local_bytes + u.net_bytes : 0;
@@ -50,17 +57,19 @@
     opened = placing.selector;
     mode = "multi";
     multi = [...hosts];
+    picked = [];
     factor = 1;
     plan = null;
     err = "";
     stats = null;
-    store = app.stores[0]?.name ?? "";
+    store = app.stores[0]?.name ?? offgrid[0] ?? "";
     keepLive = false;
     if (placing.selector.startsWith("hf")) {
       get<{ hosts: Readiness[]; usage: Record<string, HostUsage> }>("/v1/hf/detail?selector=" + encodeURIComponent(placing.selector))
         .then((d) => {
           stats = d;
           single = best;
+          picked = offgrid.filter(full);
         })
         .catch(() => {});
     }
@@ -78,19 +87,24 @@
   let timer: ReturnType<typeof setTimeout> | undefined;
   const makeOnce = singleFlight(async () => {
     if (!placing.open || mode === "archive") return;
-    const targets = mode === "multi" ? multi : single ? [single] : [];
-    if (!targets.length) {
+    const targets = mode === "multi" ? multi : mode === "offgrid" ? picked : single ? [single] : [];
+    if (!targets.length && mode !== "offgrid") {
       plan = null;
       return;
     }
     busy = true;
     try {
-      plan = await post<Plan>("/v1/plans", {
-        goal: "place",
-        selector: placing.selector,
-        hosts: targets,
-        factor: mode === "multi" ? k / H : 1,
-      });
+      plan = await post<Plan>(
+        "/v1/plans",
+        mode === "offgrid"
+          ? { goal: "offgrid", selector: placing.selector, hosts: targets }
+          : {
+              goal: "place",
+              selector: placing.selector,
+              hosts: targets,
+              factor: mode === "multi" ? k / H : 1,
+            },
+      );
       err = "";
     } catch (e) {
       err = (e as Error).message;
@@ -101,6 +115,7 @@
   $effect(() => {
     void mode;
     void multi.length;
+    void picked.length;
     void single;
     void k;
     if (!placing.open) return;
@@ -114,6 +129,8 @@
     plan = null;
   }
   const toggle = (h: string) => (multi = multi.includes(h) ? multi.filter((x) => x !== h) : hosts.filter((x) => x === h || multi.includes(x)));
+  const pick = (h: string) => (picked = picked.includes(h) ? picked.filter((x) => x !== h) : offgrid.filter((x) => x === h || picked.includes(x)));
+  const isHost = (name: string) => offgrid.includes(name);
 
   async function archive() {
     const label = placing.label;
@@ -136,10 +153,30 @@
       <div class="modes">
         <button class="mode" class:on={mode === "multi"} onclick={() => (mode = "multi")}><b>Multi host</b><span class="tiny muted">spread or replicate</span></button>
         <button class="mode" class:on={mode === "single"} onclick={() => (mode = "single")}><b>Single host</b><span class="tiny muted">gather it on one</span></button>
-        <button class="mode" class:on={mode === "archive"} disabled={!app.stores.length} onclick={() => (mode = "archive")}><b>Archive</b><span class="tiny muted">offload it</span></button>
+        <button class="mode" class:on={mode === "offgrid"} disabled={!offgrid.length} onclick={() => (mode = "offgrid")}><b>Off-grid</b><span class="tiny muted">full copies off the fabric</span></button>
+        <button class="mode" class:on={mode === "archive"} disabled={!app.stores.length && !offgrid.length} onclick={() => (mode = "archive")}><b>Archive</b><span class="tiny muted">offload it</span></button>
       </div>
 
-      {#if mode !== "archive"}
+      {#if mode === "offgrid"}
+        <div class="tiles">
+          {#each offgrid as h (h)}
+            <button class="tile" class:on={picked.includes(h)} onclick={() => pick(h)}>
+              <div class="row"><b>{h}</b>{#if full(h)}<span class="badge">holds it</span>{/if}</div>
+              <span class="tiny muted mono">{held(h) ? `holds ${human(held(h))}` : "holds none"}</span>
+              <span class="tiny muted mono">{human(free(h))} free</span>
+              <span class="use" title="{human(read(h))} read here in 30 days"><i style="width:{useBar(h) * 100}%"></i></span>
+            </button>
+          {/each}
+        </div>
+        <div class="tiny muted legend">Each host picked keeps a full copy and reads it from its own disk; copies on hosts left unpicked go (never the last one). Fabric hosts are left as they are.</div>
+        {#if err}<div class="small" style="color:var(--bad)">{err}</div>{/if}
+        {#if plan}
+          <div class="preview" class:dim={busy}>
+            <div class="row"><h3>Plan</h3><span class="small muted">uncheck anything to leave it as it is; nothing moves until you apply</span></div>
+            <PlanPreview bind:plan onapplied={close} />
+          </div>
+        {:else if busy}<div class="small muted">planning…</div>{/if}
+      {:else if mode !== "archive"}
         <div class="tiles">
           {#each hosts as h (h)}
             {@const on = mode === "multi" ? multi.includes(h) : single === h}
@@ -179,9 +216,21 @@
               <span class="tiny muted mono">{g ? `${human(g.free_bytes)} free` : "unreachable"}</span>
             </button>
           {/each}
+          {#each offgrid as h (h)}
+            <button class="tile" class:on={store === h} onclick={() => (store = h)}>
+              <b>⌂ {h}</b>
+              <span class="tiny muted mono">off-grid · {human(free(h))} free</span>
+            </button>
+          {/each}
         </div>
-        <label class="check small"><input type="checkbox" bind:checked={keepLive} /> keep the copies on hosts too</label>
-        <div class="tiny muted">{keepLive ? "Copies it into the archive; hosts keep theirs." : "Copies it into the archive, then removes the hosts' copies. Reads stream through a gateway; place it back on hosts any time."}</div>
+        <label class="check small"><input type="checkbox" bind:checked={keepLive} /> keep the copies on fabric hosts too</label>
+        <div class="tiny muted">
+          {#if isHost(store)}
+            {keepLive ? `Copies it onto ${store}; fabric hosts keep theirs.` : `Copies it onto ${store}, then removes the fabric hosts' copies: ${store} keeps it, and the others read it from there over the LAN.`}
+          {:else}
+            {keepLive ? "Copies it into the archive; hosts keep theirs." : "Copies it into the archive, then removes the fabric hosts' copies. Reads stream through a gateway; place it back on hosts any time."}
+          {/if}
+        </div>
         <div class="row end"><button class="btn primary" disabled={!store} onclick={archive}>{keepLive ? "Copy" : "Offload"} to {store}</button></div>
       {/if}
     </div>
@@ -193,7 +242,7 @@
   .dlg { width: min(860px, 100%); max-height: calc(100vh - 32px); overflow: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; background: rgba(8, 16, 34, 0.82); animation: rise 0.2s ease-out; }
   h3 { margin: 0; }
   .spark { color: var(--spark); }
-  .modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .modes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
   .mode { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; padding: 10px 14px; border-radius: 12px; border: 1px solid var(--line); background: rgba(12, 26, 52, 0.45); cursor: pointer; text-align: left; }
   .mode:hover:not(:disabled) { border-color: var(--line-hi); }
   .mode.on { border-color: var(--spark); box-shadow: var(--glow); background: rgba(56, 232, 255, 0.1); }
@@ -213,5 +262,6 @@
   .preview { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--line); padding-top: 12px; }
   .dim { opacity: 0.6; transition: opacity 0.2s; }
   .end { justify-content: flex-end; }
-  @media (max-width: 600px) { .modes { grid-template-columns: 1fr; } }
+  @media (max-width: 760px) { .modes { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 420px) { .modes { grid-template-columns: 1fr; } }
 </style>

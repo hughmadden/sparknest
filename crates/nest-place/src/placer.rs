@@ -89,6 +89,9 @@ pub struct NodeStatus {
     pub name: String,
     pub info: Option<NodeInfo>,
     pub error: Option<String>,
+    /// On the LAN only (ADR-047).
+    #[serde(default)]
+    pub offgrid: bool,
 }
 
 /// Per-host readiness of a selection.
@@ -697,6 +700,7 @@ impl Placer {
             .into_iter()
             .map(|(h, r)| NodeStatus {
                 node: h.node,
+                offgrid: h.offgrid,
                 name: h.name,
                 error: r.as_ref().err().map(|e| e.to_string()),
                 info: r.ok(),

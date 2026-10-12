@@ -21,15 +21,17 @@
   let spread = $state(true);
   let chosen = $state<string[]>([]);
 
-  // In the cluster's order.
-  const hosts = $derived(
+  // In the cluster's order. A spread goes over fabric hosts only; one host
+  // may be off-grid (ADR-049).
+  const all = $derived(
     (app.status?.nodes ?? [])
       .filter((n) => n.info?.serving)
-      .map((n) => ({ name: n.name, free: n.info?.free_bytes ?? 0 })),
+      .map((n) => ({ name: n.name, free: n.info?.free_bytes ?? 0, offgrid: !!n.offgrid })),
   );
+  const hosts = $derived(all.filter((h) => !h.offgrid));
   const roomiest = $derived([...hosts].sort((a, b) => b.free - a.free)[0]?.name ?? "");
   $effect(() => {
-    if (open && !hosts.some((h) => h.name === host) && hosts.length) host = roomiest;
+    if (open && !all.some((h) => h.name === host) && hosts.length) host = roomiest;
   });
   $effect(() => {
     if (open && !chosen.length && hosts.length) chosen = hosts.map((h) => h.name);
@@ -78,7 +80,7 @@
   }
 
   const free = $derived(
-    spread ? hosts.filter((h) => chosen.includes(h.name)).reduce((a, h) => a + h.free, 0) : (hosts.find((h) => h.name === host)?.free ?? 0),
+    spread ? hosts.filter((h) => chosen.includes(h.name)).reduce((a, h) => a + h.free, 0) : (all.find((h) => h.name === host)?.free ?? 0),
   );
   const fits = $derived(!size || free > size.missing_bytes);
 
@@ -149,7 +151,7 @@
             <div class="row small">
               <span class="muted">to</span>
               <select bind:value={host}>
-                {#each hosts as h}<option value={h.name}>{h.name} ({human(h.free)} free)</option>{/each}
+                {#each all as h}<option value={h.name}>{h.name}{h.offgrid ? " · off-grid" : ""} ({human(h.free)} free)</option>{/each}
               </select>
             </div>
           {/if}
