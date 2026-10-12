@@ -3,7 +3,7 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-## 2026-10-12 — Off-grid hosts, part 1 (ADR-047)
+## 2026-10-12 — 0.3.0: off-grid hosts (ADR-047…050)
 
 - Hosts on the LAN only (kakapo, oliver behind WSL NAT) join as Raft
   learners with `role = "offgrid"`: they dial the fabric hosts at pinned
