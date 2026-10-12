@@ -12,7 +12,7 @@
 //! This carries Raft traffic, write forwarding and data-service control
 //! messages. Bulk file data uses `nest-fabric`.
 
-mod auth;
+pub mod auth;
 mod conn;
 mod filter;
 

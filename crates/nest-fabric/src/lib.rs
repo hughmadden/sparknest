@@ -9,6 +9,7 @@ pub mod iostats;
 mod pool;
 pub mod rail;
 pub(crate) mod sys;
+pub mod tcp;
 pub use sys::nf_wc as Completion;
 pub use sys::{
     NF_OP_RECV as OP_RECV, NF_OP_RECV_IMM as OP_RECV_IMM, NF_OP_SEND as OP_SEND,

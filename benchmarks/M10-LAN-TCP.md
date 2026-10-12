@@ -79,3 +79,31 @@ into WSL is limited by per-packet work in the Hyper-V path, not drops.
   bandwidth-delay product at 1.3 ms.
 - `net.ipv4.tcp_slow_start_after_idle=0` on every host (root, sysctl):
   it cannot be set per socket.
+
+## TCP lanes (`nest-fabric/examples/lanes_bench.rs`, 2026-10-12)
+
+raptor serves a 4 GiB file from page cache with `sendfile`; the off-grid
+host dials the lanes and reads it in 4 MiB chunks (second of two rounds).
+oliver as tuned above; kakapo stock.
+
+| Reader | lanes | in flight | GB/s | Gb/s |
+|---|---|---|---|---|
+| oliver | 1 | 16 | 0.71 | 5.7 |
+| oliver | 2 | 16 | 0.88 | 7.0 |
+| oliver | 4 | 16 | 1.15 | 9.2 |
+| oliver | 8 | 16 | 1.18 | 9.5 |
+| kakapo | 1 | 16 | 0.96 | 7.7 |
+| kakapo | 2 | 16 | 0.95 | 7.6 |
+| kakapo | 4 | 16 | 1.18 | 9.4 |
+| kakapo | 8 | 16 | 1.18 | 9.4 |
+| oliver | 4 | 2 | 0.98 | 7.8 |
+| oliver | 4 | 4 | 1.07 | 8.6 |
+| oliver | 4 | 8 | 1.20 | 9.6 |
+| kakapo | 4 | 2 | 1.07 | 8.6 |
+| kakapo | 4 | 4 | 1.16 | 9.3 |
+| kakapo | 4 | 8 | 1.17 | 9.4 |
+
+Defaults: 4 lanes per peer, and at least 8 chunks (32 MiB) in flight,
+which the readahead window (16 chunks) and replication window (16) give.
+That is line rate on both kinds of off-grid host; 8 lanes add ~3% on
+oliver only.

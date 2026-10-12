@@ -11,7 +11,7 @@ links = "nf_shim"
 nest-types.workspace = true
 nest-rpc.workspace = true
 libc.workspace = true
-nix = { workspace = true, features = ["net"] }
+nix = { workspace = true, features = ["net", "socket", "zerocopy"] }
 parking_lot.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -27,3 +27,4 @@ cc = "1"
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+tempfile.workspace = true

@@ -1076,6 +1076,7 @@ dependencies = [
  "parking_lot",
  "rand 0.9.5",
  "serde",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
