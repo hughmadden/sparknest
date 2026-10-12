@@ -1275,3 +1275,23 @@ connection's first chunk.
    remains the fallback.
 4. **Jumbo frames** stay off: the LAN switching drops frames over 1500
    bytes (ENVIRONMENT.md).
+
+## ADR-049 — Placing models on off-grid hosts (2026-10-12)
+
+**Decision.**
+1. **Place** (ADR-043) spreads over fabric hosts only: an empty host list
+   and `@all` mean the fabric hosts, an off-grid host named there is
+   refused, and off-grid copies are neither counted toward the factor nor
+   removed by it (as archive copies).
+2. **Off-grid** is a fourth placement mode beside Multi host, Single host
+   and Archive: the off-grid hosts picked (0..N, `@offgrid` for all) each
+   get a full copy of the selection where it fits; the other off-grid
+   hosts' copies are removed, unless a rule keeps them or no other copy
+   would remain. Fabric hosts are left as they are. A one-shot plan,
+   edited and applied like Place; rules remain the way to force copies.
+3. **Offload** accepts an off-grid host as its destination. After the copy
+   lands there, the fabric hosts' copies are removed; copies on other
+   off-grid hosts stay (they are placed on purpose). The copy on the
+   off-grid host counts like any other, so this is not a deletion.
+4. **Hugging Face downloads** spread over fabric hosts only; an off-grid
+   host is a valid single `--host`.

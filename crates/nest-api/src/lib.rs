@@ -1436,6 +1436,13 @@ async fn make_plan(State(api): State<Api>, Json(r): Json<PlanReq>) -> R<serde_js
                             factor,
                             hub: api.hub.clone(),
                         },
+                        PlanReq::Goal(nest_place::plan::Goal::Offgrid {
+                            selector, hosts, ..
+                        }) => nest_place::plan::Goal::Offgrid {
+                            selector: api.selector_string(&selector),
+                            hosts,
+                            hub: api.hub.clone(),
+                        },
                         PlanReq::Goal(g) => g,
                         PlanReq::Free { free, archives } => {
                             nest_place::plan::Goal::Free { free, archives }

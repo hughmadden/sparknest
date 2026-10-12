@@ -249,3 +249,122 @@ async fn offgrid_data_goes_over_tcp_lanes_both_ways() {
         "fabric host did not use lanes"
     );
 }
+
+async fn wait_job(c: &TestCluster, id: u64) -> nest_place::placer::ClusterJob {
+    c.eventually("job finished", Duration::from_secs(30), |c| {
+        c.node(1).placer.job(id).is_some_and(|j| j.finished)
+    })
+    .await;
+    c.node(1).placer.job(id).unwrap()
+}
+
+fn holders(c: &TestCluster, f: FileId) -> Vec<u64> {
+    let r = c.node(1).meta.open_reader().unwrap();
+    let mut v: Vec<u64> = nest_meta::query::replicas(&r, f)
+        .unwrap()
+        .iter()
+        .map(|r| r.store.0)
+        .collect();
+    v.sort();
+    v
+}
+
+/// The Off-grid mode puts full copies on the off-grid hosts picked and
+/// removes them from the others; Place never counts, uses or removes them;
+/// offloading to an off-grid host drops the fabric hosts' copies, which is
+/// not a deletion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn offgrid_placement_place_and_offload() {
+    use nest_place::plan::{Goal, Step};
+    let c = with_offgrid(3, 4).await;
+    let p = c.node(1).placer.clone();
+    let v = c.node(1).vfs.clone();
+    let hosts = p.nodes().unwrap();
+    assert_eq!(
+        hosts
+            .iter()
+            .filter(|h| h.offgrid)
+            .map(|h| h.name.as_str())
+            .collect::<Vec<_>>(),
+        ["n4"]
+    );
+    let dir = v.mkdir(FileId::ROOT, b"m", 0o755).await.unwrap().id;
+    let mut files = Vec::new();
+    for i in 0..3u8 {
+        let (a, fh, _) = v
+            .create(dir, format!("part{i}").as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        v.write(fh, 0, vec![i; 1 << 20]).await.unwrap();
+        v.release(fh, None).await;
+        files.push(a.id);
+    }
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        files.iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    c.converge().await;
+
+    // Off-grid: a full copy on n4, nothing removed from fabric hosts.
+    let offgrid = |hosts: &[&str]| Goal::Offgrid {
+        selector: "/m".into(),
+        hosts: hosts.iter().map(|h| h.to_string()).collect(),
+        hub: "/hub".into(),
+    };
+    let plan = p.plan(offgrid(&["n4"])).await.unwrap();
+    assert!(plan.feasible, "{plan:?}");
+    assert!(
+        matches!(&plan.steps[..], [Step::Replicate { host, copies, .. }] if host == "n4" && copies.len() == 3)
+    );
+    let job = wait_job(&c, p.apply_plan(plan.id).await.unwrap()).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    for f in &files {
+        assert_eq!(holders(&c, *f), [1, 4]);
+    }
+    // Fabric hosts are refused as off-grid targets, and off-grid as Place targets.
+    assert!(p.plan(offgrid(&["n2"])).await.is_err());
+    let place = |hosts: &[&str], factor: f64| Goal::Place {
+        selector: "/m".into(),
+        hosts: hosts.iter().map(|h| h.to_string()).collect(),
+        factor,
+        hub: "/hub".into(),
+    };
+    assert!(p.plan(place(&["n4"], 1.0)).await.is_err());
+
+    // Place over every (fabric) host, one copy each: n4 is neither a
+    // target nor a source of removals, and keeps its copies.
+    let plan = p.plan(place(&[], 1.0 / 3.0)).await.unwrap();
+    assert!(
+        plan.steps.iter().all(|s| !matches!(s, Step::Replicate { host, .. } | Step::Evict { host, .. } if host == "n4")),
+        "{plan:?}"
+    );
+    let job = wait_job(&c, p.apply_plan(plan.id).await.unwrap()).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    for f in &files {
+        let h = holders(&c, *f);
+        assert!(h.contains(&4) && h.len() == 2, "{h:?}");
+    }
+
+    // Offload to n4: the fabric hosts' copies go, n4's stays, files read on.
+    let sel = nest_place::Selector::parse("/m", "/hub").unwrap();
+    let job = wait_job(&c, p.offload(sel, "n4".into(), 2).await.unwrap()).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    for (i, f) in files.iter().enumerate() {
+        assert_eq!(holders(&c, *f), [4]);
+        assert_eq!(read_all(&c, 2, *f).await, vec![i as u8; 1 << 20]);
+    }
+
+    // Off-grid copies removed everywhere: never the only copy.
+    let plan = p.plan(offgrid(&[])).await.unwrap();
+    assert!(plan.steps.is_empty(), "{plan:?}");
+    assert!(
+        plan.notes.iter().any(|n| n.contains("only copy")),
+        "{plan:?}"
+    );
+}

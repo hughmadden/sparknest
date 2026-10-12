@@ -161,6 +161,11 @@ enum Cmd {
         /// 1 (everywhere); a fraction like 2/7 or a number (default 1).
         #[arg(long, requires = "place")]
         factor: Option<String>,
+        /// Keep a full copy of a selection on exactly the off-grid hosts
+        /// given with --host (none: no off-grid copies); copies on other
+        /// off-grid hosts go, never the last one. Fabric hosts are untouched.
+        #[arg(long, value_name = "SELECTOR", conflicts_with_all = ["free", "tidy", "speedup", "consolidate", "place"])]
+        offgrid: Option<String>,
         /// Hosts or @groups for --tidy / --speedup (default: all).
         #[arg(long = "host")]
         hosts: Vec<String>,
@@ -302,6 +307,9 @@ Examples:
   Spread a model over three hosts, one copy of each file; or everywhere:
     nest plan --place hf:Qwen/Qwen3-8B --host dodo --host kiwi --host emu --factor 1/3
     nest plan --place hf:Qwen/Qwen3-8B
+  A full copy on off-grid hosts (kakapo and oliver), or on none of them:
+    nest plan --offgrid hf:Qwen/Qwen3-8B --host kakapo --host oliver
+    nest plan --offgrid hf:Qwen/Qwen3-8B
   Edit a plan before applying it: leave a model or one host out:
     nest plan show 1234567 --files
     nest plan skip 1234567 --host dodo
@@ -1258,11 +1266,14 @@ async fn main() -> Result<()> {
             consolidate,
             place,
             factor,
+            offgrid,
             hosts,
             min,
             keep_free,
         } => {
-            let body = if let Some(sel) = place {
+            let body = if let Some(sel) = offgrid {
+                json!({ "goal": "offgrid", "selector": abspath(sel), "hosts": hosts })
+            } else if let Some(sel) = place {
                 let factor = match factor.as_deref() {
                     None => 1.0,
                     Some(f) => match f.split_once('/') {

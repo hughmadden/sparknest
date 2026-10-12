@@ -17,6 +17,10 @@ use std::time::Duration;
 pub struct HostRef {
     pub node: NodeId,
     pub name: String,
+    /// On the LAN only, not the fabric (ADR-047): never part of a Place
+    /// spread or `@all`.
+    #[serde(default)]
+    pub offgrid: bool,
 }
 
 /// Where copies go: a node's live store or an archive store, and the node
@@ -290,6 +294,7 @@ impl Placer {
             .filter_map(|s| s.node.map(|n| (n, s.name)))
             .collect();
         let m = self.vfs.data().meta().metrics().membership_config;
+        let offgrid = self.vfs.offgrid_hosts();
         let mut out: Vec<HostRef> = m
             .nodes()
             .map(|(id, _)| {
@@ -300,6 +305,7 @@ impl Placer {
                         .get(&n)
                         .cloned()
                         .unwrap_or_else(|| format!("node{id}")),
+                    offgrid: offgrid.contains(&n),
                 }
             })
             .collect();
@@ -313,7 +319,7 @@ impl Placer {
         let mut out = Vec::new();
         for n in names {
             match n.strip_prefix('@') {
-                Some("all") => out.push(n.clone()),
+                Some("all" | "offgrid") => out.push(n.clone()),
                 Some(g) => match groups.iter().find(|(name, _)| name == g) {
                     Some((_, members)) => out.extend(members.iter().cloned()),
                     None => return Err(NestError::Invalid(format!("unknown group {n:?}"))),
@@ -329,8 +335,13 @@ impl Placer {
         let all = self.nodes()?;
         let mut out: Vec<HostRef> = Vec::new();
         for h in &hosts {
-            if h == "@all" {
-                out.extend(all.iter().cloned());
+            // @all: the fabric hosts; @offgrid: the hosts off it.
+            if h == "@all" || h == "@offgrid" {
+                out.extend(
+                    all.iter()
+                        .filter(|x| x.offgrid == (h == "@offgrid"))
+                        .cloned(),
+                );
                 continue;
             }
             match all
@@ -1375,14 +1386,17 @@ impl Placer {
             (Some(r), _) if !is_sha(r) => Some(r.clone()),
             _ => None,
         };
-        // Where: the hosts named, else every serving one; room is free space
-        // above the margin spread imports keep.
+        // Where: the hosts named, else every serving fabric host (off-grid
+        // hosts only when named); room is free space above the margin
+        // spread imports keep.
         let status = self.status().await?;
+        let offgrid = self.vfs.offgrid_hosts();
         let wanted: Vec<NodeId> = if hosts.is_empty() {
             status
                 .iter()
                 .filter(|s| s.info.as_ref().is_some_and(|i| i.serving))
                 .map(|s| s.node)
+                .filter(|n| !offgrid.contains(n))
                 .collect()
         } else {
             self.resolve_hosts(&hosts)?
@@ -1939,9 +1953,15 @@ impl Placer {
     ) -> NestResult<u64> {
         let m = self.manifest(&sel).await?;
         let targets = self.resolve_targets(std::slice::from_ref(&store)).await?;
-        if targets.len() != 1 || !nest_data::is_archive(targets[0].store) {
+        // An archive store, or an off-grid host (ADR-047): either way the
+        // copy there lets the fabric hosts drop theirs.
+        let offgrid = self.vfs.offgrid_hosts();
+        if targets.len() != 1
+            || !(nest_data::is_archive(targets[0].store)
+                || offgrid.contains(&NodeId(targets[0].store.0)))
+        {
             return Err(NestError::Invalid(format!(
-                "{store:?} is not an archive store"
+                "{store:?} is neither an archive store nor an off-grid host"
             )));
         }
         let id = self.next_job.fetch_add(1, Ordering::Relaxed);
@@ -1971,7 +1991,14 @@ impl Placer {
                     .filter(|e| e.stable)
                     .map(|e| e.file)
                     .collect();
-                let nodes: Vec<String> = me.nodes()?.into_iter().map(|h| h.name).collect();
+                // The fabric hosts' copies go; off-grid hosts keep theirs
+                // (they are placed on purpose, with the Off-grid mode).
+                let nodes: Vec<String> = me
+                    .nodes()?
+                    .into_iter()
+                    .filter(|h| !h.offgrid)
+                    .map(|h| h.name)
+                    .collect();
                 me.evict_files(&files, &nodes).await?;
                 Ok(())
             }

@@ -212,13 +212,23 @@ pub enum Goal {
     Place {
         /// A path, or hf:org/name.
         selector: String,
-        /// Hosts or @groups it goes on; every host when empty.
+        /// Hosts or @groups it goes on; every fabric host when empty.
         #[serde(default)]
         hosts: Vec<String>,
         /// Share of those hosts each file is on: 1/hosts (spread) to 1
         /// (everywhere).
         #[serde(default = "default_factor")]
         factor: f64,
+        #[serde(default)]
+        hub: String,
+    },
+    /// Which off-grid hosts hold a full copy (ADR-047): copies are added on
+    /// the hosts named and removed from the other off-grid hosts (never the
+    /// last copy anywhere). Fabric hosts are left as they are.
+    Offgrid {
+        selector: String,
+        #[serde(default)]
+        hosts: Vec<String>,
         #[serde(default)]
         hub: String,
     },
@@ -322,6 +332,8 @@ struct World {
     dest: Vec<ArchiveTarget>,
     blocked: Vec<String>,
     notes: Vec<String>,
+    /// Hosts off the fabric (ADR-047).
+    offgrid: HashSet<NodeId>,
 }
 
 impl World {
@@ -360,6 +372,7 @@ impl World {
             dest: Vec::new(),
             blocked: Vec::new(),
             notes: Vec::new(),
+            offgrid: nodes.iter().filter(|h| h.offgrid).map(|h| h.node).collect(),
         };
         w.archives(placer, archives).await?;
         Ok(w)
@@ -515,9 +528,15 @@ fn ago(ms: u64) -> String {
 }
 
 /// Resolve hosts/@groups to nodes; every node when `names` is empty.
+/// The hosts `names` resolve to; every fabric host when empty.
 fn scope(placer: &Placer, names: &[String]) -> NestResult<Vec<NodeId>> {
     Ok(if names.is_empty() {
-        placer.nodes()?.into_iter().map(|h| h.node).collect()
+        placer
+            .nodes()?
+            .into_iter()
+            .filter(|h| !h.offgrid)
+            .map(|h| h.node)
+            .collect()
     } else {
         placer
             .resolve_hosts(names)?
@@ -578,7 +597,38 @@ pub async fn make(placer: &Placer, goal: Goal) -> NestResult<Plan> {
             let m = placer.manifest(&sel).await?;
             let w = World::gather(placer, &[], nest_data::usage::KEEP_DAYS).await?;
             let targets = scope(placer, hosts)?;
+            if let Some(n) = targets.iter().find(|n| w.offgrid.contains(n)) {
+                return Err(NestError::Invalid(format!(
+                    "{} is off-grid: Place spreads over fabric hosts; use the Off-grid mode for it",
+                    w.host(*n)
+                )));
+            }
             make_place(w, goal.clone(), &m, targets, *factor)
+        }
+        Goal::Offgrid {
+            selector,
+            hosts,
+            hub,
+        } => {
+            let sel = Selector::parse(selector, hub).map_err(NestError::Invalid)?;
+            let m = placer.manifest(&sel).await?;
+            let w = World::gather(placer, &[], 0).await?;
+            let picked = if hosts.is_empty() {
+                Vec::new()
+            } else {
+                placer
+                    .resolve_hosts(hosts)?
+                    .into_iter()
+                    .map(|h| h.node)
+                    .collect()
+            };
+            if let Some(n) = picked.iter().find(|n| !w.offgrid.contains(n)) {
+                return Err(NestError::Invalid(format!(
+                    "{} is on the fabric: use Place for it",
+                    w.host(*n)
+                )));
+            }
+            make_offgrid(w, goal.clone(), &m, picked)
         }
     }
 }
@@ -1108,9 +1158,10 @@ fn make_place(
     let total: u64 = entries.iter().map(|e| e.size).sum();
     // Each host's even share of the bytes to hold.
     let share = ((total as u128 * k as u128) / h as u128) as u64;
-    // Who holds which generation now (live stores).
+    // Who holds which generation now (live stores; off-grid copies are
+    // neither counted nor removed here, like archive copies).
     let mut holders: HashMap<(FileId, Generation), Vec<NodeId>> = HashMap::new();
-    for (n, v) in &w.copies_on {
+    for (n, v) in w.copies_on.iter().filter(|(n, _)| !w.offgrid.contains(n)) {
         for c in v {
             holders.entry((c.file, c.generation)).or_default().push(*n);
         }
@@ -1260,6 +1311,161 @@ fn make_place(
     let mut rows: Vec<NodeId> = w.name_of.keys().copied().collect();
     rows.sort();
     let rows = w.host_rows(rows.into_iter().map(|n| (n, 0)));
+    Ok(w.finish(goal, rows, steps))
+}
+
+/// Off-grid copies of a selection on exactly the `picked` off-grid hosts:
+/// added where missing (if they fit), removed from the others unless a
+/// rule keeps them there or no other copy would remain.
+fn make_offgrid(
+    mut w: World,
+    goal: Goal,
+    m: &crate::selector::Manifest,
+    picked: Vec<NodeId>,
+) -> NestResult<Plan> {
+    let mut offgrid: Vec<NodeId> = w.offgrid.iter().copied().collect();
+    offgrid.sort();
+    if offgrid.is_empty() {
+        return Err(NestError::Invalid("there are no off-grid hosts".into()));
+    }
+    let mut seen = HashSet::new();
+    let mut entries: Vec<&crate::selector::Entry> = m
+        .entries
+        .iter()
+        .filter(|e| e.stable && seen.insert(e.file))
+        .collect();
+    let skipped = m.entries.iter().filter(|e| !e.stable).count();
+    if skipped > 0 {
+        w.notes.push(format!(
+            "{skipped} files are being written and are left as they are"
+        ));
+    }
+    entries.sort_by(|a, b| b.size.cmp(&a.size).then(a.file.cmp(&b.file)));
+    let mut holders: HashMap<(FileId, Generation), Vec<NodeId>> = HashMap::new();
+    for (n, v) in &w.copies_on {
+        for c in v {
+            holders.entry((c.file, c.generation)).or_default().push(*n);
+        }
+    }
+    let margin = |w: &World, n: NodeId| -> u64 {
+        (64u64 << 30).max(w.total.get(&n).copied().unwrap_or(0) / 20)
+    };
+    let mut add: BTreeMap<NodeId, Vec<Copy>> = BTreeMap::new();
+    let mut drop: BTreeMap<NodeId, Vec<Copy>> = BTreeMap::new();
+    let (mut short_files, mut short_bytes) = (0u64, 0u64);
+    let (mut sole, mut sole_bytes) = (0u64, 0u64);
+    let mut kept: HashMap<String, u64> = HashMap::new();
+    for e in &entries {
+        let held = holders
+            .get(&(e.file, e.generation))
+            .cloned()
+            .unwrap_or_default();
+        let mut gets: Vec<NodeId> = Vec::new();
+        for &n in &picked {
+            if held.contains(&n) {
+                gets.push(n);
+                continue;
+            }
+            let room = w.projected.get(&n).copied().unwrap_or(0);
+            if room < e.size + margin(&w, n) {
+                short_files += 1;
+                short_bytes += e.size;
+                continue;
+            }
+            *w.projected.entry(n).or_default() -= e.size;
+            gets.push(n);
+            add.entry(n).or_default().push(Copy::new(
+                e.file,
+                e.generation,
+                e.size,
+                e.path.clone(),
+                "off-grid copy".into(),
+            ));
+        }
+        // Copies anywhere (archives included), less those removed so far.
+        let mut left = w.count.get(&(e.file, e.generation)).copied().unwrap_or(0)
+            + gets.iter().filter(|n| !held.contains(n)).count();
+        for &n in held
+            .iter()
+            .filter(|n| w.offgrid.contains(n) && !picked.contains(n))
+        {
+            if let Some(rule) = w.required(e.file, n) {
+                *kept
+                    .entry(format!("{}: rule {rule:?}", w.host(n)))
+                    .or_default() += e.size;
+                continue;
+            }
+            if left <= 1 {
+                sole += 1;
+                sole_bytes += e.size;
+                continue;
+            }
+            left -= 1;
+            let keeper = held
+                .iter()
+                .chain(gets.iter())
+                .copied()
+                .find(|k| *k != n && !(w.offgrid.contains(k) && !picked.contains(k)));
+            let mut c = Copy::new(
+                e.file,
+                e.generation,
+                e.size,
+                e.path.clone(),
+                match keeper {
+                    Some(k) => format!("kept on {}", w.host(k)),
+                    None => "kept in an archive".into(),
+                },
+            );
+            c.keeper = keeper;
+            drop.entry(n).or_default().push(c);
+        }
+    }
+    let names: Vec<String> = picked.iter().map(|n| w.host(*n)).collect();
+    w.notes.push(if names.is_empty() {
+        "no off-grid copies".into()
+    } else {
+        format!("a full copy on {}", names.join(", "))
+    });
+    if short_files > 0 {
+        w.blocked.push(format!(
+            "{short_files} files ({}) do not fit on the off-grid hosts picked",
+            human(short_bytes)
+        ));
+    }
+    if sole > 0 {
+        w.notes.push(format!(
+            "{sole} files ({}) stay where they are: an off-grid host holds their only copy",
+            human(sole_bytes)
+        ));
+    }
+    let mut kept: Vec<_> = kept.into_iter().collect();
+    kept.sort();
+    for (who, b) in kept {
+        let (host, rule) = who.split_once(": ").unwrap_or((&who, ""));
+        w.notes
+            .push(format!("{host}: {} stays, {rule} keeps it there", human(b)));
+    }
+    let mut steps = Vec::new();
+    for (n, copies) in add {
+        steps.push(Step::Replicate {
+            host: w.host(n),
+            node: n,
+            bytes: copies.iter().map(|c| c.size).sum(),
+            copies,
+        });
+    }
+    for (n, copies) in drop {
+        let b: u64 = copies.iter().map(|c| c.size).sum();
+        *w.projected.entry(n).or_default() += b;
+        steps.push(Step::Evict {
+            host: w.host(n),
+            node: n,
+            bytes: b,
+            copies,
+            requires: None,
+        });
+    }
+    let rows = w.host_rows(offgrid.into_iter().map(|n| (n, 0)));
     Ok(w.finish(goal, rows, steps))
 }
 
