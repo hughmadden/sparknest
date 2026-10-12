@@ -68,6 +68,23 @@ pub struct NodeSection {
     /// filesystem for metadata and the Raft log (writes past it get ENOSPC).
     #[serde(default = "default_reserve_gib")]
     pub data_reserve_gib: u64,
+    /// `fabric` (default) or `offgrid`: a host reaching the cluster over
+    /// the LAN only (ADR-047). It joins as a learner, dials the members
+    /// listed here at their LAN addresses and keeps those connections
+    /// open, and reads its own copies first.
+    #[serde(default)]
+    pub role: Role,
+}
+
+/// Where a host sits (ADR-047).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// On the RDMA fabric; votes.
+    #[default]
+    Fabric,
+    /// LAN only; a Raft learner that dials out.
+    Offgrid,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -206,6 +223,23 @@ impl Config {
         if self.node.id.0 == 0 {
             bail!("node.id must be non-zero");
         }
+        if self.node.role == Role::Offgrid {
+            if self
+                .cluster
+                .members
+                .iter()
+                .any(|m| m.id == self.node.id && m.voter)
+            {
+                bail!(
+                    "an off-grid host (node.role = \"offgrid\") cannot be a voter: set voter = false"
+                );
+            }
+            if !self.cluster.members.iter().any(|m| m.id != self.node.id) {
+                bail!(
+                    "an off-grid host needs the fabric hosts in cluster.members, at their LAN addresses"
+                );
+            }
+        }
         // sockaddr_un holds 108 bytes including the terminating NUL.
         let sock = self.api_socket();
         if sock.as_os_str().len() >= 108 {
@@ -225,6 +259,20 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offgrid_sample_parses_and_offgrid_hosts_cannot_vote() {
+        let text = include_str!("../../../packaging/config/node-offgrid.toml.sample");
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.node.role, Role::Offgrid);
+        let voting = text.replace(
+            r#"addr = "172.22.2.7:7400", voter = false"#,
+            r#"addr = "172.22.2.7:7400""#,
+        );
+        let cfg: Config = toml::from_str(&voting).unwrap();
+        assert!(cfg.validate().is_err());
+    }
 
     #[test]
     fn sample_config_parses() {

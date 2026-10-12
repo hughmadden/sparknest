@@ -1,0 +1,36 @@
+# sparknest node configuration for an off-grid host (ADR-047): on the LAN
+# only, not on the RDMA fabric. It joins as a non-voting learner and dials
+# the fabric hosts at their LAN addresses; they never dial it, so it may sit
+# behind NAT (WSL2) with no inbound port open.
+#
+# Before its first start, add it from any fabric host (no address: it dials in):
+#   nest cluster add 8 --offgrid
+# Fabric hosts must listen on the LAN too: listen = "0.0.0.0:7400" in theirs.
+
+[node]
+id = 8
+name = "kakapo"
+role = "offgrid"
+state_dir = "/srv/sparknest"
+mountpoint = "/mnt/sparknest"
+listen = "0.0.0.0:7400"
+api_listen = "0.0.0.0:7401"
+data_reserve_gib = 4
+
+[cluster]
+name = "sparknest"
+secret_file = "/srv/sparknest/cluster.secret"
+# Every fabric host at its LAN address, and this host as a learner.
+members = [
+  { id = 1, name = "raptor",  addr = "172.22.2.12:7400" },
+  { id = 2, name = "ostrich", addr = "172.22.2.1:7400" },
+  { id = 8, name = "kakapo",  addr = "172.22.2.7:7400", voter = false },
+]
+
+[fuse]
+allow_other = true
+ttl_ms = 1000
+io_uring = true   # FUSE over io_uring when the kernel has fuse.enable_uring=1
+
+[hf]
+home = "/hf-home"

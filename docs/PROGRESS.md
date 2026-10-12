@@ -3,6 +3,26 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-12 — Off-grid hosts, part 1 (ADR-047)
+
+- Hosts on the LAN only (kakapo, oliver behind WSL NAT) join as Raft
+  learners with `role = "offgrid"`: they dial the fabric hosts at pinned
+  LAN addresses and every control connection now carries requests both
+  ways, so nothing needs to reach them inbound. They never vote, never
+  seed a re-found, read their own copies first and never spread reads;
+  fabric hosts rank them after fabric holders and leave them out of
+  spreads. `nest cluster add ID --offgrid`; sample config in
+  `packaging/config/node-offgrid.toml.sample`. Fencing stays cluster-wide.
+- RDMA link setup backs off after a failure (1 s doubling to 30 s) and
+  logs why, instead of re-dialling on every read.
+- LAN TCP measured (benchmarks/M10-LAN-TCP.md): Linux Sparks fill 10GbE
+  with 1–2 streams, oliver needs 4–8; oliver tuned (NIC buffers, WSL MTU
+  1500); `tcp_slow_start_after_idle=0` on every host. Jumbo frames do not
+  pass the LAN switching yet.
+- Next: TCP bulk lanes (parallel connections, sendfile), then the Off-grid
+  placement mode, offload to off-grid hosts, HF spread exclusion, moving a
+  host between roles.
+
 ## 2026-10-11 — 0.2.2: RDMA lanes no longer leak
 
 - Lanes of replaced or half-built links held their QP and registered ring

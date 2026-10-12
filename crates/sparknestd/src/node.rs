@@ -93,9 +93,17 @@ impl Node {
         })
         .await
         .with_context(|| format!("binding {}", cfg.node.listen))?;
+        let offgrid = cfg.node.role == crate::config::Role::Offgrid;
         for m in &cfg.cluster.members {
             if m.id != id {
-                rpc.set_peer(m.id, m.addr);
+                // An off-grid host knows the others by their LAN addresses
+                // and dials them; membership's fabric addresses must not
+                // replace those (ADR-047).
+                if offgrid {
+                    rpc.pin_peer(m.id, m.addr);
+                } else {
+                    rpc.set_peer(m.id, m.addr);
+                }
             }
         }
         let boot = tuning
@@ -190,6 +198,9 @@ impl Node {
             tracing::warn!(plan = %plan.id, "founded the new Raft group from this host's metadata");
         }
         hello.running(meta.clone(), meta.incarnation());
+        if bootstrap && offgrid {
+            anyhow::bail!("an off-grid host cannot found a cluster: add it to a running one");
+        }
         if bootstrap {
             let members = voters.clone();
             if meta.bootstrap(members).await? {
@@ -200,10 +211,19 @@ impl Node {
         tracing::info!(?report, "local store reconciled");
         let vfs = Vfs::new(
             data.clone(),
-            VfsConfig {
-                passthrough: cfg.fuse.passthrough,
-                balance_reads: cfg.fuse.balance_reads,
-                ..tuning.vfs.clone()
+            if offgrid {
+                // Its own copy first, always; never spread over others.
+                VfsConfig {
+                    passthrough: nest_data::vfs::Passthrough::Always,
+                    balance_reads: false,
+                    ..tuning.vfs.clone()
+                }
+            } else {
+                VfsConfig {
+                    passthrough: cfg.fuse.passthrough,
+                    balance_reads: cfg.fuse.balance_reads,
+                    ..tuning.vfs.clone()
+                }
             },
         );
         let recovery = if !trust_local {
@@ -221,6 +241,7 @@ impl Node {
             None
         };
         let fabric = match (cfg.fabric.mode, &tuning.fabric) {
+            _ if offgrid => None,
             (crate::config::FabricMode::Tcp, _) | (_, None) => None,
             (mode, Some(fc)) => {
                 let mut fc = fc.clone();

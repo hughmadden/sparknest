@@ -583,8 +583,11 @@ impl MetaNode {
         if let Ok(a) = addr.parse() {
             self.rpc.set_peer(id, a);
         }
+        // A voter must catch up before it is promoted; a learner (an
+        // off-grid host, added before it first starts) catches up whenever
+        // it connects.
         self.raft
-            .add_learner(id.0, BasicNode { addr }, true)
+            .add_learner(id.0, BasicNode { addr }, voter)
             .await?;
         if voter {
             self.raft

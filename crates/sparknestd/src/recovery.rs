@@ -344,6 +344,9 @@ pub async fn decide(
     if fresh || peers.is_empty() {
         return Ok(Outcome::Normal);
     }
+    if cfg.node.role == crate::config::Role::Offgrid {
+        return wait_for_cluster(rpc, &peers, local).await;
+    }
     if settled {
         // One quick look: are the others running a later incarnation?
         let infos = infos(rpc, &peers).await;
@@ -395,6 +398,8 @@ pub async fn decide(
                 _ => None,
             })
             .collect();
+        // Only voters re-found (an off-grid learner never seeds, ADR-047).
+        here.retain(|(id, _)| voters.contains(id));
         here.push((me, local.applied));
         here.sort();
         if here.len() >= need {
@@ -434,6 +439,31 @@ pub async fn decide(
             last_log = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// An off-grid host never takes part in re-founding: it waits for a running
+/// cluster and joins it, keeping its Raft state only if that is still the
+/// incarnation it belongs to.
+async fn wait_for_cluster(rpc: &Rpc, peers: &[u64], local: &Local) -> anyhow::Result<Outcome> {
+    let mut last_log = Instant::now() - Duration::from_secs(60);
+    loop {
+        let infos = infos(rpc, peers).await;
+        if let Some(i) = live(&infos) {
+            return Ok(
+                if local.disk == Found::Current && i.incarnation == local.incarnation {
+                    Outcome::Normal
+                } else {
+                    Outcome::Join(i.incarnation.clone())
+                },
+            );
+        }
+        if last_log.elapsed() > Duration::from_secs(10) {
+            tracing::warn!("off-grid: waiting for the fabric hosts to run a cluster");
+            crate::sdnotify::status("off-grid: waiting for a running cluster");
+            last_log = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

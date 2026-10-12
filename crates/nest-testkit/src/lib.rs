@@ -54,6 +54,8 @@ pub struct TestCluster {
     nodes: BTreeMap<u64, Node>,
     /// Simulated kernel boot id per host (see [`TestCluster::power_loss`]).
     boots: BTreeMap<u64, u64>,
+    /// Off-grid nodes (ADR-047): learners the others have no address for.
+    offgrid: std::collections::BTreeSet<u64>,
 }
 
 impl TestCluster {
@@ -70,6 +72,7 @@ impl TestCluster {
             addrs: BTreeMap::new(),
             nodes: BTreeMap::new(),
             boots: BTreeMap::new(),
+            offgrid: Default::default(),
         };
         for id in 1..=n {
             c.boot(id, "127.0.0.1:0".parse().unwrap()).await;
@@ -110,18 +113,27 @@ impl TestCluster {
                 mountpoint: None,
                 listen,
                 api_listen: None,
+                role: if self.offgrid.contains(&id) {
+                    sparknestd::config::Role::Offgrid
+                } else {
+                    sparknestd::config::Role::Fabric
+                },
             },
             cluster: ClusterSection {
                 name: "testkit".into(),
                 secret_file: self.dir.path().join("secret"),
+                // Fabric hosts' configs never list off-grid hosts (they
+                // cannot dial them); an off-grid host lists every fabric
+                // host and itself as a learner.
                 members: self
                     .addrs
                     .iter()
+                    .filter(|(i, _)| **i == id || !self.offgrid.contains(i))
                     .map(|(i, a)| Member {
                         id: NodeId(*i),
                         name: format!("n{i}"),
                         addr: *a,
-                        voter: true,
+                        voter: !self.offgrid.contains(i),
                     })
                     .collect(),
             },
@@ -208,6 +220,19 @@ impl TestCluster {
                 .await
                 .unwrap()
         }
+    }
+
+    /// Add an off-grid node `id` (ADR-047): the leader adds it as a learner
+    /// with no address, so every request to it travels over the
+    /// connections it opens (as behind NAT).
+    pub async fn add_offgrid(&mut self, id: u64) {
+        self.offgrid.insert(id);
+        let leader = self.wait_leader().await;
+        let meta = self.nodes[&leader].meta.clone();
+        let add =
+            tokio::spawn(async move { meta.add_node(NodeId(id), String::new(), false).await });
+        self.boot(id, "127.0.0.1:0".parse().unwrap()).await;
+        add.await.unwrap().unwrap();
     }
 
     /// Restart a stopped node on its original address.

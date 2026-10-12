@@ -354,6 +354,17 @@ impl Vfs {
         self.disk_bps.load(Ordering::Relaxed)
     }
 
+    /// Members that do not vote: off-grid hosts, on the LAN only (ADR-047).
+    pub fn offgrid_hosts(&self) -> std::collections::HashSet<NodeId> {
+        let m = self.d.meta().metrics().membership_config;
+        let voters: std::collections::HashSet<u64> = m.membership().voter_ids().collect();
+        m.nodes()
+            .map(|(id, _)| *id)
+            .filter(|id| !voters.contains(id))
+            .map(NodeId)
+            .collect()
+    }
+
     /// This host's RDMA link rate, bytes/s (0 without a fabric).
     pub fn link_bps(&self) -> u64 {
         self.fabric().map_or(0, |f| f.link_bytes_per_s())
@@ -369,6 +380,7 @@ impl Vfs {
         let key = ObjectKey::new(a.id, a.generation);
         let local = self.d.servable(key).then(|| self.d.store().clone());
         let me = self.me();
+        let offgrid = self.offgrid_hosts();
         let mut sources: Vec<Source> = self
             .q(|c| query::replicas(c, a.id))
             .ok()?
@@ -379,7 +391,10 @@ impl Vfs {
                     && !crate::is_archive(r.store)
                     && NodeId(r.store.0) != me
             })
-            .map(|r| Source::Peer(NodeId(r.store.0)))
+            .map(|r| NodeId(r.store.0))
+            // Off-grid hosts are not on the fabric: never part of a spread.
+            .filter(|n| !offgrid.contains(n))
+            .map(Source::Peer)
             .collect();
         if local.is_some() {
             sources.insert(0, Source::Local);
@@ -1138,6 +1153,13 @@ impl Vfs {
 
     /// Nodes holding a live copy of the current generation, this node last,
     /// rotated by file id to spread load.
+    /// The hosts this node would read `file` from, in order. For tests and
+    /// diagnostics.
+    #[doc(hidden)]
+    pub fn read_order(&self, file: FileId) -> NestResult<Vec<NodeId>> {
+        self.holders(&self.raw_attr(file)?)
+    }
+
     fn holders(&self, a: &FileAttr) -> NestResult<Vec<NodeId>> {
         let replicas: Vec<_> = self
             .q(|c| query::replicas(c, a.id))?
@@ -1154,6 +1176,10 @@ impl Vfs {
             let k = (a.id.0 as usize) % nodes.len();
             nodes.rotate_left(k);
         }
+        // Off-grid holders answer over TCP: after every fabric holder (a
+        // stable sort keeps the rotation within each group).
+        let offgrid = self.offgrid_hosts();
+        nodes.sort_by_key(|n| offgrid.contains(n));
         // Archive copies are read through their gateways, after live copies.
         for r in replicas.iter().filter(|r| crate::is_archive(r.store)) {
             if let Some((_, cfg)) = self.d.archive_row(r.store) {

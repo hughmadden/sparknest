@@ -567,10 +567,16 @@ enum ClusterCmd {
     /// Add (or re-add) a node by id and control address (ip:port).
     Add {
         id: u64,
-        addr: String,
+        /// Control address; omitted for an off-grid host (it dials in).
+        #[arg(required_unless_present = "offgrid")]
+        addr: Option<String>,
         /// Join as a non-voting learner.
         #[arg(long)]
         learner: bool,
+        /// An off-grid host (ADR-047): a learner on the LAN that the others
+        /// never dial; start it after adding it.
+        #[arg(long, conflicts_with_all = ["addr", "learner"])]
+        offgrid: bool,
     },
 }
 
@@ -1505,10 +1511,17 @@ async fn main() -> Result<()> {
                 c.post("/v1/cluster/remove", json!({ "host": host }))
                     .await?
             }
-            ClusterCmd::Add { id, addr, learner } => {
+            ClusterCmd::Add {
+                id,
+                addr,
+                learner,
+                offgrid,
+            } => {
+                let addr = addr.clone().unwrap_or_default();
+                let voter = !(*learner || *offgrid);
                 c.post(
                     "/v1/cluster/add",
-                    json!({ "id": id, "addr": addr, "voter": !learner }),
+                    json!({ "id": id, "addr": addr, "voter": voter }),
                 )
                 .await?
             }
