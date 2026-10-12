@@ -572,6 +572,16 @@ enum ClusterCmd {
     Ls,
     /// Remove a node from the cluster (e.g. before re-imaging it).
     Remove { host: String },
+    /// Move a host off the RDMA fabric or onto it (ADR-047). Stop it, run
+    /// this, switch its cable and node.toml (role, listen, members), start it.
+    Role {
+        host: String,
+        #[arg(value_parser = ["offgrid", "fabric"])]
+        role: String,
+        /// Its control address on the fabric (ip:port), for `fabric`.
+        #[arg(long, required_if_eq("role", "fabric"))]
+        addr: Option<String>,
+    },
     /// Add (or re-add) a node by id and control address (ip:port).
     Add {
         id: u64,
@@ -1521,6 +1531,13 @@ async fn main() -> Result<()> {
             ClusterCmd::Remove { host } => {
                 c.post("/v1/cluster/remove", json!({ "host": host }))
                     .await?
+            }
+            ClusterCmd::Role { host, role, addr } => {
+                c.post(
+                    "/v1/cluster/role",
+                    json!({ "host": host, "role": role, "addr": addr }),
+                )
+                .await?
             }
             ClusterCmd::Add {
                 id,

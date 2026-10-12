@@ -183,6 +183,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/web", get(web_info))
         .route("/v1/cluster", get(cluster))
         .route("/v1/cluster/remove", post(cluster_remove))
+        .route("/v1/cluster/role", post(cluster_role))
         .route("/v1/cluster/add", post(cluster_add))
         .with_state(api)
 }
@@ -875,6 +876,36 @@ async fn cluster(State(api): State<Api>) -> R<serde_json::Value> {
 #[derive(Deserialize)]
 struct RemoveReq {
     host: String,
+}
+
+#[derive(Deserialize)]
+struct RoleReq {
+    host: String,
+    /// "offgrid" or "fabric".
+    role: String,
+    /// Its control address on the fabric (role "fabric").
+    #[serde(default)]
+    addr: Option<String>,
+}
+
+/// Move a host off the fabric or onto it (ADR-047). Done while the host is
+/// stopped for the move; it starts again with the matching node.toml.
+async fn cluster_role(State(api): State<Api>, Json(r): Json<RoleReq>) -> R<serde_json::Value> {
+    let h = api
+        .placer
+        .resolve_hosts(std::slice::from_ref(&r.host))?
+        .pop()
+        .ok_or(bad("unknown host"))?;
+    let addr = match (r.role.as_str(), r.addr) {
+        ("offgrid", _) => String::new(),
+        ("fabric", Some(a)) if a.parse::<std::net::SocketAddr>().is_ok() => a,
+        ("fabric", _) => return Err(bad("role fabric needs addr, its control address (ip:port)")),
+        _ => return Err(bad("role is offgrid or fabric")),
+    };
+    api.placer
+        .change_membership(nest_place::admin::MembershipChange::SetRole { node: h.node, addr })
+        .await?;
+    Ok(Json(json!({ "host": h.name, "role": r.role })))
 }
 
 async fn cluster_remove(State(api): State<Api>, Json(r): Json<RemoveReq>) -> R<serde_json::Value> {

@@ -1295,3 +1295,15 @@ connection's first chunk.
    off-grid host counts like any other, so this is not a deletion.
 4. **Hugging Face downloads** spread over fabric hosts only; an off-grid
    host is a valid single `--host`.
+
+## ADR-050 — Moving a host between the fabric and off-grid (2026-10-12)
+
+**Decision.** `nest cluster role HOST offgrid|fabric [--addr IP:PORT]`,
+run while the host is stopped for its move. Off-grid: the host stops
+voting (kept as a learner) and its membership address is cleared; every
+node watches membership and stops dialling a member whose address is
+cleared, so it is reached over the connections it opens. Fabric: its
+address is set while it is still a learner, then it becomes a voter. At
+least three voters must remain. The host then starts with the matching
+`node.toml` (`role`, `listen`, members at fabric or LAN addresses). Its
+copies stay where they are; only how they are counted by Place changes.

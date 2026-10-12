@@ -253,6 +253,28 @@ impl MetaNode {
                 lease_ms: cfg.election_max_ms,
             }),
         );
+        // A member whose address is cleared went off-grid (ADR-047): stop
+        // dialling where it was; it reaches us over the connections it opens.
+        {
+            let (mut m, rpc) = (raft.metrics(), rpc.clone());
+            tokio::spawn(async move {
+                loop {
+                    let gone: Vec<NodeId> = m
+                        .borrow_and_update()
+                        .membership_config
+                        .nodes()
+                        .filter(|(_, n)| n.addr.is_empty())
+                        .map(|(id, _)| NodeId(*id))
+                        .collect();
+                    for id in gone {
+                        rpc.forget_peer(id);
+                    }
+                    if m.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
         Ok(Arc::new(MetaNode {
             cfg,
             raft,
@@ -592,6 +614,45 @@ impl MetaNode {
         if voter {
             self.raft
                 .change_membership(ChangeMembers::AddVoterIds(BTreeSet::from([id.0])), false)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Move a host off the fabric (`addr` empty: a learner that dials in,
+    /// ADR-047) or onto it (a voter at `addr`). Off-grid: it stops voting at
+    /// once and its address is cleared, so others stop dialling it. Onto the
+    /// fabric: its address is set while still a learner, then it is promoted.
+    pub async fn set_role(&self, id: NodeId, addr: String) -> anyhow::Result<()> {
+        let one = BTreeSet::from([id.0]);
+        let node = BTreeMap::from([(id.0, BasicNode { addr: addr.clone() })]);
+        if addr.is_empty() {
+            let voters = self
+                .metrics()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .count();
+            anyhow::ensure!(
+                voters > 3,
+                "taking {id} off the fabric would leave {} voters; keep at least three",
+                voters - 1
+            );
+            self.raft
+                .change_membership(ChangeMembers::RemoveVoters(one), true)
+                .await?;
+            self.raft
+                .change_membership(ChangeMembers::SetNodes(node), false)
+                .await?;
+        } else {
+            if let Ok(a) = addr.parse() {
+                self.rpc.set_peer(id, a);
+            }
+            self.raft
+                .change_membership(ChangeMembers::SetNodes(node), false)
+                .await?;
+            self.raft
+                .change_membership(ChangeMembers::AddVoterIds(one), false)
                 .await?;
         }
         Ok(())

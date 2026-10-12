@@ -350,6 +350,15 @@ impl Rpc {
         }
     }
 
+    /// Stop dialling `node` (it went off-grid and dials in, ADR-047). A
+    /// pinned address stays; an open connection stays until it drops.
+    pub fn forget_peer(&self, node: NodeId) {
+        if self.inner.pinned.read().contains_key(&node) {
+            return;
+        }
+        self.inner.addrs.write().remove(&node);
+    }
+
     pub fn peer_addr(&self, node: NodeId) -> Option<SocketAddr> {
         self.inner.addrs.read().get(&node).copied()
     }

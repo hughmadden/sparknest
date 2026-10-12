@@ -368,3 +368,70 @@ async fn offgrid_placement_place_and_offload() {
         "{plan:?}"
     );
 }
+
+/// A fabric host moves off-grid and back (ADR-047): stopped, its role
+/// changed in membership, started with the matching configuration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_host_moves_off_the_fabric_and_back() {
+    let mut c = ready(4).await;
+    let voters = |c: &TestCluster| -> Vec<u64> {
+        let mut v: Vec<u64> = c
+            .node(1)
+            .meta
+            .metrics()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(voters(&c), [1, 2, 3, 4]);
+    let f = file(&c, 1, "before", b"written on the fabric").await;
+
+    // Off the fabric.
+    c.stop(4).await;
+    c.node(1)
+        .meta
+        .set_role(NodeId(4), String::new())
+        .await
+        .unwrap();
+    c.set_offgrid(4, true);
+    c.restart(4).await;
+    c.eventually("4 serving off-grid", Duration::from_secs(10), |c| {
+        c.node(4).data.caught_up() && c.node(4).data.session().is_some()
+    })
+    .await;
+    assert_eq!(voters(&c), [1, 2, 3]);
+    c.eventually(
+        "fabric hosts forgot its address",
+        Duration::from_secs(5),
+        |c| (1..=3).all(|i| c.node(i).rpc.peer_addr(NodeId(4)).is_none()),
+    )
+    .await;
+    assert_eq!(read_all(&c, 4, f).await, b"written on the fabric");
+    let g = file(&c, 4, "off-grid", b"written off the fabric").await;
+    assert_eq!(read_all(&c, 2, g).await, b"written off the fabric");
+    // Three voters must remain.
+    assert!(
+        c.node(1)
+            .meta
+            .set_role(NodeId(3), String::new())
+            .await
+            .is_err()
+    );
+
+    // Back onto the fabric.
+    c.stop(4).await;
+    let addr = c.node_config(4).node.listen.to_string();
+    c.node(1).meta.set_role(NodeId(4), addr).await.unwrap();
+    c.set_offgrid(4, false);
+    c.restart(4).await;
+    c.eventually("4 a voter again", Duration::from_secs(10), |c| {
+        c.node(4).data.caught_up() && voters(c) == [1, 2, 3, 4]
+    })
+    .await;
+    assert!(c.node(1).vfs.offgrid_hosts().is_empty());
+    let h = file(&c, 4, "back", b"on the fabric again").await;
+    assert_eq!(read_all(&c, 3, h).await, b"on the fabric again");
+}

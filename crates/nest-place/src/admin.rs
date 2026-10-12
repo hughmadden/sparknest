@@ -207,6 +207,9 @@ pub enum MembershipChange {
     },
     /// Remove a node entirely (it stops voting and receiving the log).
     Remove { node: NodeId },
+    /// Move a node off the fabric (`addr` empty: a learner that dials in)
+    /// or onto it (a voter at `addr`), ADR-047.
+    SetRole { node: NodeId, addr: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -693,6 +696,7 @@ impl Handler for AdminService {
                             meta.add_node(node, addr, voter).await
                         }
                         MembershipChange::Remove { node } => meta.remove_node(node).await,
+                        MembershipChange::SetRole { node, addr } => meta.set_role(node, addr).await,
                     };
                     match r {
                         Ok(()) => AdminResp::Started,

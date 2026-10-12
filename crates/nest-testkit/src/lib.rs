@@ -252,6 +252,16 @@ impl TestCluster {
         add.await.unwrap().unwrap();
     }
 
+    /// Configure stopped node `id` as off-grid or fabric for its next start
+    /// (its role in membership is changed separately).
+    pub fn set_offgrid(&mut self, id: u64, offgrid: bool) {
+        if offgrid {
+            self.offgrid.insert(id);
+        } else {
+            self.offgrid.remove(&id);
+        }
+    }
+
     /// Restart a stopped node on its original address.
     pub async fn restart(&mut self, id: u64) {
         let addr = self.addrs[&id];
