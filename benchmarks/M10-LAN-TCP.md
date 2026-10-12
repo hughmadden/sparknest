@@ -107,3 +107,22 @@ Defaults: 4 lanes per peer, and at least 8 chunks (32 MiB) in flight,
 which the readahead window (16 chunks) and replication window (16) give.
 That is line rate on both kinds of off-grid host; 8 lanes add ~3% on
 oliver only.
+
+## Through the filesystem (0.3.0 on the real cluster, 2026-10-13)
+
+kakapo joined off-grid; reading MiMo-V2.6-Pro blobs (3.9 GiB each, held on
+all six Sparks' NVMe) through /mnt/sparknest with `dd bs=16M`, kakapo's
+page cache dropped first (`sparknest-drop-page-cache`).
+
+| Read | Throughput |
+|---|---|
+| one stream, holder's copy cold | 749–771 MB/s |
+| one stream, holder's copy in its page cache | 838–861 MB/s |
+| two streams at once, holders warm | 2 × 566 MB/s = 1.13 GB/s |
+| lanes_bench ostrich -> kakapo (no filesystem), 4 lanes | 1.16 GB/s |
+
+The lanes and the link reach line rate; one sequential reader through the
+filesystem gets ~75% of it (readahead from one holder, two copies per
+chunk on the reader). Loaders that open several shards at once see line
+rate. A 60 GiB file held only in the `scratch` archive read at 448 MB/s:
+the SATA archive disk behind its gateway.
