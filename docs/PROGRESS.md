@@ -27,8 +27,14 @@ what is next. Keep entries short; link to benchmarks and ADRs.
   the Place dialog and `nest plan --offgrid`; offload to an off-grid host;
   HF spread downloads skip them. `nest cluster role HOST offgrid|fabric`
   moves a host (ADR-050). `scripts/add-offgrid.sh` onboards one.
-- Next: release, fabric hosts listening on the LAN (`add-offgrid.sh
-  fabric-lan` + rolling restart), then kakapo and oliver join.
+- Released 0.3.0 (bottles-20261012-1), installed on nine hosts, fabric
+  hosts restarted onto it listening on the LAN. 2026-10-13: kakapo (node
+  8) and oliver (node 9, WSL behind NAT) joined off-grid, both with FUSE
+  passthrough and io_uring. Reads from fabric NVMe: kakapo 0.84 GB/s one
+  stream, 1.13 GB/s two; oliver 0.53 and 0.79 (its quantization job was
+  running).
+- Next: single-stream reads through the filesystem off the fabric (one
+  holder per stream, two copies per chunk), and oliver's WSL path.
 
 ## 2026-10-11 — 0.2.2: RDMA lanes no longer leak
 
