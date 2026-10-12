@@ -50,6 +50,23 @@ Slow start after idle costs 0.8–2 ms per idle connection's first chunk
 (20–40% of a 4 MiB fetch). One request at a time on one connection never
 reaches line rate off-grid: the window must stay full.
 
+## oliver tuned (same day)
+
+Windows RTL8127 Receive and Transmit Buffers 1024/512 -> 4096/4096, then
+WSL eth0 MTU 1280 -> 1500 (WSL copied the Tailscale adapter's 1280; a
+route keeps 1280 for 100.64.0.0/10; `wsl-lan-mtu.service` sets it at boot).
+
+| oliver <- raptor | before | buffers 4096 | + MTU 1500 |
+|---|---|---|---|
+| iperf3 P=1 | 5.14 Gb/s, 2.2k retr | 4.48, 0 retr | 5.19, 0 retr |
+| iperf3 P=2 | 7.70 | 7.31 | 8.18, 0 retr |
+| iperf3 P=8 | 9.51, 8.8k retr | 9.62, 19k retr | 9.68, 464 retr |
+| one connection, 4 MiB back-to-back | 4.0 Gb/s | | 5.2 Gb/s |
+| one connection, 16 MiB back-to-back | 4.0 Gb/s | | 5.6 Gb/s |
+
+The buffers removed the single-stream loss but not its ceiling: one flow
+into WSL is limited by per-packet work in the Hyper-V path, not drops.
+
 ## Consequences for the bulk path
 
 - Several connections per peer, 4 by default (configurable; 8 for WSL),

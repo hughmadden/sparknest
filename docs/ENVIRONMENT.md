@@ -24,6 +24,22 @@ User account: `tj`, uid 1000 on raptor, uid 1001 on Sparks. `sudo` needs a
 password on every host, so the agent cannot perform root steps; see the
 one-time root checklist below.
 
+### Off-grid hosts (LAN only, ADR-047)
+
+| Host | Arch | OS | Kernel | LAN | Notes |
+|---|---|---|---|---|---|
+| kakapo | arm64 | Ubuntu 24.04.5 | 7.0.0-1019-nvidia | 172.22.2.7, RTL8127 (r8127), 10GbE | Spark without the fabric cable; `fuse.enable_uring` still N (set at runtime when it joins, kernel command line at next reboot) |
+| oliver | amd64 | Ubuntu 24.04.5 on WSL2 (NAT) | 6.18.40.1-microsoft-standard-WSL2 | Windows RTL8127, 10GbE; WSL eth0 172.25.172.80 behind NAT | 24 cores, 62 GiB, ext4 VHD 3.6T |
+
+oliver: never use WSL mirrored networking (it drops inbound connections
+there); stays on NAT and dials out. Tuned 2026-10-12 (benchmarks/M10-LAN-TCP.md):
+Windows adapter "Ethernet 7" Receive/Transmit Buffers 4096; WSL eth0 MTU
+1500 via `/etc/systemd/system/wsl-lan-mtu.service` (WSL copies the Windows
+Tailscale adapter's 1280; a route keeps 1280 for 100.64.0.0/10);
+`.wslconfig` has `kernelCommandLine=fuse.enable_uring=1`. All LAN NICs
+support jumbo frames (atlantic max 16334, r8127 max 9194, Windows 9014),
+not enabled yet.
+
 ## Fabric
 
 - raptor: `mlx5_0`, RoCE (Ethernet link layer), 400G, `enp1s0np0` with
