@@ -15,6 +15,7 @@ Add a row the moment a new tool is introduced.
 | cc, python3 | all nodes | already installed | build the page-cache helper on `sparknest-drop-page-cache --install`; its tests run in `scripts/build.sh --check` |
 | sparknest-allow-restart | all nodes | once per host, asks for sudo: `tools/allow-restart/sparknest-allow-restart --hosts` from a checkout (every host in `scripts/cluster.env`), or `sparknest-allow-restart` from the Homebrew package | a sudoers rule for exactly `systemctl restart sparknestd@CLUSTER`, so an agent iterating on the daemon can restart it after a deploy without a password prompt; `--check` tells whether it is in place |
 | perftest (`ib_write_bw`) | all nodes | already installed on raptor; `apt`/brew on Sparks if missing | raw fabric ceilings |
+| iperf3 | raptor, ostrich, oliver, kakapo | `brew install iperf3` (Sparks may have it from apt) | LAN TCP throughput per stream count (benchmarks/M10-LAN-TCP.md) |
 
 Homebrew (`/home/linuxbrew/.linuxbrew`) is the preferred way to add tools.
 
