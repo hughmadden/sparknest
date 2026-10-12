@@ -1197,3 +1197,50 @@ queued ones move at once to the least loaded good host with room; the job
 says so. A file is retried once on its host, then on another, and given up
 after three tries. The scheduling (`hfimport::Schedule`) is plain code
 with unit tests.
+
+## ADR-047 — Off-grid hosts: learners on the LAN that dial out (2026-10-12)
+
+**Context.** New hosts join that are not on the RDMA fabric: kakapo (a
+Spark) and later another, and oliver (WSL2 on a Windows PC, behind WSL's
+NAT; mirrored networking drops connections there, so it stays on NAT). All
+are on 10 GbE and always on. They must use every model on the cluster,
+keep full copies of the models they use for local speed, and write and own
+files, but not slow consensus down with TCP round trips. Seven fabric
+hosts already vote.
+
+**Decision.**
+1. **Role.** An off-grid host is a Raft learner (`voter = false`) marked
+   `role = "offgrid"` in membership. It applies the whole log into its own
+   metadata, so lookups are local, and forwards proposals to the leader
+   like any follower. It may own and create files. Quorum, elections and
+   recovery count voters only, as today.
+2. **It dials out.** Core hosts cannot reach a host behind NAT, so an
+   off-grid host keeps a control connection open to every member it has an
+   address for, and every control connection carries requests both ways:
+   a node with no address for a peer sends its requests (Raft appends,
+   fences, replication, data calls) over the connection that peer opened.
+   Core hosts additionally listen on the LAN (`listen = 0.0.0.0:7400`); an
+   off-grid host lists the core hosts at their LAN addresses in its own
+   `node.toml`, and addresses learned from Raft membership (fabric IPs)
+   never replace an address given there. No inbound port is needed on an
+   off-grid host.
+3. **Fencing is unchanged: every member.** Narrowing it to the holders of
+   a file is not safe: a host that read the file before (remotely, sealed)
+   has its pages in the kernel page cache, which only the fence drops
+   synchronously. With hosts always on, the fence costs one parallel LAN
+   round trip; the lease wait only applies when a member does not answer.
+4. **Reads are local first.** An off-grid host reads its own copy whenever
+   it has one, regardless of how many other copies exist, and otherwise
+   reads over TCP from one core holder (never striped). Its copies are full
+   replicas under the usual generation rules.
+5. **Placement.** Place spreads only over fabric hosts and never counts
+   or removes off-grid copies. An Off-grid goal picks which off-grid hosts
+   hold a selection; offload accepts an off-grid host as its destination;
+   a copy there is a copy, so unloading from the fabric hosts is not a
+   deletion.
+6. **Not now.** No encryption (public data, trusted LAN, performance
+   first); no reads while disconnected; onboarding is explicit (plans and
+   `nest import`), informed by usage, never triggered by reads (invariant 2).
+
+The TCP bulk data path and the planner and UI work follow in their own
+ADRs.

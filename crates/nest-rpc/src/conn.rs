@@ -54,6 +54,7 @@ struct Inner {
     local_addr: SocketAddr,
     handlers: parking_lot::RwLock<HashMap<u8, Arc<dyn Handler>>>,
     addrs: parking_lot::RwLock<HashMap<NodeId, SocketAddr>>,
+    pinned: parking_lot::RwLock<HashMap<NodeId, SocketAddr>>,
     conns: Mutex<HashMap<NodeId, ConnSlot>>,
     filter: Filter,
     shutdown: watch::Sender<bool>,
@@ -119,7 +120,11 @@ type ConnSlot = Arc<tokio::sync::Mutex<Option<Arc<Conn>>>>;
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Bytes, RpcError>>>>;
 
-/// An outgoing, authenticated connection to one peer.
+/// An authenticated connection to one peer. Either end may send requests
+/// on it (ADR-047): each numbers its own, and the frame kind tells a
+/// request from the other end apart from an answer to one of ours. A node
+/// dials the peers it has an address for; a peer it cannot reach (behind
+/// NAT) dials in, and its connection is used for both directions.
 struct Conn {
     peer: NodeId,
     tx: mpsc::Sender<Frame>,
@@ -129,7 +134,11 @@ struct Conn {
 }
 
 impl Conn {
-    async fn open(inner: &Inner, peer: NodeId, addr: SocketAddr) -> Result<Arc<Conn>, RpcError> {
+    async fn open(
+        inner: &Arc<Inner>,
+        peer: NodeId,
+        addr: SocketAddr,
+    ) -> Result<Arc<Conn>, RpcError> {
         let unreachable = |e: String| RpcError::Unreachable(peer, e);
         let mut s = tokio::time::timeout(inner.cfg.connect_timeout, TcpStream::connect(addr))
             .await
@@ -153,12 +162,24 @@ impl Conn {
                 "{addr} is node {who}, expected {peer}"
             )));
         }
+        Ok(Conn::start(inner, peer, s))
+    }
+
+    /// Run an authenticated stream: answer the peer's requests and route
+    /// answers to ours.
+    fn start(inner: &Arc<Inner>, peer: NodeId, s: TcpStream) -> Arc<Conn> {
         let (mut r, w) = s.into_split();
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(writer(BufWriter::with_capacity(256 << 10, w), rx));
-        let pending: Arc<Pending> = Arc::default();
-        let dead = Arc::new(AtomicBool::new(false));
-        let (p2, d2) = (pending.clone(), dead.clone());
+        let conn = Arc::new(Conn {
+            peer,
+            tx: tx.clone(),
+            pending: Arc::default(),
+            next_id: AtomicU64::new(1),
+            dead: Arc::new(AtomicBool::new(false)),
+        });
+        let (pending, dead) = (conn.pending.clone(), conn.dead.clone());
+        let inner = inner.clone();
         let mut stop = inner.shutdown.subscribe();
         tokio::spawn(async move {
             loop {
@@ -167,42 +188,45 @@ impl Conn {
                     _ = stop.changed() => break,
                 };
                 let Ok(f) = f else { break };
-                let res = match f.kind {
-                    KIND_OK => Ok(f.body),
-                    KIND_ERR => Err(match f.service {
-                        0 => RpcError::Remote(String::from_utf8_lossy(&f.body).into_owned()),
-                        s => RpcError::NoService(s),
-                    }),
-                    _ => Err(RpcError::Protocol(format!(
-                        "unexpected frame kind {}",
-                        f.kind
-                    ))),
-                };
-                if let Some(tx) = p2.lock().remove(&f.id) {
-                    let _ = tx.send(res);
+                match f.kind {
+                    KIND_REQ => answer(&inner, peer, &tx, f),
+                    KIND_OK | KIND_ERR => {
+                        let res = if f.kind == KIND_OK {
+                            Ok(f.body)
+                        } else {
+                            Err(match f.service {
+                                0 => {
+                                    RpcError::Remote(String::from_utf8_lossy(&f.body).into_owned())
+                                }
+                                s => RpcError::NoService(s),
+                            })
+                        };
+                        if let Some(tx) = pending.lock().remove(&f.id) {
+                            let _ = tx.send(res);
+                        }
+                    }
+                    _ => break,
                 }
             }
-            d2.store(true, Ordering::SeqCst);
-            for (_, tx) in p2.lock().drain() {
+            dead.store(true, Ordering::SeqCst);
+            for (_, tx) in pending.lock().drain() {
                 let _ = tx.send(Err(RpcError::Protocol(format!(
                     "connection to {peer} lost"
                 ))));
             }
         });
-        Ok(Arc::new(Conn {
-            peer,
-            tx,
-            pending,
-            next_id: AtomicU64::new(1),
-            dead,
-        }))
+        conn
+    }
+
+    fn alive(&self) -> bool {
+        !self.dead.load(Ordering::SeqCst)
     }
 
     async fn call(&self, service: u8, body: Bytes) -> Result<Bytes, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(id, tx);
-        if self.dead.load(Ordering::SeqCst)
+        if !self.alive()
             || self
                 .tx
                 .send(Frame {
@@ -222,6 +246,35 @@ impl Conn {
     }
 }
 
+/// Run a request from `peer` and send the answer back on its connection.
+fn answer(inner: &Arc<Inner>, peer: NodeId, tx: &mpsc::Sender<Frame>, f: Frame) {
+    if inner.filter.is_blocked(peer) {
+        return; // partitioned: the request is lost
+    }
+    let handler = inner.handlers.read().get(&f.service).cloned();
+    let (tx, inner) = (tx.clone(), inner.clone());
+    tokio::spawn(async move {
+        let (kind, service, body) = match handler {
+            None => (KIND_ERR, f.service, Bytes::new()),
+            Some(h) => match h.call(peer, f.body).await {
+                Ok(b) => (KIND_OK, 0, b),
+                Err(e) => (KIND_ERR, 0, Bytes::from(e.into_bytes())),
+            },
+        };
+        if inner.filter.is_blocked(peer) {
+            return;
+        }
+        let _ = tx
+            .send(Frame {
+                id: f.id,
+                kind,
+                service,
+                body,
+            })
+            .await;
+    });
+}
+
 impl Rpc {
     /// Bind the listener and start serving. Handlers may be registered
     /// afterwards; requests for unregistered services get `NoService`.
@@ -234,6 +287,7 @@ impl Rpc {
             local_addr,
             handlers: Default::default(),
             addrs: Default::default(),
+            pinned: Default::default(),
             conns: Default::default(),
             filter: Filter::default(),
             shutdown,
@@ -251,7 +305,9 @@ impl Rpc {
                 tokio::spawn(serve(inner, s));
             }
         });
-        Ok(Rpc { inner })
+        let rpc = Rpc { inner };
+        rpc.keep_pinned_connected();
+        Ok(rpc)
     }
 
     pub fn node(&self) -> NodeId {
@@ -270,7 +326,24 @@ impl Rpc {
         self.inner.handlers.write().insert(service, handler);
     }
 
+    /// Learn a peer's address (from membership). Ignored for a peer whose
+    /// address was pinned.
     pub fn set_peer(&self, node: NodeId, addr: SocketAddr) {
+        if self.inner.pinned.read().contains_key(&node) {
+            return;
+        }
+        let old = self.inner.addrs.write().insert(node, addr);
+        if old.is_some_and(|o| o != addr) {
+            self.inner.conns.lock().remove(&node);
+        }
+    }
+
+    /// Fix a peer's address (from this host's own configuration): nothing
+    /// learned later replaces it, and the connection to it is kept open so
+    /// the peer can send its requests on it (an off-grid host pins the
+    /// fabric hosts' LAN addresses, ADR-047).
+    pub fn pin_peer(&self, node: NodeId, addr: SocketAddr) {
+        self.inner.pinned.write().insert(node, addr);
         let old = self.inner.addrs.write().insert(node, addr);
         if old.is_some_and(|o| o != addr) {
             self.inner.conns.lock().remove(&node);
@@ -279,6 +352,17 @@ impl Rpc {
 
     pub fn peer_addr(&self, node: NodeId) -> Option<SocketAddr> {
         self.inner.addrs.read().get(&node).copied()
+    }
+
+    /// Whether a live connection to `peer` is open (either direction).
+    pub fn connected(&self, peer: NodeId) -> bool {
+        let slot = self.inner.conns.lock().get(&peer).cloned();
+        slot.and_then(|s| {
+            s.try_lock()
+                .ok()
+                .and_then(|c| c.as_ref().map(|c| c.alive()))
+        })
+        .unwrap_or(false)
     }
 
     /// Send one request and wait for its response.
@@ -313,16 +397,42 @@ impl Rpc {
         let slot = self.inner.conns.lock().entry(peer).or_default().clone();
         let mut slot = slot.lock().await;
         if let Some(c) = slot.as_ref()
-            && !c.dead.load(Ordering::SeqCst)
+            && c.alive()
         {
             return Ok(c.clone());
         }
-        let addr = self
-            .peer_addr(peer)
-            .ok_or_else(|| RpcError::Unreachable(peer, "no address".into()))?;
+        let addr = self.peer_addr(peer).ok_or_else(|| {
+            RpcError::Unreachable(peer, "no address, and it has not connected here".into())
+        })?;
         let c = Conn::open(&self.inner, peer, addr).await?;
         *slot = Some(c.clone());
         Ok(c)
+    }
+
+    /// Reconnect to pinned peers as soon as their connection drops, so
+    /// they can always reach this host.
+    fn keep_pinned_connected(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        let mut stop = self.inner.shutdown.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = stop.changed() => return,
+                }
+                let Some(inner) = weak.upgrade() else { return };
+                let rpc = Rpc { inner };
+                let peers: Vec<NodeId> = rpc.inner.pinned.read().keys().copied().collect();
+                for p in peers {
+                    if !rpc.inner.filter.is_blocked(p) && !rpc.connected(p) {
+                        let r = rpc.clone();
+                        tokio::spawn(async move {
+                            let _ = r.conn(p).await;
+                        });
+                    }
+                }
+            }
+        });
     }
 
     /// Stop serving and close connections. Outstanding calls fail.
@@ -352,45 +462,13 @@ async fn serve(inner: Arc<Inner>, mut s: TcpStream) {
         }
         Err(_) => return,
     };
-    let (mut r, w) = s.into_split();
-    let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(writer(BufWriter::with_capacity(256 << 10, w), rx));
-    let mut stop = inner.shutdown.subscribe();
-    loop {
-        let f = tokio::select! {
-            f = read_frame(&mut r) => f,
-            _ = stop.changed() => return,
-        };
-        let Ok(f) = f else { return };
-        if f.kind != KIND_REQ {
-            return;
-        }
-        if inner.filter.is_blocked(peer) {
-            continue; // partitioned: the request is lost
-        }
-        let handler = inner.handlers.read().get(&f.service).cloned();
-        let tx = tx.clone();
-        let inner2 = inner.clone();
-        tokio::spawn(async move {
-            let (kind, service, body) = match handler {
-                None => (KIND_ERR, f.service, Bytes::new()),
-                Some(h) => match h.call(peer, f.body).await {
-                    Ok(b) => (KIND_OK, 0, b),
-                    Err(e) => (KIND_ERR, 0, Bytes::from(e.into_bytes())),
-                },
-            };
-            if inner2.filter.is_blocked(peer) {
-                return;
-            }
-            let _ = tx
-                .send(Frame {
-                    id: f.id,
-                    kind,
-                    service,
-                    body,
-                })
-                .await;
-        });
+    let conn = Conn::start(&inner, peer, s);
+    // A peer we cannot dial (no address: it is behind NAT) is reached over
+    // the connection it opened; the newest one wins. Peers we can dial keep
+    // their own outgoing connection for our requests.
+    if !inner.addrs.read().contains_key(&peer) {
+        let slot = inner.conns.lock().entry(peer).or_default().clone();
+        *slot.lock().await = Some(conn);
     }
 }
 
@@ -519,5 +597,94 @@ mod tests {
             &a.call(NodeId(2), 7, Bytes::new(), t).await.unwrap()[..],
             b"back"
         );
+    }
+
+    /// ADR-047: a host behind NAT dials out; the host it dialled has no
+    /// address for it and sends its own requests back over that connection.
+    #[tokio::test]
+    async fn a_peer_behind_nat_is_reached_over_the_connection_it_opened() {
+        let core = node(1, b"s").await;
+        let offgrid = node(2, b"s").await;
+        let t = Duration::from_secs(2);
+        // No address for node 2 on the core side, and none learned later.
+        assert!(matches!(
+            core.call(NodeId(2), 7, Bytes::new(), t).await,
+            Err(RpcError::Unreachable(..))
+        ));
+        offgrid.pin_peer(NodeId(1), core.local_addr());
+        // Membership later names node 1 by a fabric address: ignored.
+        offgrid.set_peer(NodeId(1), "10.255.255.1:9".parse().unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !core.connected(NodeId(2)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 never dialled in"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let r = core.call(NodeId(2), 7, Bytes::from_static(b"hi"), t).await;
+        assert_eq!(&r.unwrap()[..], b"2<-1:hi");
+        let r = offgrid
+            .call(NodeId(1), 7, Bytes::from_static(b"yo"), t)
+            .await;
+        assert_eq!(&r.unwrap()[..], b"1<-2:yo");
+        // Both directions at once, many in flight.
+        let ups: Vec<_> = (0..100)
+            .map(|i| core.call(NodeId(2), 7, Bytes::from(format!("{i}")), t))
+            .collect();
+        let downs: Vec<_> = (0..100)
+            .map(|i| offgrid.call(NodeId(1), 7, Bytes::from(format!("{i}")), t))
+            .collect();
+        let (ups, downs) = futures::join!(
+            futures::future::join_all(ups),
+            futures::future::join_all(downs)
+        );
+        for (i, (u, d)) in ups.into_iter().zip(downs).enumerate() {
+            assert_eq!(u.unwrap(), Bytes::from(format!("2<-1:{i}")));
+            assert_eq!(d.unwrap(), Bytes::from(format!("1<-2:{i}")));
+        }
+
+        // The core host restarts: the off-grid host dials in again and the
+        // core reaches it as before.
+        let addr = core.local_addr();
+        core.shutdown();
+        drop(core);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let core = Rpc::bind(RpcConfig {
+            node: NodeId(1),
+            cluster: "test".into(),
+            secret: b"s".to_vec(),
+            listen: addr,
+            connect_timeout: t,
+        })
+        .await
+        .unwrap();
+        core.register(
+            7,
+            Arc::new(|p: NodeId, b: Bytes| {
+                async move {
+                    let mut v = format!("1'<-{p}:").into_bytes();
+                    v.extend_from_slice(&b);
+                    Ok(Bytes::from(v))
+                }
+                .boxed()
+            }),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !core.connected(NodeId(2)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 did not reconnect"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let r = core
+            .call(NodeId(2), 7, Bytes::from_static(b"again"), t)
+            .await;
+        assert_eq!(&r.unwrap()[..], b"2<-1:again");
+        let r = offgrid
+            .call(NodeId(1), 7, Bytes::from_static(b"x"), t)
+            .await;
+        assert_eq!(&r.unwrap()[..], b"1'<-2:x");
     }
 }

@@ -2,6 +2,9 @@
 //!
 //! One TCP connection per peer pair and direction carries any number of
 //! concurrent requests, each tagged with a service number and a request id.
+//! Either end may send requests on a connection: a peer this node has no
+//! address for (an off-grid host behind NAT) is reached over the connection
+//! it opened, and pinned peers are kept connected (ADR-047).
 //! Connections are mutually authenticated with an HMAC challenge-response
 //! over the shared cluster secret (ADR-012). Payloads are opaque bytes;
 //! [`typed`] helpers encode serde types with postcard.
