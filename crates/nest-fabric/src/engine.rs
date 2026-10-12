@@ -61,6 +61,11 @@ pub struct FabricConfig {
     /// registered before its QP and ring are released: long enough for the
     /// NIC to flush its outstanding work into the completion queue.
     pub lane_grace: Duration,
+    /// After a failed link setup to a peer, how long until the next attempt;
+    /// doubled on each further failure up to `link_retry_max`. Meanwhile
+    /// reads to that peer fail at once (callers fall back to TCP).
+    pub link_retry: Duration,
+    pub link_retry_max: Duration,
 }
 
 /// A slot tier: its size, and landing and staging slots per device.
@@ -93,6 +98,8 @@ impl Default for FabricConfig {
             inflight_bytes: 0,
             devices: Vec::new(),
             lane_grace: Duration::from_secs(10),
+            link_retry: Duration::from_secs(1),
+            link_retry_max: Duration::from_secs(30),
         }
     }
 }
@@ -474,6 +481,12 @@ pub struct Fabric {
     next_lane: AtomicU32,
     links: Mutex<HashMap<NodeId, Arc<Link>>>,
     connecting: Mutex<HashMap<NodeId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Peers whose last link setup failed: when to try again, and the wait
+    /// after the next failure. Without it every read re-dialled at once (a
+    /// peer that could not pair took ~5,000 setups a minute).
+    retry: Mutex<HashMap<NodeId, (std::time::Instant, Duration)>>,
+    /// Link setups started (dialled), successful or not.
+    attempts: AtomicU64,
     /// Waiters by (device, landing slot), with the lane the request used.
     pending: Mutex<HashMap<(u32, u32), Waiter>>,
     /// Staging slots held until their write-with-imm completes.
@@ -593,6 +606,8 @@ impl Fabric {
             next_lane: AtomicU32::new(1),
             links: Mutex::new(HashMap::new()),
             connecting: Mutex::new(HashMap::new()),
+            retry: Mutex::new(HashMap::new()),
+            attempts: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             source: Mutex::new(None),
@@ -847,6 +862,11 @@ impl Fabric {
         count
     }
 
+    /// Link setups this host has started, for tests and diagnostics.
+    pub fn link_attempts(&self) -> u64 {
+        self.attempts.load(Ordering::Relaxed)
+    }
+
     /// Registered lanes, live and not yet released.
     pub fn lane_count(&self) -> usize {
         self.lanes.lock().len()
@@ -863,18 +883,55 @@ impl Fabric {
     }
 
     async fn link(&self, peer: NodeId) -> Result<Arc<Link>, NestError> {
-        if let Some(l) = self.links.lock().get(&peer).cloned()
-            && l.lanes.iter().all(|x| !x.dead.load(Ordering::SeqCst))
-        {
+        if let Some(l) = self.live_link(peer) {
             return Ok(l);
         }
         let gate = self.connecting.lock().entry(peer).or_default().clone();
         let _g = gate.lock().await;
-        if let Some(l) = self.links.lock().get(&peer).cloned()
-            && l.lanes.iter().all(|x| !x.dead.load(Ordering::SeqCst))
-        {
+        if let Some(l) = self.live_link(peer) {
             return Ok(l);
         }
+        if let Some((at, _)) = self.retry.lock().get(&peer)
+            && std::time::Instant::now() < *at
+        {
+            return Err(NestError::Unavailable(format!(
+                "RDMA link to {peer} failed recently; retrying later"
+            )));
+        }
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        match self.connect(peer).await {
+            Ok(link) => {
+                self.retry.lock().remove(&peer);
+                Ok(link)
+            }
+            Err(e) => {
+                let mut retry = self.retry.lock();
+                let wait = retry
+                    .get(&peer)
+                    .map_or(self.cfg.link_retry, |(_, w)| *w)
+                    .min(self.cfg.link_retry_max);
+                retry.insert(
+                    peer,
+                    (
+                        std::time::Instant::now() + wait,
+                        (wait * 2).min(self.cfg.link_retry_max),
+                    ),
+                );
+                tracing::warn!(%peer, error = %e, retry_in = ?wait, "RDMA link setup failed");
+                Err(e)
+            }
+        }
+    }
+
+    fn live_link(&self, peer: NodeId) -> Option<Arc<Link>> {
+        self.links
+            .lock()
+            .get(&peer)
+            .filter(|l| l.lanes.iter().all(|x| !x.dead.load(Ordering::SeqCst)))
+            .cloned()
+    }
+
+    async fn connect(&self, peer: NodeId) -> Result<Arc<Link>, NestError> {
         let mut offers = Vec::new();
         let mut lanes = Vec::new();
         let mut psns = Vec::new();

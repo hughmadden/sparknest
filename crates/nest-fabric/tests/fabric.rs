@@ -518,3 +518,60 @@ async fn replaced_links_release_their_lanes() {
     read().await.unwrap();
     assert_eq!(f2.lane_count(), steady);
 }
+
+/// A peer that cannot be linked is not re-dialled by every read: after a
+/// failed setup, reads fail at once until the backoff passes, and the wait
+/// doubles. Before this, each read dialled again (~5,000 setups a minute
+/// against hosts that could not pair).
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_link_setups_back_off() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("warn")
+        .try_init();
+    let cfg = FabricConfig {
+        chunk: 1 << 20,
+        client_slots: 4,
+        server_slots: 4,
+        window: 4,
+        devices: vec![],
+        link_retry: Duration::from_millis(300),
+        link_retry_max: Duration::from_secs(5),
+        ..FabricConfig::default()
+    };
+    let Some((rpc1, f1)) = node(1, cfg.clone()).await else {
+        return;
+    };
+    let (rpc2, f2) = node(2, cfg).await.unwrap();
+    rpc1.set_peer(NodeId(2), rpc2.local_addr());
+    let src: Arc<dyn ReadSource> = Arc::new(Pattern);
+    f1.set_source(Arc::downgrade(&src));
+    // Peer 1 unreachable: nothing listens there.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    rpc2.set_peer(NodeId(1), closed.local_addr().unwrap());
+    drop(closed);
+    let read = || f2.read(NodeId(1), FileId(7), Generation(3), 0, 4096);
+
+    assert!(read().await.is_err());
+    assert_eq!(f2.link_attempts(), 1);
+    for _ in 0..200 {
+        assert!(read().await.is_err());
+    }
+    assert_eq!(f2.link_attempts(), 1, "reads re-dialled during the backoff");
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(read().await.is_err());
+    assert_eq!(f2.link_attempts(), 2);
+    // The wait doubled: still backing off after the first interval.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(read().await.is_err());
+    assert_eq!(f2.link_attempts(), 2, "the wait did not double");
+
+    // Reachable again: the next attempt after the backoff links and reads.
+    rpc2.set_peer(NodeId(1), rpc1.local_addr());
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    read().await.unwrap();
+    assert_eq!(f2.link_attempts(), 3);
+    read().await.unwrap();
+    assert_eq!(f2.link_attempts(), 3);
+}
