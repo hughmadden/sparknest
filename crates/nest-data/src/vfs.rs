@@ -204,6 +204,8 @@ pub struct Vfs {
     inflight_done: tokio::sync::Notify,
     fence_hooks: Mutex<Vec<FenceHook>>,
     fabric: Mutex<Option<Arc<nest_fabric::Fabric>>>,
+    /// TCP lanes to and from off-grid hosts (ADR-048).
+    lanes: Mutex<Option<Arc<nest_fabric::tcp::Lanes>>>,
 }
 
 fn io(e: std::io::Error) -> NestError {
@@ -297,6 +299,7 @@ impl Vfs {
             inflight_done: tokio::sync::Notify::new(),
             fence_hooks: Mutex::new(Vec::new()),
             fabric: Mutex::new(None),
+            lanes: Mutex::new(None),
         });
         d.meta().rpc().register(
             nest_rpc::service::DATA,
@@ -544,6 +547,34 @@ impl Vfs {
 
     pub fn fabric(&self) -> Option<Arc<nest_fabric::Fabric>> {
         self.fabric.lock().clone()
+    }
+
+    /// Use `lanes` for reads to and from off-grid hosts, and serve their
+    /// requests from here.
+    pub fn attach_lanes(self: &Arc<Self>, lanes: Arc<nest_fabric::tcp::Lanes>) {
+        let src: Arc<dyn nest_fabric::ReadSource> = self.clone();
+        lanes.set_source(Arc::downgrade(&src));
+        // The lanes hold a Weak; keep the trait object alive with us.
+        std::mem::forget(src);
+        *self.lanes.lock() = Some(lanes);
+    }
+
+    pub fn lanes(&self) -> Option<Arc<nest_fabric::tcp::Lanes>> {
+        self.lanes.lock().clone()
+    }
+
+    /// How to fetch whole chunks from `peer`: TCP lanes when either end is
+    /// off the fabric, else RDMA. `None`: one request at a time over the
+    /// control connection.
+    fn bulk_to(&self, peer: NodeId) -> Option<Arc<dyn crate::bulk::Bulk>> {
+        let fabric = self.fabric();
+        if (fabric.is_none() || self.offgrid_hosts().contains(&peer))
+            && let Some(l) = self.lanes()
+            && l.connected(peer) > 0
+        {
+            return Some(l);
+        }
+        fabric.map(|f| f as Arc<dyn crate::bulk::Bulk>)
     }
 
     /// Register a blocking page-cache invalidation run during fencing.
@@ -1834,7 +1865,7 @@ impl Vfs {
                 let mut ra = h.readahead.lock().await;
                 if !ra.as_ref().is_some_and(|r| r.matches(h.file, a.generation)) {
                     *ra = Some(crate::readahead::Readahead::new(
-                        &fab,
+                        fab.clone(),
                         self.balancer.clone(),
                         self.patterns.clone(),
                         self.io.clone(),
@@ -1847,7 +1878,7 @@ impl Vfs {
                     ));
                 }
                 let r = ra.as_mut().expect("just set");
-                match r.read(&fab, offset, size).await {
+                match r.read(offset, size).await {
                     Ok(b) => {
                         let (l, rem) = r.take_served();
                         self.count_read(&h, crate::usage::Source::Local, l);
@@ -1953,13 +1984,13 @@ impl Vfs {
                 continue;
             }
             for s in sources {
-                if let Some(fab) = self.fabric() {
+                if let Some(bulk) = self.bulk_to(s) {
                     let r = if a.gen_state == GenState::Stable && !scattered {
                         // Immutable generation: read ahead in whole chunks.
                         let mut ra = h.readahead.lock().await;
                         if !ra.as_ref().is_some_and(|r| r.matches(h.file, a.generation)) {
                             *ra = Some(crate::readahead::Readahead::new(
-                                &fab,
+                                bulk.clone(),
                                 self.balancer.clone(),
                                 self.patterns.clone(),
                                 self.io.clone(),
@@ -1971,15 +2002,11 @@ impl Vfs {
                                 Some(a.size),
                             ));
                         }
-                        ra.as_mut()
-                            .expect("just set")
-                            .read(&fab, offset, size)
-                            .await
+                        ra.as_mut().expect("just set").read(offset, size).await
                     } else {
                         // Being written by its owner: fetch exactly this
                         // range, keep nothing.
-                        self.fabric_exact(&fab, s, h.file, a.generation, offset, size)
-                            .await
+                        bulk_exact(&bulk, s, h.file, a.generation, offset, size).await
                     };
                     match r {
                         Ok(b) => {
@@ -1995,8 +2022,9 @@ impl Vfs {
                             continue;
                         }
                         Err(e) => {
-                            // Fabric trouble: fall back to TCP for this read.
-                            tracing::debug!(peer = %s, error = %e, "RDMA read failed; using TCP");
+                            // Bulk trouble: fall back to the control
+                            // connection for this read.
+                            tracing::debug!(peer = %s, error = %e, "bulk read failed; using one request");
                             *h.readahead.lock().await = None;
                         }
                     }
@@ -2162,14 +2190,13 @@ impl Vfs {
         if a.gen_state != GenState::Stable || scattered {
             return None;
         }
-        let fab = self.fabric()?;
         let mut ra = h.readahead.try_lock().ok()?;
         let r = ra.as_mut()?;
         if !r.matches(h.file, a.generation) {
             return None;
         }
         let out = r.try_ready(offset, size)?;
-        r.advance(&fab, offset, size);
+        r.advance(offset, size);
         let (l, rem) = r.take_served();
         self.count_read(&h, crate::usage::Source::Local, l);
         self.count_read(&h, crate::usage::Source::Remote, rem);
@@ -2623,8 +2650,17 @@ impl Vfs {
             .await
             .expect("blocking task")
             .map_err(io)?;
-        let fab = self.fabric();
-        let chunk: u64 = fab.as_ref().map(|f| f.chunk() as u64).unwrap_or(4 << 20);
+        // Off the fabric (either end): TCP lanes, which need no slots.
+        let lanes = self
+            .lanes()
+            .filter(|l| l.connected(src) > 0)
+            .filter(|_| self.fabric().is_none() || self.offgrid_hosts().contains(&src));
+        let fab = if lanes.is_some() { None } else { self.fabric() };
+        let chunk: u64 = match (&fab, &lanes) {
+            (Some(f), _) => f.chunk() as u64,
+            (None, Some(l)) => l.chunk() as u64,
+            (None, None) => 4 << 20,
+        };
         let window = 16usize;
         // Chunks are fetched 16 at a time and written as they arrive by
         // direct I/O through io_uring (nest_store::uring): no thread waits
@@ -2636,12 +2672,21 @@ impl Vfs {
         let mut inflight = futures::stream::FuturesUnordered::new();
         use futures::StreamExt;
         let fetch = |off: u64| {
-            let (fab, st) = (fab.clone(), staging.clone());
+            let (fab, lanes, st) = (fab.clone(), lanes.clone(), staging.clone());
             let (file, generation, size) = (a.id, a.generation, a.size);
             async move {
                 let len = (size - off).min(chunk) as usize;
-                let buf = match &fab {
-                    Some(f) => match f.read(src, file, generation, off, len).await {
+                let buf = match (&fab, &lanes) {
+                    (_, Some(l)) => match l.read(src, file, generation, off, len).await {
+                        Ok(b) => nest_store::uring::AlignedBuf::copy_of(&b),
+                        Err(NestError::Stale) => return Err(NestError::Stale),
+                        Err(_) => nest_store::uring::AlignedBuf::copy_of(
+                            &self
+                                .tcp_read(src, file, generation, off, len as u32)
+                                .await?,
+                        ),
+                    },
+                    (Some(f), None) => match f.read(src, file, generation, off, len).await {
                         Ok(b) => nest_store::uring::AlignedBuf::copy_of(b.as_slice()),
                         Err(NestError::Stale) => return Err(NestError::Stale),
                         Err(_) => nest_store::uring::AlignedBuf::copy_of(
@@ -2650,7 +2695,7 @@ impl Vfs {
                                 .await?,
                         ),
                     },
-                    None => nest_store::uring::AlignedBuf::copy_of(
+                    (None, None) => nest_store::uring::AlignedBuf::copy_of(
                         &self
                             .tcp_read(src, file, generation, off, len as u32)
                             .await?,
@@ -3041,4 +3086,29 @@ impl ScatteredRead {
             }),
         );
     }
+}
+
+/// One uncached read of exactly `[offset, offset+size)` over `bulk`.
+async fn bulk_exact(
+    bulk: &Arc<dyn crate::bulk::Bulk>,
+    source: NodeId,
+    file: FileId,
+    generation: Generation,
+    offset: u64,
+    size: u32,
+) -> NestResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(size as usize);
+    let chunk = bulk.chunk();
+    while out.len() < size as usize {
+        let want = (size as usize - out.len()).min(chunk);
+        let b = bulk
+            .clone()
+            .fetch(source, file, generation, offset + out.len() as u64, want)
+            .await?;
+        out.extend_from_slice(&b);
+        if b.len() < want {
+            break;
+        }
+    }
+    Ok(out)
 }

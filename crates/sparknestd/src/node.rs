@@ -82,6 +82,7 @@ impl Node {
     ) -> anyhow::Result<Node> {
         let id = cfg.node.id;
         let secret_for_web = secret.clone();
+        let lanes_secret = secret.clone();
         std::fs::create_dir_all(&cfg.node.state_dir)
             .with_context(|| format!("creating {}", cfg.node.state_dir.display()))?;
         let rpc = Rpc::bind(RpcConfig {
@@ -268,8 +269,29 @@ impl Node {
             }
         };
         let retry_fabric = fabric.is_none()
+            && !offgrid
             && cfg.fabric.mode == crate::config::FabricMode::Auto
             && tuning.fabric.is_some();
+        // TCP lanes (ADR-048): every host accepts them; an off-grid host
+        // dials every member it knows and keeps the lanes open.
+        let lanes = nest_fabric::tcp::Lanes::start(
+            id,
+            cfg.cluster.name.clone(),
+            lanes_secret,
+            nest_fabric::tcp::LanesConfig {
+                per_peer: cfg.node.lanes.max(1),
+                ..Default::default()
+            },
+            Some(cfg.node.lanes_listen()),
+        )
+        .await
+        .with_context(|| format!("binding TCP lanes on {}", cfg.node.lanes_listen()))?;
+        vfs.attach_lanes(lanes.clone());
+        if offgrid {
+            for m in cfg.cluster.members.iter().filter(|m| m.id != id) {
+                lanes.dial(m.id, m.lanes());
+            }
+        }
         let fabric = Arc::new(parking_lot::Mutex::new(fabric));
         if retry_fabric {
             // At boot the RoCE addresses may not be configured yet: keep
@@ -499,6 +521,9 @@ impl Node {
         self.unmount();
         if let Some(f) = self.fabric.lock().take() {
             f.shutdown();
+        }
+        if let Some(l) = self.vfs.lanes() {
+            l.shutdown();
         }
         self.data.shutdown();
         self.meta.shutdown().await;

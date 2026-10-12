@@ -56,6 +56,8 @@ pub struct TestCluster {
     boots: BTreeMap<u64, u64>,
     /// Off-grid nodes (ADR-047): learners the others have no address for.
     offgrid: std::collections::BTreeSet<u64>,
+    /// Each node's TCP lanes address, kept across restarts.
+    lanes: BTreeMap<u64, SocketAddr>,
 }
 
 impl TestCluster {
@@ -73,6 +75,7 @@ impl TestCluster {
             nodes: BTreeMap::new(),
             boots: BTreeMap::new(),
             offgrid: Default::default(),
+            lanes: BTreeMap::new(),
         };
         for id in 1..=n {
             c.boot(id, "127.0.0.1:0".parse().unwrap()).await;
@@ -118,6 +121,13 @@ impl TestCluster {
                 } else {
                     sparknestd::config::Role::Fabric
                 },
+                lanes_listen: Some(
+                    self.lanes
+                        .get(&id)
+                        .copied()
+                        .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
+                ),
+                lanes: 2,
             },
             cluster: ClusterSection {
                 name: "testkit".into(),
@@ -134,6 +144,7 @@ impl TestCluster {
                         name: format!("n{i}"),
                         addr: *a,
                         voter: !self.offgrid.contains(i),
+                        lanes: self.lanes.get(i).copied(),
                     })
                     .collect(),
             },
@@ -157,6 +168,9 @@ impl TestCluster {
         tuning.boot_id = Some(format!("test-boot-{}", self.boots.entry(id).or_insert(0)));
         let node = start_node(cfg, tuning).await;
         self.addrs.insert(id, node.rpc.local_addr());
+        if let Some(a) = node.vfs.lanes().and_then(|l| l.local_addr()) {
+            self.lanes.insert(id, a);
+        }
         self.nodes.insert(id, node);
     }
 
@@ -199,6 +213,9 @@ impl TestCluster {
             .collect();
         for (id, n) in futures::future::join_all(starts).await {
             self.addrs.insert(id, n.rpc.local_addr());
+            if let Some(a) = n.vfs.lanes().and_then(|l| l.local_addr()) {
+                self.lanes.insert(id, a);
+            }
             self.nodes.insert(id, n);
         }
     }

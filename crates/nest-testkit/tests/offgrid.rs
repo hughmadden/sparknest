@@ -197,3 +197,55 @@ async fn an_offgrid_host_rejoins_after_a_fabric_restart_and_its_own() {
     .await;
     assert_eq!(read_all(&c, 4, h).await, b"three");
 }
+
+fn lane_read(c: &TestCluster, id: u64) -> u64 {
+    c.node(id).vfs.lanes().map_or(0, |l| {
+        l.stats
+            .read_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// Bulk data to and from an off-grid host travels over the TCP lanes it
+/// dialled (ADR-048): reads both ways and a whole-file copy onto it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn offgrid_data_goes_over_tcp_lanes_both_ways() {
+    let c = with_offgrid(3, 4).await;
+    c.eventually("lanes up", Duration::from_secs(5), |c| {
+        let l = c.node(4).vfs.lanes().unwrap();
+        (1..=3).all(|i| l.connected(NodeId(i)) >= 2)
+    })
+    .await;
+    let big: Vec<u8> = (0..(9 << 20) + 777).map(|i| (i % 251) as u8).collect();
+    let f = file(&c, 1, "big", &big).await;
+
+    // Read from a fabric host: over lanes, in whole chunks.
+    let before = lane_read(&c, 4);
+    assert_eq!(read_all(&c, 4, f).await, big);
+    assert!(
+        lane_read(&c, 4) - before >= big.len() as u64,
+        "not read over lanes"
+    );
+
+    // Copied onto the off-grid host (onboarding): over lanes too.
+    let before = lane_read(&c, 4);
+    c.node(4).vfs.replicate_here(f).await.unwrap();
+    c.converge().await;
+    assert!(
+        lane_read(&c, 4) - before >= big.len() as u64,
+        "copy not over lanes"
+    );
+    let local = c.node(4).vfs.local_read_bytes();
+    assert_eq!(read_all(&c, 4, f).await, big);
+    assert_eq!(c.node(4).vfs.local_read_bytes() - local, big.len() as u64);
+
+    // A fabric host reads what only the off-grid host holds, over the
+    // lanes the off-grid host opened.
+    let g = file(&c, 4, "offgrid-only", &big[..3 << 20]).await;
+    let before = lane_read(&c, 2);
+    assert_eq!(read_all(&c, 2, g).await, &big[..3 << 20]);
+    assert!(
+        lane_read(&c, 2) - before >= 3 << 20,
+        "fabric host did not use lanes"
+    );
+}

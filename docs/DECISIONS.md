@@ -1244,3 +1244,34 @@ hosts already vote.
 
 The TCP bulk data path and the planner and UI work follow in their own
 ADRs.
+
+## ADR-048 — TCP lanes: the bulk path for off-grid hosts (2026-10-12)
+
+**Context.** Off-grid hosts (ADR-047) read and copy whole models over
+10GbE. Before this, a host without RDMA read one request at a time over its
+control connection, which also carries Raft heartbeats and lease renewals:
+a large transfer could delay a lease. Measurements (benchmarks/M10-LAN-TCP.md):
+one TCP stream does not fill the link into WSL2 (4–5.7 Gb/s) and leaves
+headroom on kakapo; four streams with eight 4 MiB chunks in flight reach
+9.2–9.6 Gb/s on both; slow start after idle costs 20–40% of an idle
+connection's first chunk.
+
+**Decision.**
+1. **Lanes.** Each off-grid host keeps `node.lanes` (default 4) TCP
+   connections to every member it knows, dialled by it (it may sit behind
+   NAT) at `listen` port + 2 (`lanes_listen`). Lanes are authenticated with
+   the cluster secret and carry range requests both ways, so fabric hosts
+   read from an off-grid host over the lanes it opened.
+2. **Serving.** Answers are a header sent with MSG_MORE followed by
+   `sendfile` from the object: no user-space copy on the serving host.
+   Objects open through the same `ReadSource` as RDMA reads, so serving
+   checks and fence guards are shared; a guard is held until the bytes are
+   on the wire. TCP_NODELAY on every lane; socket buffers left to
+   autotuning; `tcp_slow_start_after_idle=0` on every host.
+3. **Use.** Readahead and replication fetch whole chunks through one
+   interface (`Bulk`) with two transports: RDMA between fabric hosts, lanes
+   when either end is off-grid. Reads in flight are capped in bytes
+   (64 MiB) as on the fabric. Without a lane the old one-request path
+   remains the fallback.
+4. **Jumbo frames** stay off: the LAN switching drops frames over 1500
+   bytes (ENVIRONMENT.md).

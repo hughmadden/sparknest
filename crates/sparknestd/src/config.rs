@@ -74,6 +74,28 @@ pub struct NodeSection {
     /// open, and reads its own copies first.
     #[serde(default)]
     pub role: Role,
+    /// Where TCP lanes to off-grid hosts are accepted (ADR-048); defaults
+    /// to `listen` with the port plus 2.
+    #[serde(default)]
+    pub lanes_listen: Option<SocketAddr>,
+    /// TCP lanes this host keeps to each host it dials (off-grid hosts).
+    #[serde(default = "default_lanes")]
+    pub lanes: usize,
+}
+
+fn default_lanes() -> usize {
+    4
+}
+
+impl NodeSection {
+    pub fn lanes_listen(&self) -> SocketAddr {
+        self.lanes_listen
+            .unwrap_or_else(|| port_plus_2(self.listen))
+    }
+}
+
+fn port_plus_2(a: SocketAddr) -> SocketAddr {
+    SocketAddr::new(a.ip(), a.port().wrapping_add(2))
 }
 
 /// Where a host sits (ADR-047).
@@ -106,6 +128,15 @@ pub struct Member {
     pub addr: SocketAddr,
     #[serde(default = "default_true")]
     pub voter: bool,
+    /// Its TCP lanes address, when it is not `addr` with the port plus 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lanes: Option<SocketAddr>,
+}
+
+impl Member {
+    pub fn lanes(&self) -> SocketAddr {
+        self.lanes.unwrap_or_else(|| port_plus_2(self.addr))
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

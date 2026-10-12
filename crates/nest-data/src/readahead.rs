@@ -8,8 +8,9 @@
 //!
 //! Each chunk comes from the source the node's `Balancer` picks among the
 //! copies given: this host's disk (a pread on the blocking pool) or a holder
-//! over the fabric. A source that fails a chunk (its copy gone, a peer
-//! down) is dropped for this stream and the chunk is fetched elsewhere.
+//! over the fabric or TCP lanes (`bulk`). A source that fails a chunk (its
+//! copy gone, a peer down) is dropped for this stream and the chunk is
+//! fetched elsewhere.
 //! Fabric chunks are copied out of their registered landing slot on arrival
 //! (holding slots until the reader got there starved new requests);
 //! speculative fabric chunks are still only requested while the node has
@@ -22,8 +23,8 @@
 //! directly instead (see `pattern`).
 
 use crate::balance::{Balancer, Source};
+use crate::bulk::Bulk;
 use crate::pattern::Patterns;
-use nest_fabric::Fabric;
 use nest_store::{ObjectKey, ObjectStore};
 use nest_types::{FileId, Generation, NestError, NestResult};
 use std::collections::BTreeMap;
@@ -53,6 +54,8 @@ enum Chunk {
 }
 
 pub(crate) struct Readahead {
+    /// How remote chunks are fetched: RDMA, or TCP lanes off the fabric.
+    bulk: Arc<dyn Bulk>,
     file: FileId,
     generation: Generation,
     /// Where copies are; `Local` reads from `local`.
@@ -83,7 +86,7 @@ impl Readahead {
     /// `local` must be given when it includes `Source::Local`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        fabric: &Fabric,
+        bulk: Arc<dyn Bulk>,
         balancer: Arc<Balancer>,
         patterns: Arc<Patterns>,
         io: Arc<nest_fabric::iostats::IoStats>,
@@ -95,12 +98,13 @@ impl Readahead {
         size: Option<u64>,
     ) -> Readahead {
         Readahead {
+            chunk: bulk.chunk() as u64,
+            bulk,
             file,
             generation,
             sources,
             local,
             balancer,
-            chunk: fabric.chunk() as u64,
             window: 1,
             max_window: max_window.max(1),
             next: 0,
@@ -131,11 +135,11 @@ impl Readahead {
     /// take the slots a demanded read needs (PROPOSAL invariant 9; without
     /// this, many readers reading ahead deadlock). With slots short it goes
     /// to the local disk if there is a copy, else waits.
-    fn fetch(&mut self, fabric: &Arc<Fabric>, start: u64, speculative: bool) {
+    fn fetch(&mut self, start: u64, speculative: bool) {
         if self.chunks.contains_key(&start) || self.eof.is_some_and(|e| start >= e) {
             return;
         }
-        let slots_short = fabric.spare_landing() <= fabric.landing_slots() / 4;
+        let slots_short = !self.bulk.speculate();
         let local_only = [Source::Local];
         let candidates: &[Source] = if speculative && slots_short {
             if !self.sources.contains(&Source::Local) {
@@ -198,12 +202,10 @@ impl Readahead {
                 })
             }
             Source::Peer(node) => {
-                let f = fabric.clone();
+                let fetch = self.bulk.clone().fetch(node, file, generation, start, len);
                 self.rt.spawn(async move {
-                    match f.read(node, file, generation, start, len).await {
-                        Ok(b) => {
-                            let v = b.as_slice().to_vec();
-                            drop(b); // the landing slot is free again
+                    match fetch.await {
+                        Ok(v) => {
                             ticket.finish(v.len() as u64);
                             Ok(Buf(v))
                         }
@@ -218,7 +220,7 @@ impl Readahead {
         self.chunks.insert(start, Chunk::Pending(src, task));
     }
 
-    async fn ready(&mut self, fabric: &Arc<Fabric>, start: u64) -> NestResult<()> {
+    async fn ready(&mut self, start: u64) -> NestResult<()> {
         while let Some(Chunk::Pending(..)) = self.chunks.get(&start) {
             let Some(Chunk::Pending(src, h)) = self.chunks.remove(&start) else {
                 unreachable!()
@@ -237,7 +239,7 @@ impl Readahead {
                 Err(e) if self.sources.len() > 1 => {
                     tracing::debug!(file = self.file.0, ?src, error = %e, "chunk source failed; trying another copy");
                     self.sources.retain(|s| *s != src);
-                    self.fetch(fabric, start, false);
+                    self.fetch(start, false);
                 }
                 Err(e) => return Err(e),
             }
@@ -327,15 +329,15 @@ impl Readahead {
 
     /// Top up the window after `[offset, offset+size)` with speculative
     /// chunks (fabric ones only while landing slots are spare).
-    fn top_up(&mut self, fabric: &Arc<Fabric>, last: u64) {
+    fn top_up(&mut self, last: u64) {
         let c = self.chunk;
         for i in 1..self.window as u64 {
-            self.fetch(fabric, last + i * c, true);
+            self.fetch(last + i * c, true);
         }
     }
 
     /// After a fast-path hit: drop consumed chunks and top up the window.
-    pub(crate) fn advance(&mut self, fabric: &Arc<Fabric>, offset: u64, size: u32) {
+    pub(crate) fn advance(&mut self, offset: u64, size: u32) {
         let c = self.chunk;
         let first = offset / c * c;
         let stale: Vec<u64> = self.chunks.range(..first).map(|(k, _)| *k).collect();
@@ -343,16 +345,11 @@ impl Readahead {
             self.drop_chunk(k);
         }
         let last = (offset + size as u64).saturating_sub(1) / c * c;
-        self.top_up(fabric, last);
+        self.top_up(last);
     }
 
     /// Read `[offset, offset+size)`, returning fewer bytes only at EOF.
-    pub(crate) async fn read(
-        &mut self,
-        fabric: &Arc<Fabric>,
-        offset: u64,
-        size: u32,
-    ) -> NestResult<Vec<u8>> {
+    pub(crate) async fn read(&mut self, offset: u64, size: u32) -> NestResult<Vec<u8>> {
         let c = self.chunk;
         let first = offset / c * c;
         let sequential = offset == self.next || self.chunks.contains_key(&first);
@@ -371,16 +368,16 @@ impl Readahead {
         let last = (offset + size as u64).saturating_sub(1) / c * c;
         let mut s = first;
         while s <= last {
-            self.fetch(fabric, s, false);
+            self.fetch(s, false);
             s += c;
         }
-        self.top_up(fabric, last);
+        self.top_up(last);
         let mut out = Vec::with_capacity(size as usize);
         let mut pos = offset;
         let end = offset + size as u64;
         while pos < end {
             let start = pos / c * c;
-            if let Err(e) = self.ready(fabric, start).await {
+            if let Err(e) = self.ready(start).await {
                 // A chunk no copy could serve (e.g. Stale) poisons this state.
                 self.chunks.clear();
                 return Err(e);

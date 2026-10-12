@@ -20,6 +20,7 @@ mod local;
 pub mod pattern;
 /// Read latencies by kind and size (recorded by the fabric and the VFS).
 pub use nest_fabric::iostats;
+mod bulk;
 mod readahead;
 mod remote;
 mod session;
