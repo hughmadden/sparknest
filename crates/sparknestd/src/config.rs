@@ -81,6 +81,14 @@ pub struct NodeSection {
     /// TCP lanes this host keeps to each host it dials (off-grid hosts).
     #[serde(default = "default_lanes")]
     pub lanes: usize,
+    /// RDMA counters as JSON over HTTP (ADR-051); loopback only. The
+    /// binary stream is always at `<state_dir>/rdma-counters.sock`.
+    #[serde(default = "default_counters_listen")]
+    pub counters_listen: Option<SocketAddr>,
+}
+
+fn default_counters_listen() -> Option<SocketAddr> {
+    Some(SocketAddr::from(([127, 0, 0, 1], 7403)))
 }
 
 fn default_lanes() -> usize {
@@ -254,6 +262,13 @@ impl Config {
         if self.node.id.0 == 0 {
             bail!("node.id must be non-zero");
         }
+        if let Some(a) = self.node.counters_listen
+            && !a.ip().is_loopback()
+        {
+            bail!(
+                "node.counters_listen must be a loopback address (got {a}): the counters are unauthenticated"
+            );
+        }
         if self.node.role == Role::Offgrid {
             if self
                 .cluster
@@ -284,6 +299,11 @@ impl Config {
 
     pub fn api_socket(&self) -> PathBuf {
         self.node.state_dir.join("api.sock")
+    }
+
+    /// The RDMA counters stream (ADR-051).
+    pub fn counters_socket(&self) -> PathBuf {
+        self.node.state_dir.join("rdma-counters.sock")
     }
 }
 

@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Read sparknest's RDMA counters stream (ADR-051, docs/RDMA-COUNTERS.md).
+
+  sparknest-rdma-counters [--socket PATH] [--hz N] [--rates]
+
+Prints one JSON object per frame: the counters per RDMA device port, or
+with --rates the bytes and estimated packets per second since the last
+frame (the first frame and frames after a daemon restart print totals).
+The module's `frames()` is the reference decoder for other tools.
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+"""
+import argparse
+import json
+import socket
+import struct
+import sys
+
+SCHEMA = 1
+HELLO = 1
+COUNTERS = 2
+FIELDS = ("bytes_sent", "bytes_received", "ops_sent", "ops_received",
+          "packets_sent", "packets_received")
+
+
+def _str(b, i):
+    n = b[i]
+    return b[i + 1:i + 1 + n].decode(), i + 1 + n
+
+
+def decode(kind, body):
+    """One frame's body as a dict: {"type": "hello"|"counters", ...}."""
+    if kind == HELLO:
+        schema, start_id, epoch, boot, gen, n = struct.unpack_from("<HQQ16sIH", body, 0)
+        if schema != SCHEMA:
+            raise ValueError(f"schema {schema}, this decoder reads {SCHEMA}")
+        i = struct.calcsize("<HQQ16sIH")
+        ports = []
+        for _ in range(n):
+            port, mtu = struct.unpack_from("<BI", body, i)
+            i += 5
+            device, i = _str(body, i)
+            netdev, i = _str(body, i)
+            addrs = []
+            na = body[i]
+            i += 1
+            for _ in range(na):
+                a, i = _str(body, i)
+                addrs.append(a)
+            ports.append({"device": device, "port": port, "netdev": netdev,
+                          "addrs": addrs, "path_mtu": mtu})
+        b = boot.hex()
+        return {"type": "hello", "schema": schema, "start_id": start_id,
+                "start_epoch_ns": epoch, "generation": gen, "ports": ports,
+                "boot_id": f"{b[:8]}-{b[8:12]}-{b[12:16]}-{b[16:20]}-{b[20:]}"}
+    if kind == COUNTERS:
+        seq, mono, wall, gen, n = struct.unpack_from("<QQQIH", body, 0)
+        i = struct.calcsize("<QQQIH")
+        values = [dict(zip(FIELDS, struct.unpack_from("<6Q", body, i + k * 48)))
+                  for k in range(n)]
+        return {"type": "counters", "seq": seq, "mono_ns": mono, "wall_ns": wall,
+                "generation": gen, "values": values}
+    return {"type": f"unknown-{kind}"}
+
+
+def frames(f):
+    """Decoded frames from a binary file-like stream (a socket's makefile)."""
+    while True:
+        hdr = f.read(4)
+        if len(hdr) < 4:
+            return
+        (n,) = struct.unpack("<I", hdr)
+        body = f.read(n)
+        if len(body) < n:
+            return
+        yield decode(body[0], body[1:])
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--socket", default="/srv/sparknest/rdma-counters.sock")
+    p.add_argument("--hz", type=int, default=1, help="frames per second, 1 to 20")
+    p.add_argument("--rates", action="store_true", help="per-second rates, not totals")
+    a = p.parse_args()
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(a.socket)
+    if a.hz != 1:
+        s.sendall(bytes([max(1, min(20, a.hz))]))
+    hello, last = None, None
+    for fr in frames(s.makefile("rb")):
+        if fr["type"] == "hello":
+            if hello and hello["start_id"] != fr["start_id"]:
+                last = None
+            hello = fr
+            continue
+        if fr["type"] != "counters" or not hello:
+            continue
+        out = {"seq": fr["seq"], "wall_ns": fr["wall_ns"], "start_id": hello["start_id"], "ports": []}
+        for port, v in zip(hello["ports"], fr["values"]):
+            row = {"device": port["device"], "port": port["port"], "netdev": port["netdev"]}
+            key = (port["device"], port["port"])
+            if a.rates and last and key in last[1]:
+                dt = (fr["mono_ns"] - last[0]) / 1e9
+                row.update({k + "_per_s": round((v[k] - last[1][key][k]) / dt)
+                            for k in ("bytes_sent", "bytes_received", "packets_sent", "packets_received")})
+            else:
+                row.update(v)
+            out["ports"].append(row)
+        last = (fr["mono_ns"], {(p["device"], p["port"]): v for p, v in zip(hello["ports"], fr["values"])})
+        print(json.dumps(out), flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)

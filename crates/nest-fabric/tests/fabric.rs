@@ -575,3 +575,80 @@ async fn failed_link_setups_back_off() {
     read().await.unwrap();
     assert_eq!(f2.link_attempts(), 3);
 }
+
+/// ADR-051: every byte read counts once, as sent on the serving host's
+/// port and received on the reader's; requests count as control messages.
+#[tokio::test(flavor = "multi_thread")]
+async fn port_counters_match_the_bytes_moved() {
+    let cfg = FabricConfig {
+        chunk: 1 << 20,
+        client_slots: 4,
+        server_slots: 4,
+        window: 4,
+        devices: vec![],
+        ..FabricConfig::default()
+    };
+    let Some((rpc1, f1)) = node(1, cfg.clone()).await else {
+        return;
+    };
+    let (rpc2, f2) = node(2, cfg).await.unwrap();
+    rpc2.set_peer(NodeId(1), rpc1.local_addr());
+    rpc1.set_peer(NodeId(2), rpc2.local_addr());
+    let src: Arc<dyn ReadSource> = Arc::new(Pattern);
+    f1.set_source(Arc::downgrade(&src));
+    let ports = f2.ports();
+    assert!(!ports.is_empty());
+    assert!(
+        ports
+            .iter()
+            .all(|p| p.path_mtu >= 1024 && !p.netdev.is_empty())
+    );
+
+    let total = |f: &Fabric| {
+        let mut v = Vec::new();
+        f.port_counters(&mut v);
+        v.iter().fold(
+            nest_fabric::counters::CounterValues::default(),
+            |mut a, c| {
+                a.bytes_sent += c.bytes_sent;
+                a.bytes_received += c.bytes_received;
+                a.ops_sent += c.ops_sent;
+                a.ops_received += c.ops_received;
+                a.packets_sent += c.packets_sent;
+                a.packets_received += c.packets_received;
+                a
+            },
+        )
+    };
+    // Link up first (its setup sends nothing over RDMA).
+    f2.read(NodeId(1), FileId(7), Generation(3), 0, 4096)
+        .await
+        .unwrap();
+    let (s0, r0) = (total(&f1), total(&f2));
+    let sizes = [1 << 20, 1 << 20, 4096, 100_000, 1];
+    for (i, n) in sizes.iter().enumerate() {
+        let b = f2
+            .read(NodeId(1), FileId(7), Generation(3), (i as u64) << 20, *n)
+            .await
+            .unwrap();
+        assert_eq!(b.len(), *n);
+    }
+    let bytes: u64 = sizes.iter().map(|n| *n as u64).sum();
+    let (s1, r1) = (total(&f1), total(&f2));
+    let mtu = ports[0].path_mtu as u64;
+    let packets: u64 = sizes.iter().map(|n| (*n as u64).div_ceil(mtu)).sum();
+    // Serving host: the data out, the requests in.
+    assert_eq!(s1.bytes_sent - s0.bytes_sent, bytes);
+    assert_eq!(s1.ops_sent - s0.ops_sent, sizes.len() as u64);
+    assert_eq!(s1.packets_sent - s0.packets_sent, packets);
+    assert_eq!(s1.ops_received - s0.ops_received, sizes.len() as u64);
+    // Reader: the data in, one request message out per read.
+    assert_eq!(r1.bytes_received - r0.bytes_received, bytes);
+    assert_eq!(r1.packets_received - r0.packets_received, packets);
+    assert_eq!(r1.ops_sent - r0.ops_sent, sizes.len() as u64);
+    assert_eq!(
+        r1.bytes_sent - r0.bytes_sent,
+        s1.bytes_received - s0.bytes_received,
+        "request bytes sent and received differ"
+    );
+}

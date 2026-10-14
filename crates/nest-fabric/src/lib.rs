@@ -4,6 +4,7 @@
 //! RAII wrappers; `rail` discovers RoCE v2 rails. The link and read
 //! protocol live in `link` and `engine`.
 
+pub mod counters;
 mod engine;
 pub mod iostats;
 mod pool;

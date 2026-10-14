@@ -332,7 +332,30 @@ impl Node {
         };
         let sock = cfg.api_socket();
         let web_addr = cfg.node.api_listen;
+        let counters = {
+            let slot = Arc::downgrade(&fabric);
+            nest_api::counters::Counters::new(move || slot.upgrade().and_then(|s| s.lock().clone()))
+        };
+        let (counters_http, counters_sock) = (cfg.node.counters_listen, cfg.counters_socket());
         let api_task = tokio::spawn(async move {
+            let c2 = counters.clone();
+            let counters = async move {
+                let http = async move {
+                    if let Some(addr) = counters_http
+                        && let Err(e) = nest_api::counters::serve_http(c2, addr).await
+                    {
+                        tracing::error!(error = %e, %addr, "RDMA counters listener stopped");
+                    }
+                };
+                let stream = async move {
+                    if let Err(e) =
+                        nest_api::counters::serve_stream(counters, counters_sock.clone()).await
+                    {
+                        tracing::error!(error = %e, socket = %counters_sock.display(), "RDMA counters stream stopped");
+                    }
+                };
+                tokio::join!(http, stream);
+            };
             let api_unix = api.clone();
             let unix = async move {
                 if let Err(e) = nest_api::serve_unix(api_unix, sock.clone()).await {
@@ -346,7 +369,7 @@ impl Node {
                     tracing::error!(error = %e, %addr, "web UI listener stopped");
                 }
             };
-            tokio::join!(unix, tcp);
+            tokio::join!(unix, tcp, counters);
         });
         let node = Node {
             cfg,

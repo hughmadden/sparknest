@@ -1307,3 +1307,31 @@ address is set while it is still a learner, then it becomes a voter. At
 least three voters must remain. The host then starts with the matching
 `node.toml` (`role`, `listen`, members at fabric or LAN addresses). Its
 copies stay where they are; only how they are counted by Place changes.
+
+## ADR-051 — RDMA traffic counters for benchmarking (2026-10-15)
+
+**Context.** The RDMA fabric is shared by sparknest (model loads,
+replication), the LLM engine's engram table reads and its activations.
+Engine benchmarks are sometimes confounded by sparknest traffic; the engine
+measures the NIC totals on its own schedule and needs sparknest's share to
+subtract.
+
+**Decision.**
+1. Each RDMA device port keeps cumulative payload bytes, operations and
+   estimated packets (`ceil(bytes / path_mtu)` per operation), sent and
+   received, as relaxed atomics added on the completion path where sizes
+   are known (data at successful completion, control messages at post).
+   They reset only when the daemon restarts; a random `start_id` marks
+   each start. Reading them takes no lock.
+2. Exposed read-only and unauthenticated, on loopback only: a JSON
+   snapshot (`GET 127.0.0.1:7403/v1/rdma/counters`) and a binary stream on
+   `<state_dir>/rdma-counters.sock` (mode 0666, for containers): a hello
+   with the port table, then counters at 1 Hz or a rate the reader asks
+   for with one byte (up to 20 Hz). Slow readers skip frames, never
+   buffered. Layout in docs/RDMA-COUNTERS.md, pinned by a fixture both the
+   encoder and the Python reference decoder are tested against.
+3. Ports are named as `/sys/class/infiniband` names them, with their
+   netdev, addresses and path MTU; timestamps are `CLOCK_MONOTONIC` and
+   wall clock with the boot id.
+4. Not included: per-peer or per-class splits, events, the NIC's own
+   counters, TCP lanes, rates, file names, histograms, control actions.

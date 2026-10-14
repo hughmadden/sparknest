@@ -249,6 +249,9 @@ fn wr_parts(id: u64) -> (u64, u32, u32) {
 struct Device {
     id: u32,
     ctx: Arc<Context>,
+    /// The port as /sys/class/infiniband names it (ADR-051).
+    info: crate::counters::PortInfo,
+    counters: crate::counters::PortCounters,
     cq: Arc<Cq>,
     landing: Tiers,
     staging: Tiers,
@@ -366,6 +369,8 @@ struct Lane {
     dead: AtomicBool,
     /// When the lane died; the expiry sweep releases it after `lane_grace`.
     dead_at: Mutex<Option<std::time::Instant>>,
+    /// Path MTU agreed with the peer, bytes (for packet estimates).
+    mtu: AtomicU32,
 }
 
 impl Lane {
@@ -490,7 +495,8 @@ pub struct Fabric {
     /// Waiters by (device, landing slot), with the lane the request used.
     pending: Mutex<HashMap<(u32, u32), Waiter>>,
     /// Staging slots held until their write-with-imm completes.
-    in_flight: Mutex<HashMap<u64, Slot>>,
+    /// With the bytes written, counted when the write completes.
+    in_flight: Mutex<HashMap<u64, (Slot, u32)>>,
     source: Mutex<Option<Weak<dyn ReadSource>>>,
     /// Where read latencies are recorded (set by the host's data layer).
     io: std::sync::OnceLock<Arc<crate::iostats::IoStats>>,
@@ -574,8 +580,21 @@ impl Fabric {
                 <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(efd)
             });
             let serve = Mutex::new(ServeRing::new(&wake)?);
+            let info = crate::counters::PortInfo {
+                device: r.ibdev.clone(),
+                port: r.port,
+                netdev: r.netdev.clone(),
+                addrs: rails
+                    .iter()
+                    .filter(|x| x.ibdev == r.ibdev)
+                    .map(|x| x.addr.to_string())
+                    .collect(),
+                path_mtu: crate::counters::mtu_bytes(mtu),
+            };
             devices.push(Arc::new(Device {
                 id: devices.len() as u32,
+                info,
+                counters: Default::default(),
                 ctx,
                 cq,
                 landing,
@@ -698,6 +717,17 @@ impl Fabric {
             .unwrap_or(0)
     }
 
+    /// The ports this host's RDMA traffic uses (ADR-051).
+    pub fn ports(&self) -> Vec<crate::counters::PortInfo> {
+        self.devices.iter().map(|d| d.info.clone()).collect()
+    }
+
+    /// Their counters now, in the order of `ports`. Atomic loads only.
+    pub fn port_counters(&self, out: &mut Vec<crate::counters::CounterValues>) {
+        out.clear();
+        out.extend(self.devices.iter().map(|d| d.counters.load()));
+    }
+
     /// Chunk-sized landing slots per device.
     pub fn landing_slots(&self) -> usize {
         self.cfg.client_slots as usize
@@ -724,6 +754,7 @@ impl Fabric {
         let qp = Qp::new(&dev.ctx, &dev.cq, &dev.cq, depth * 2, depth, rail.port)?;
         let ring = Region::new(&dev.ctx, depth as usize * RING_SLOT, false)?;
         let id = self.next_lane.fetch_add(1, Ordering::Relaxed);
+        let mtu = AtomicU32::new(crate::counters::mtu_bytes(dev.mtu));
         let lane = Arc::new(Lane {
             id,
             dev,
@@ -734,6 +765,7 @@ impl Fabric {
             peer,
             dead: AtomicBool::new(false),
             dead_at: Mutex::new(None),
+            mtu,
         });
         for i in 0..depth {
             self.post_ring(&lane, i)?;
@@ -797,6 +829,8 @@ impl Fabric {
             };
             let psn = rand::random::<u32>() & 0xff_ffff;
             let mtu = lane.dev.mtu.min(offer.qp.mtu);
+            lane.mtu
+                .store(crate::counters::mtu_bytes(mtu), Ordering::Relaxed);
             if let Err(e) = lane.qp.connect(rail.gid_index, psn, &offer.qp, mtu) {
                 made.push((rail.clone(), lane));
                 self.retire_lanes(&made.into_iter().map(|(_, l)| l).collect::<Vec<_>>());
@@ -988,6 +1022,8 @@ impl Fabric {
         for (i, remote) in pairs {
             let lane = lanes[i as usize].clone();
             let mtu = lane.dev.mtu.min(remote.mtu);
+            lane.mtu
+                .store(crate::counters::mtu_bytes(mtu), Ordering::Relaxed);
             if let Err(e) = lane
                 .qp
                 .connect(lane.local.gid_index, psns[i as usize], &remote, mtu)
@@ -1092,6 +1128,7 @@ impl Fabric {
             self.fail_lane(&lane);
             return Err(NestError::Unavailable(e.to_string()));
         }
+        lane.dev.counters.sent(MSG_SIZE as u64, 0);
         let r = tokio::time::timeout(Duration::from_secs(30), rx).await;
         self.stats
             .read_rtt_ns
@@ -1224,10 +1261,14 @@ impl Fabric {
             }
             return;
         }
+        let mtu = lane
+            .as_ref()
+            .map_or(dev.info.path_mtu, |l| l.mtu.load(Ordering::Relaxed));
         match (kind, wc.opcode) {
             (WR_RING, sys::NF_OP_RECV_IMM) => {
                 let slot = wc.imm;
                 let len = wc.byte_len as usize;
+                dev.counters.received(len as u64, mtu);
                 let w = self.pending.lock().remove(&(dev.id, slot));
                 if let Some(w) = w {
                     w.complete(len);
@@ -1237,6 +1278,7 @@ impl Fabric {
                 }
             }
             (WR_RING, sys::NF_OP_RECV) => {
+                dev.counters.received(wc.byte_len as u64, mtu);
                 let Some(l) = lane else { return };
                 // SAFETY: the receive completed; the ring slot is ours until
                 // we repost it below.
@@ -1256,7 +1298,9 @@ impl Fabric {
                 }
             }
             (WR_WRITE, _) => {
-                self.in_flight.lock().remove(&wc.wr_id);
+                if let Some((_, n)) = self.in_flight.lock().remove(&wc.wr_id) {
+                    dev.counters.sent(n as u64, mtu);
+                }
             }
             _ => {}
         }
@@ -1451,7 +1495,7 @@ impl Fabric {
             Ok((slot, n)) => {
                 let id = wr(WR_WRITE, lane.id, slot.id());
                 let (ptr, lkey) = (slot.ptr(), slot.lkey());
-                self.in_flight.lock().insert(id, slot);
+                self.in_flight.lock().insert(id, (slot, n as u32));
                 let imm = req.slot;
                 // SAFETY: the staging slot stays alive in `in_flight`
                 // until this write completes; the remote range is the
@@ -1483,6 +1527,8 @@ impl Fabric {
                 .is_err()
                 {
                     self.fail_lane(lane);
+                } else {
+                    lane.dev.counters.sent(8, 0);
                 }
             }
         }
@@ -1551,6 +1597,9 @@ impl Reservation {
                 true,
             )
         };
+        if posted.is_ok() {
+            lane.dev.counters.sent(MSG_SIZE as u64, 0);
+        }
         if let Err(e) = posted {
             let w = fabric.pending.lock().remove(&key);
             fabric.fail_lane(&lane);

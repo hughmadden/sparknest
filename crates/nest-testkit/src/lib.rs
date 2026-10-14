@@ -128,6 +128,7 @@ impl TestCluster {
                         .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
                 ),
                 lanes: 2,
+                counters_listen: None,
             },
             cluster: ClusterSection {
                 name: "testkit".into(),

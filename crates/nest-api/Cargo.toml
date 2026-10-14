@@ -11,6 +11,8 @@ nest-types.workspace = true
 nest-meta.workspace = true
 nest-data.workspace = true
 nest-place.workspace = true
+nest-fabric.workspace = true
+nix = { workspace = true, features = ["time"] }
 axum.workspace = true
 tokio.workspace = true
 futures.workspace = true
@@ -22,3 +24,7 @@ rusqlite.workspace = true
 anyhow.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+nest-rpc.workspace = true
+tempfile.workspace = true

@@ -37,6 +37,7 @@ case "${1:-}" in
       python3 -m unittest discover -s tools/drop-page-cache -p 'test_*.py'
     fi
     python3 -m unittest discover -s tools/hf-fetch -p 'test_*.py'
+    python3 -m unittest discover -s tools/rdma-counters -p 'test_*.py'
     bash -n scripts/add-offgrid.sh
     # The restart rule: exactly one command line, and valid sudoers syntax.
     allow=tools/allow-restart/sparknest-allow-restart

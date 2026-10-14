@@ -5,6 +5,7 @@
 //! Paths in requests are namespace paths ("/hub/...") or paths under this
 //! node's mountpoint, which are translated.
 
+pub mod counters;
 mod events;
 mod transfer;
 
