@@ -3,6 +3,14 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-15 — 0.4.0: RDMA counters for benchmarking (ADR-051)
+
+- Per RDMA port: payload bytes, operations and estimated packets, sent and
+  received, for subtracting sparknest's share from the NIC totals in LLM
+  engine benchmarks. JSON snapshot on 127.0.0.1:7403, binary stream on
+  /srv/sparknest/rdma-counters.sock (1–20 Hz); docs/RDMA-COUNTERS.md;
+  `sparknest-rdma-counters` prints it.
+
 ## 2026-10-12 — 0.3.0: off-grid hosts (ADR-047…050)
 
 - Hosts on the LAN only (kakapo, oliver behind WSL NAT) join as Raft
