@@ -57,6 +57,20 @@ pub fn web_token(secret: &[u8]) -> String {
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
+/// Which web UI this daemon serves: a page that reconnects to a daemon
+/// serving another reloads itself rather than run stale code against it.
+pub(crate) fn ui_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        use sha2::Digest;
+        sha2::Sha256::digest(INDEX_HTML.as_bytes())
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    })
+}
+
 pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl From<NestError> for ApiError {

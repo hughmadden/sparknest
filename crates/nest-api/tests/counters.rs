@@ -104,7 +104,7 @@ async fn stream_and_snapshot_show_the_bytes_moved() {
     // The reader's counters, as its daemon would expose them.
     let r2 = reader.clone();
     let counters = Counters::new(move || Some(r2.clone()));
-    let sock = dir.path().join("rdma-counters.sock");
+    let sock = dir.path().join("run").join("rdma-counters.sock");
     tokio::spawn(serve_stream(counters.clone(), sock.clone()));
     let addr = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -123,6 +123,16 @@ async fn stream_and_snapshot_show_the_bytes_moved() {
     let mode =
         std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&sock).unwrap().permissions());
     assert_eq!(mode & 0o777, 0o666);
+    let dir_mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(sock.parent().unwrap())
+            .unwrap()
+            .permissions(),
+    );
+    assert_eq!(
+        dir_mode & 0o777,
+        0o755,
+        "containers mount the socket's directory"
+    );
     s.write_all(&[20]).await.unwrap();
     let (_, before) = next_counters(&mut s).await;
     let rx0: u64 = before.iter().map(|p| p.1).sum();

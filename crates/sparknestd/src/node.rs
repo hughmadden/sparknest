@@ -337,6 +337,8 @@ impl Node {
             nest_api::counters::Counters::new(move || slot.upgrade().and_then(|s| s.lock().clone()))
         };
         let (counters_http, counters_sock) = (cfg.node.counters_listen, cfg.counters_socket());
+        // 0.4.0 put the socket directly in the state dir (ADR-052).
+        let _ = std::fs::remove_file(cfg.node.state_dir.join("rdma-counters.sock"));
         let api_task = tokio::spawn(async move {
             let c2 = counters.clone();
             let counters = async move {

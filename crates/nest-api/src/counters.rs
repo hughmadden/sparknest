@@ -268,12 +268,16 @@ async fn snapshot(State(c): State<Counters>) -> Json<Snapshot> {
 /// Stream frames on a Unix socket at `path` (mode 0666, so containers with
 /// it bind-mounted can read it).
 pub async fn serve_stream(c: Counters, path: PathBuf) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // The socket's directory is what containers mount (ADR-052): it stays
+    // put while the socket in it is recreated at every start.
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    }
     let _ = std::fs::remove_file(&path);
     let l = tokio::net::UnixListener::bind(&path)?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
-    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
     loop {
         let (s, _) = l.accept().await?;
         let c = c.clone();

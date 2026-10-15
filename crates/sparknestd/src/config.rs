@@ -82,7 +82,7 @@ pub struct NodeSection {
     #[serde(default = "default_lanes")]
     pub lanes: usize,
     /// RDMA counters as JSON over HTTP (ADR-051); loopback only. The
-    /// binary stream is always at `<state_dir>/rdma-counters.sock`.
+    /// binary stream is always at `<state_dir>/run/rdma-counters.sock` (ADR-052).
     #[serde(default = "default_counters_listen")]
     pub counters_listen: Option<SocketAddr>,
 }
@@ -303,7 +303,7 @@ impl Config {
 
     /// The RDMA counters stream (ADR-051).
     pub fn counters_socket(&self) -> PathBuf {
-        self.node.state_dir.join("rdma-counters.sock")
+        self.node.state_dir.join("run").join("rdma-counters.sock")
     }
 }
 

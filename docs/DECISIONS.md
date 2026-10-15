@@ -1335,3 +1335,18 @@ subtract.
    wall clock with the boot id.
 4. Not included: per-peer or per-class splits, events, the NIC's own
    counters, TCP lanes, rates, file names, histograms, control actions.
+
+## ADR-052 — The counters socket in a directory of its own (2026-10-15)
+
+**Context.** ADR-051 put the counters stream at
+`<state_dir>/rdma-counters.sock`, for containers to bind-mount. A bind
+mount of a file pins that inode; the daemon unlinks and recreates the
+socket at every start, so a container keeps a dead socket until it is
+restarted itself. Mounting the whole state dir instead would hand
+containers the metadata and the cluster secret.
+
+**Decision.** The socket lives at `<state_dir>/run/rdma-counters.sock`.
+The daemon creates `run/` (mode 0755) and nothing else goes in it;
+containers mount the directory, which outlives the socket, and reconnect
+after a restart. The 0.4.0 path is removed at start, not kept: nothing
+depended on it yet. Protocol and permissions are unchanged.

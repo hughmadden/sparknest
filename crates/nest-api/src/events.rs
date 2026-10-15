@@ -68,6 +68,7 @@ async fn snapshot(api: &Api) -> Option<String> {
             "jobs": api.placer.all_jobs().await,
             "stores": stores,
             "groups": groups,
+            "ui": crate::ui_id(),
         })
         .to_string(),
     )

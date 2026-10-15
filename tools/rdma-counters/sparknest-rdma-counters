@@ -78,7 +78,7 @@ def frames(f):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--socket", default="/srv/sparknest/rdma-counters.sock")
+    p.add_argument("--socket", default="/srv/sparknest/run/rdma-counters.sock")
     p.add_argument("--hz", type=int, default=1, help="frames per second, 1 to 20")
     p.add_argument("--rates", action="store_true", help="per-second rates, not totals")
     a = p.parse_args()

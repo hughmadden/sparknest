@@ -7,10 +7,15 @@ else on the NIC. Two read-only, unauthenticated interfaces on each host:
 | | Where | Format |
 |---|---|---|
 | Snapshot | `GET http://127.0.0.1:7403/v1/rdma/counters` (`node.counters_listen`; loopback only, `None` turns it off) | JSON |
-| Stream | Unix socket `<state_dir>/rdma-counters.sock` (`/srv/sparknest/rdma-counters.sock`), mode 0666 | binary, below |
+| Stream | Unix socket `<state_dir>/run/rdma-counters.sock` (`/srv/sparknest/run/rdma-counters.sock`), mode 0666 | binary, below |
 
-Containers reach the stream by bind-mounting the socket (loopback HTTP is
-not reachable from a bridged container). `sparknest-rdma-counters`
+Containers reach the stream by bind-mounting the socket's directory,
+`/srv/sparknest/run` (loopback HTTP is not reachable from a bridged
+container), e.g. `-v /srv/sparknest/run:/run/sparknest:ro` and connect to
+`/run/sparknest/rdma-counters.sock`. Mount the directory, not the socket:
+the daemon recreates the socket at every start, and a bind mount of the file
+itself would keep pointing at the old one; the directory stays (ADR-052).
+Read-only is fine: connecting to a socket is not a write. `sparknest-rdma-counters`
 (installed with sparknest) prints the stream as JSON lines and is the
 reference decoder.
 
@@ -131,7 +136,7 @@ def frames(f):
         yield body[0], body[1:]
 
 s = socket.socket(socket.AF_UNIX)
-s.connect("/srv/sparknest/rdma-counters.sock")
+s.connect("/srv/sparknest/run/rdma-counters.sock")
 s.sendall(bytes([10]))                      # 10 Hz
 for kind, b in frames(s.makefile("rb")):
     if kind == 2:
