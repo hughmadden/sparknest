@@ -3,7 +3,7 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-## 2026-10-15 — Hugging Face imports and downloads into archive stores (ADR-055)
+## 2026-10-15 — 0.4.3: Hugging Face imports and downloads into archive stores (ADR-055)
 
 - `nest hf import SRC --archive NAME` and `nest hf download REPO --archive
   NAME` (and the Download dialog's Archive choice) put a model in an
