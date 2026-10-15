@@ -3,7 +3,7 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-## 2026-10-15 — counters socket directory, UI reloads on upgrade
+## 2026-10-15 — 0.4.1: always-passthrough files, counters socket directory, UI fixes
 
 - Files can be marked always passthrough (ADR-053): `nest passthrough
   SEL always|default`, a toggle on a model's page, the Passthrough… menu
