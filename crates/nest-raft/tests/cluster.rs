@@ -285,15 +285,26 @@ async fn snapshot_catch_up_emits_resync() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn duplicate_requests_apply_once() {
     let c = Cluster::new(3, 100_000).await;
-    let leader = c.wait_leader().await;
-    let raft = c.nodes[&leader].meta.raft().clone();
     let req = nest_raft::Request {
         client: 42,
         seq: 7,
         cmd: mkdir("once"),
     };
-    let a = raft.client_write(req.clone()).await.unwrap().data;
-    let b = raft.client_write(req).await.unwrap().data;
+    // On a loaded host the node that reported itself leader may have lost
+    // its lease by the time it is asked: ask whoever leads now. Retries are
+    // the duplicates under test, so they still apply once.
+    let write = async || {
+        for _ in 0..100 {
+            let leader = c.wait_leader().await;
+            match c.nodes[&leader].meta.raft().client_write(req.clone()).await {
+                Ok(r) => return r.data,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        panic!("no leader accepted the write");
+    };
+    let a = write().await;
+    let b = write().await;
     assert_eq!(a, b);
     assert!(a.0.is_ok());
     c.converge().await;
