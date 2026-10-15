@@ -3,7 +3,10 @@
 //!
 //! - Requests are dispatched onto the tokio runtime and answered from
 //!   there, so slow operations (consensus, remote I/O) never block the
-//!   `/dev/fuse` reader threads.
+//!   `/dev/fuse` reader threads. Metadata reads that this host can answer
+//!   from its own replica (lookup, getattr, readdir, READDIRPLUS) are
+//!   answered inline instead: a handoff to the runtime and back costs more
+//!   than the query (ADR-054).
 //! - Unsealed files are opened with `FOPEN_DIRECT_IO` (plus parallel direct
 //!   writes); sealed files use kernel passthrough to the local object when
 //!   possible, else the page cache with `FOPEN_KEEP_CACHE`.
@@ -14,9 +17,9 @@
 use fuser::{
     BackingId, Config, Errno, FileAttr as FAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, MountOption, Notifier, OpenFlags,
-    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow,
-    WriteFlags,
+    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty,
+    ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL,
+    TimeOrNow, WriteFlags,
 };
 use nest_data::{OpenMode, Vfs};
 use nest_meta::{Effect, LockKind};
@@ -268,7 +271,8 @@ impl Filesystem for Fs {
             | InitFlags::FUSE_CACHE_SYMLINKS
             | InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP
             | InitFlags::FUSE_BIG_WRITES
-            | InitFlags::FUSE_ASYNC_READ;
+            | InitFlags::FUSE_ASYNC_READ
+            | InitFlags::FUSE_DO_READDIRPLUS;
         let have = config.capabilities();
         if let Err(missing) = config.add_capabilities(want & have) {
             tracing::warn!(?missing, "kernel lacks some FUSE capabilities");
@@ -309,6 +313,11 @@ impl Filesystem for Fs {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        match self.vfs.lookup_now(fid(parent), name.as_bytes()) {
+            Ok(Some(a)) => return reply.entry(&self.ttl, &self.attr(&a), Generation(0)),
+            Ok(None) => {}
+            Err(e) => return reply.error(errno(&e)),
+        }
         let inner = self.inner.clone();
         let name = name.as_bytes().to_vec();
         self.spawn(async move {
@@ -320,6 +329,11 @@ impl Filesystem for Fs {
     }
 
     fn getattr(&self, _req: &Request, i: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.vfs.getattr_now(fid(i)) {
+            Ok(Some(a)) => return reply.attr(&self.ttl, &self.attr(&a)),
+            Ok(None) => {}
+            Err(e) => return reply.error(errno(&e)),
+        }
         let inner = self.inner.clone();
         self.spawn(async move {
             match inner.vfs.getattr(fid(i)).await {
@@ -749,6 +763,32 @@ impl Filesystem for Fs {
             Ok(entries) => {
                 for (off, e) in entries {
                     if reply.add(ino(e.id), off, kind(e.kind), OsStr::from_bytes(&e.name)) {
+                        break;
+                    }
+                }
+                reply.ok();
+            }
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// Entries with attributes, so a listing followed by a stat of every
+    /// entry (`du`, `ls -l`, `find -size`) costs no LOOKUP per entry.
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        i: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        match self.vfs.readdir_plus(fid(i), offset, 512) {
+            Ok(entries) => {
+                for e in entries {
+                    // Another host owns it: the kernel asks again on use.
+                    let ttl = if e.fresh { self.ttl } else { Duration::ZERO };
+                    let (a, name) = (self.attr(&e.attr), OsStr::from_bytes(&e.name));
+                    if reply.add(ino(e.attr.id), e.offset, name, &ttl, &a, Generation(0)) {
                         break;
                     }
                 }

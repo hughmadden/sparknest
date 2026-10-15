@@ -3,6 +3,14 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-15 — Fast metadata scans (ADR-054)
+
+- LOOKUP and GETATTR are answered on the ring thread that received them
+  unless another host owns the file, and listings use READDIRPLUS, so
+  stat after readdir costs no request per entry. Before: `du` over the
+  mount (24,210 entries) took 0.3–0.8 s on raptor and 5–12 s on the
+  Sparks (~400 µs per `stat`, mostly cross-CPU wakeups).
+
 ## 2026-10-15 — 0.4.1: always-passthrough files, counters socket directory, UI fixes
 
 - Files can be marked always passthrough (ADR-053): `nest passthrough

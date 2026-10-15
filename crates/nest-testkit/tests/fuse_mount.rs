@@ -1,6 +1,8 @@
 //! The filesystem through a real kernel FUSE mount on this machine.
 
+use nest_data::vfs::oflags;
 use nest_testkit::TestCluster;
+use nest_types::FileId;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
@@ -433,6 +435,84 @@ async fn io_uring_serves_requests_when_the_kernel_offers_it() {
         "only {} requests came through io_uring",
         after - before
     );
+    c.node(1).unmount();
+}
+
+fn uring_enabled() -> bool {
+    std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring")
+        .map(|s| s.trim() == "Y")
+        .unwrap_or(false)
+}
+
+/// A listing carries attributes (READDIRPLUS): stat after readdir, as `du`
+/// and `ls -l` do, costs no LOOKUP per entry (ADR-054).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn listing_then_stat_takes_no_request_per_entry() {
+    let Some((c, mp)) = cluster_with_mount(1).await else {
+        return;
+    };
+    if !uring_enabled() {
+        eprintln!("skipping: fuse.enable_uring is off on this host");
+        c.node(1).unmount();
+        return;
+    }
+    // Made behind the kernel's back, so it has nothing cached.
+    let v = &c.node(1).vfs;
+    let dir = v.mkdir(FileId::ROOT, b"many", 0o755).await.unwrap();
+    for i in 0..300u64 {
+        let name = format!("f{i}");
+        let (_, fh, _) = v
+            .create(dir.id, name.as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        v.write(fh, 0, vec![1; i as usize]).await.unwrap();
+        v.release(fh, None).await;
+    }
+    let (_, before) = c.node(1).io_uring().unwrap();
+    let d = mp.join("many");
+    let total = blocking(move || {
+        fs::read_dir(&d)
+            .unwrap()
+            .map(|e| fs::symlink_metadata(e.unwrap().path()).unwrap().len())
+            .sum::<u64>()
+    })
+    .await;
+    let (_, after) = c.node(1).io_uring().unwrap();
+    assert_eq!(total, (0..300).sum::<u64>());
+    assert!(
+        after - before < 30,
+        "{} requests to list and stat 300 files",
+        after - before
+    );
+    c.node(1).unmount();
+}
+
+/// A file being written on another host is listed with its live size: its
+/// attributes are not cached from the listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn listing_shows_the_live_size_of_a_file_written_elsewhere() {
+    let Some((c, mp)) = cluster_with_mount(3).await else {
+        return;
+    };
+    let v2 = &c.node(2).vfs;
+    let (_, fh, _) = v2
+        .create(FileId::ROOT, b"log", 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    v2.write(fh, 0, b"hello".to_vec()).await.unwrap();
+    c.converge().await;
+    let sizes = |mp: PathBuf| {
+        blocking(move || {
+            fs::read_dir(&mp)
+                .unwrap()
+                .map(|e| fs::symlink_metadata(e.unwrap().path()).unwrap().len())
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(sizes(mp.clone()).await, vec![5]);
+    v2.write(fh, 5, b" world".to_vec()).await.unwrap();
+    assert_eq!(sizes(mp.clone()).await, vec![11]);
+    v2.release(fh, None).await;
     c.node(1).unmount();
 }
 

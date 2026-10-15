@@ -84,6 +84,28 @@ pub fn readdir(
     rows.collect()
 }
 
+/// `readdir` with each entry's attributes, for READDIRPLUS.
+pub fn readdir_attrs(
+    c: &Connection,
+    dir: FileId,
+    after: u64,
+    limit: usize,
+) -> rusqlite::Result<Vec<(u64, Vec<u8>, FileAttr)>> {
+    let mut st = c.prepare_cached(&format!(
+        "SELECT {}, d.cookie, d.name FROM dentries d JOIN files f ON f.id = d.child \
+         WHERE d.parent = ?1 AND d.cookie > ?2 ORDER BY d.cookie LIMIT ?3",
+        ATTR_COLS
+            .split(", ")
+            .map(|c| format!("f.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))?;
+    let rows = st.query_map(params![dir.0 as i64, after as i64, limit as i64], |r| {
+        Ok((r.get::<_, i64>(14)? as u64, r.get(15)?, attr_from_row(r)?))
+    })?;
+    rows.collect()
+}
+
 pub fn dir_is_empty(c: &Connection, dir: FileId) -> rusqlite::Result<bool> {
     Ok(
         c.prepare_cached("SELECT 1 FROM dentries WHERE parent = ?1 LIMIT 1")?

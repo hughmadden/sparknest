@@ -244,6 +244,29 @@ pub struct RemoveReport {
     pub errors: Vec<String>,
 }
 
+/// A directory entry with its attributes (`Vfs::readdir_plus`).
+#[derive(Clone, Debug)]
+pub struct DirEntryPlus {
+    /// Cookie to continue the listing after this entry.
+    pub offset: u64,
+    pub name: Vec<u8>,
+    pub attr: FileAttr,
+    /// False when another host owns the file: the size here may be stale,
+    /// so the kernel must not cache it.
+    pub fresh: bool,
+}
+
+impl DirEntryPlus {
+    fn new(offset: u64, name: &[u8], attr: FileAttr) -> Self {
+        DirEntryPlus {
+            offset,
+            name: name.to_vec(),
+            attr,
+            fresh: true,
+        }
+    }
+}
+
 fn pread_into(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> NestResult<usize> {
     let mut done = 0;
     while done < buf.len() {
@@ -748,17 +771,46 @@ impl Vfs {
         Ok(a)
     }
 
-    async fn overlay_owned(&self, a: &mut FileAttr) {
+    /// `getattr` answered from this host's own state, without waiting:
+    /// `None` when another host owns the file, whose live size takes a call
+    /// (use `getattr`). Lets FUSE answer on the thread the request arrived on.
+    pub fn getattr_now(&self, file: FileId) -> NestResult<Option<FileAttr>> {
+        let mut a = self.raw_attr(file)?;
+        Ok(self.overlay_local(&mut a).then_some(a))
+    }
+
+    /// `lookup` answered from this host's own state; `None` as for
+    /// `getattr_now`.
+    pub fn lookup_now(&self, parent: FileId, name: &[u8]) -> NestResult<Option<FileAttr>> {
+        let mut a = self
+            .q(|c| query::lookup_attr(c, parent, name))?
+            .ok_or(NestError::NotFound)?;
+        Ok(self.overlay_local(&mut a).then_some(a))
+    }
+
+    /// Overlay an owned file's live size and mtime when this host owns it.
+    /// False when another host does: only it knows them.
+    fn overlay_local(&self, a: &mut FileAttr) -> bool {
         let (GenState::Owned, Some(owner)) = (a.gen_state, a.owner) else {
-            return;
+            return true;
         };
-        if owner == self.me() {
-            if let Ok((size, mtime)) = self.d.store().stat(ObjectKey::new(a.id, a.generation)) {
-                a.size = size;
-                a.mtime = mtime;
-            }
+        if owner != self.me() {
+            return false;
+        }
+        if let Ok((size, mtime)) = self.d.store().stat(ObjectKey::new(a.id, a.generation)) {
+            a.size = size;
+            a.mtime = mtime;
+        }
+        true
+    }
+
+    async fn overlay_owned(&self, a: &mut FileAttr) {
+        if self.overlay_local(a) {
             return;
         }
+        let Some(owner) = a.owner else {
+            return;
+        };
         let r = remote::call(
             self.rpc(),
             owner,
@@ -830,6 +882,41 @@ impl Vfs {
         let after = offset.saturating_sub(2);
         for (cookie, e) in self.q(|c| query::readdir(c, dir, after, limit))? {
             out.push((cookie + 2, e));
+        }
+        Ok(out)
+    }
+
+    /// `readdir` with each entry's attributes (READDIRPLUS).
+    pub fn readdir_plus(
+        &self,
+        dir: FileId,
+        offset: u64,
+        limit: usize,
+    ) -> NestResult<Vec<DirEntryPlus>> {
+        let a = self.raw_attr(dir)?;
+        if a.kind != FileKind::Directory {
+            return Err(NestError::NotDir);
+        }
+        let mut out = Vec::new();
+        if offset < 2 {
+            let parent = self
+                .q(|c| query::dir_parent(c, dir))?
+                .unwrap_or(FileId::ROOT);
+            let pa = self.raw_attr(parent)?;
+            if offset < 1 {
+                out.push(DirEntryPlus::new(1, b".", a));
+            }
+            out.push(DirEntryPlus::new(2, b"..", pa));
+        }
+        let after = offset.saturating_sub(2);
+        for (cookie, name, mut e) in self.q(|c| query::readdir_attrs(c, dir, after, limit))? {
+            let fresh = self.overlay_local(&mut e);
+            out.push(DirEntryPlus {
+                offset: cookie + 2,
+                name,
+                attr: e,
+                fresh,
+            });
         }
         Ok(out)
     }

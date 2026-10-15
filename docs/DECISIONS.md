@@ -1381,3 +1381,37 @@ gave up passthrough for nothing.
 but costs a selector match per open and a second place to look); marking
 the file scattered (also changes how hosts without a copy read it, and
 hosts revise it).
+
+## ADR-054 — Metadata reads answered on the ring thread; READDIRPLUS (2026-10-15)
+
+**Context.** `du` over the production mount (24,210 entries) took 0.3–0.8 s
+on raptor but 5–12 s on the Sparks, idle or not, off-grid or not: about
+400 µs per `stat`. Every LOOKUP and GETATTR went from the ring thread
+that received it to a tokio worker and back through an eventfd, several
+cross-CPU wakeups for a sub-millisecond SQLite query. The daemon used
+3.5 s of CPU of kakapo's 11 s, and `du` slept 30,000 times; disabling the
+deep idle states (433 µs exit) only brought it to 8.7 s. And every entry
+of a listing cost its own LOOKUP, since READDIR carries no attributes.
+
+**Decision.**
+1. LOOKUP and GETATTR are answered on the thread the request arrived on
+   (the CPU's ring queue, or a /dev/fuse reader) whenever this host's
+   replica answers them: always, except for a file another host owns,
+   whose live size takes a call; those still go to the runtime. READDIR
+   already worked this way, and READ has its own fast path (ADR-025).
+2. READDIRPLUS (`FUSE_DO_READDIRPLUS`, not the adaptive mode): listings
+   carry each entry's attributes from the same join, so stat after
+   readdir (`du`, `ls -l`, `find -size`) needs no request per entry. An
+   entry another host owns goes out with zero entry and attribute TTLs,
+   so the kernel asks again for its live size on use.
+
+Both read SQLite on the request thread, as READDIR did. The pages are
+local and almost always in the page cache; a slow query delays that CPU's
+queue, not the runtime.
+
+**Alternatives.** Keeping metadata on the runtime and making the handoff
+cheaper (busy-polling the eventfd burns a core per queue; pinning workers
+does not remove the wakeups); a longer attribute TTL (helps repeated
+scans only, and delays other hosts' changes); the adaptive READDIRPLUS
+mode (plain listings would save the attribute columns, but listings of
+large directories switch between the two and lose the point).
