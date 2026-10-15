@@ -3,6 +3,15 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-15 — counters socket directory, UI reloads on upgrade
+
+- The counters stream moved to /srv/sparknest/run/rdma-counters.sock so
+  containers mount the directory and survive daemon restarts (ADR-052).
+- The web UI reloads itself when its node starts serving a different UI,
+  and no longer reflows under the pointer when hover content or a
+  scrollbar appears (stable scrollbar gutters, fixed-size treemap details,
+  no animation on resize).
+
 ## 2026-10-15 — 0.4.0: RDMA counters for benchmarking (ADR-051)
 
 - Per RDMA port: payload bytes, operations and estimated packets, sent and

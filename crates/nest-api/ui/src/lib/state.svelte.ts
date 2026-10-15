@@ -71,6 +71,7 @@ export const app = $state({
 const prev: Record<string, { t: number; r: number; s: number; l: number }> = {};
 
 let runningIds = new Set<number>();
+let uiSeen = "";
 
 function apply(status: Status, stores: Store[], jobs: Job[], groups: { name: string; members: string[] }[]) {
   {
@@ -164,6 +165,11 @@ function connect() {
       clearTimeout(p.timer);
       p.resolve({ status: m.status, body: m.body });
     } else if (m.type === "state") {
+      // The node now serves another UI (it was upgraded): load that one.
+      if (m.data.ui) {
+        if (uiSeen && uiSeen !== m.data.ui) location.reload();
+        uiSeen = m.data.ui;
+      }
       app.error = "";
       apply(m.data.status, m.data.stores, m.data.jobs, m.data.groups);
     } else if (m.type === "changed") app.changed++;
