@@ -348,7 +348,10 @@ Examples:
   Another disk's cache, moved (the old directory becomes a link):
     nest hf import /mnt/scratch/hf_cache --move --wait
   One model, without asking the Hub:
-    nest hf import ~/hf/hub/models--Qwen--Qwen3-8B --offline";
+    nest hf import ~/hf/hub/models--Qwen--Qwen3-8B --offline
+  Into the archive store `scratch` (on one of its gateways; hard links when
+  the cache is on the archive's disk):
+    nest hf import /mnt/scratch/hf --archive scratch --wait";
 
 #[derive(Subcommand, Debug)]
 enum HfCmd {
@@ -387,6 +390,14 @@ enum HfCmd {
         /// Blobs the cluster already has are skipped.
         #[arg(long)]
         spread: bool,
+        /// Put the blobs in this archive store instead of on hosts
+        ///
+        /// Run on one of its gateways. Blobs on the archive's filesystem are
+        /// hard-linked into it, others copied (paced); snapshots are mirrored
+        /// from the source. The models read through the gateway until
+        /// copied onto hosts.
+        #[arg(long, conflicts_with = "spread")]
+        archive: Option<String>,
         /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
@@ -435,6 +446,14 @@ enum HfCmd {
         /// Files downloading at once across the cluster.
         #[arg(long, default_value_t = 4)]
         in_flight: usize,
+        /// Download into this archive store instead of onto hosts
+        ///
+        /// Run on one of its gateways. Files are fetched one at a time into
+        /// a scratch hub on the archive's own disk, then linked into the
+        /// archive; the models read through the gateway until copied onto
+        /// hosts.
+        #[arg(long, conflicts_with_all = ["host", "hosts"])]
+        archive: Option<String>,
         /// Follow the job until it finishes.
         #[arg(long)]
         wait: bool,
@@ -1765,6 +1784,7 @@ async fn main() -> Result<()> {
                     dataset,
                     revision,
                     in_flight,
+                    archive,
                     wait,
                 },
         } => {
@@ -1778,6 +1798,7 @@ async fn main() -> Result<()> {
                         "kind": if *dataset { "dataset" } else { "model" },
                         "revision": revision,
                         "in_flight": in_flight,
+                        "archive": archive,
                     }),
                 )
                 .await?;
@@ -1851,6 +1872,7 @@ async fn main() -> Result<()> {
                     offline,
                     no_copy,
                     spread,
+                    archive,
                     wait,
                 },
         } => {
@@ -1867,7 +1889,7 @@ async fn main() -> Result<()> {
             let v = c
                 .post(
                     "/v1/hf/import",
-                    json!({ "src": src, "move": mv, "hf": hf, "copy": !no_copy, "spread": spread }),
+                    json!({ "src": src, "move": mv, "hf": hf, "copy": !no_copy, "spread": spread, "archive": archive }),
                 )
                 .await?;
             let id = v["job"].as_u64().unwrap_or(0);

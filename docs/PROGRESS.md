@@ -3,6 +3,16 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-15 — Hugging Face imports and downloads into archive stores (ADR-055)
+
+- `nest hf import SRC --archive NAME` and `nest hf download REPO --archive
+  NAME` (and the Download dialog's Archive choice) put a model in an
+  archive store without it touching a host's disk; a cache on the
+  archive's own disk is hard-linked in. Verified with a one-node trial
+  daemon: a real download (hf-internal-testing/tiny-random-gpt2) and an
+  import of a cache on the archive's filesystem (blobs linked, link count
+  2), both reading back through the mount with matching hashes.
+
 ## 2026-10-15 — 0.4.2: fast metadata scans (ADR-054)
 
 - LOOKUP and GETATTR are answered on the ring thread that received them

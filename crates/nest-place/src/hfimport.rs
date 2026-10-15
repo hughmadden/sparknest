@@ -22,6 +22,12 @@
 //!    repo verified, the whole cache directory becomes a symlink to
 //!    sparknest's hub, so tools still pointed at it keep working; otherwise
 //!    each verified repo directory is replaced by such a link.
+//!
+//! **Into an archive** (`archive`, ADR-055): this host is a gateway of the
+//! archive store and the blobs go into it, never into a host's store:
+//! hard-linked when the source is on the archive's filesystem, else copied
+//! (paced, as every write into an archive). hf would write blobs through
+//! the mount onto this host, so snapshots are mirrored from the source.
 
 use crate::import::{Entry, ImportProgress, import_entries};
 use crate::selector;
@@ -55,6 +61,10 @@ pub struct HfImportOptions {
     /// copies; the cluster's existing blobs are skipped.
     #[serde(default)]
     pub spread: bool,
+    /// An archive store (by name) to put the blobs in, instead of hosts.
+    /// This host must be one of its gateways.
+    #[serde(default)]
+    pub archive: Option<String>,
 }
 
 /// A spread import copies about this much here before handing it out.
@@ -395,6 +405,15 @@ pub async fn run(
     outcomes: Arc<Mutex<Vec<RepoOutcome>>>,
     spread: Option<Arc<crate::placer::Placer>>,
 ) -> NestResult<()> {
+    let archive = match &opts.archive {
+        Some(name) => Some(archive_here(&vfs, name)?),
+        None => None,
+    };
+    if archive.is_some() && spread.is_some() {
+        return Err(NestError::Invalid(
+            "an import goes into an archive or is spread over hosts, not both".into(),
+        ));
+    }
     // A spread import's handing-out of the previous batch, running while
     // the next batch copies.
     let mut handing: Option<tokio::task::JoinHandle<NestResult<()>>> = None;
@@ -464,7 +483,9 @@ pub async fn run(
         let errs_before = progress.lock().errors.len();
         // A repo that fails is reported and the import moves on.
         let placed = match &spread {
-            None => import_entries(&vfs, entries, false, opts.copy, &progress).await,
+            None => {
+                import_entries(&vfs, entries, false, opts.copy, archive.as_ref(), &progress).await
+            }
             Some(p) => place_spread(&vfs, p, entries, opts.copy, &progress, &mut handing).await,
         };
         if let Err(e) = placed {
@@ -483,8 +504,8 @@ pub async fn run(
         }
         // 2. Snapshots: hf where possible, else the source's links.
         for (commit, files) in &r.snapshots {
-            let via_hf = match (&opts.hf, &opts.mount_hub) {
-                (Some(hf), Some(mh)) => hf_finalize(hf, mh, r, commit, files).await,
+            let via_hf = match (&opts.hf, &opts.mount_hub, &archive) {
+                (Some(hf), Some(mh), None) => hf_finalize(hf, mh, r, commit, files).await,
                 _ => Err("offline".into()),
             };
             if let Err(why) = via_hf {
@@ -527,8 +548,15 @@ pub async fn run(
         if bad.is_empty() && out.status != "failed" {
             // This host has the weights; give it its own copy of the repo's
             // small files other hosts wrote (refs, trees/*.json, configs), so
-            // it counts as holding the whole model.
-            fill_small_files(&vfs, &base).await;
+            // it counts as holding the whole model. Into an archive, the
+            // weights are not here and the small files stay where they are.
+            if archive.is_none() {
+                fill_small_files(&vfs, &base).await;
+            }
+            // Snapshots were mirrored, not hf's: that is the expected path.
+            if archive.is_some() && out.status == "mirrored" && out.note.is_empty() {
+                out.status = "done".into();
+            }
             verified_dirs.push(r.dir.clone());
         } else {
             all_verified = false;
@@ -697,7 +725,7 @@ async fn place_spread(
         }
         let this = std::mem::take(&mut batch);
         bytes = 0;
-        import_entries(vfs, this.clone(), false, copy, progress).await?;
+        import_entries(vfs, this.clone(), false, copy, None, progress).await?;
         // The files this batch left on this host (new, or adopted here).
         let me = vfs.data().id().live_store();
         let files: Vec<(FileId, u64)> = vfs
@@ -731,6 +759,31 @@ async fn place_spread(
         *handing = Some(tokio::spawn(async move { p.spread(files, &prog).await }));
     }
     Ok(())
+}
+
+/// Archive store `name`, which this host must be a healthy gateway of.
+pub fn archive_here(vfs: &Vfs, name: &str) -> NestResult<Arc<nest_data::Archive>> {
+    let rows = vfs
+        .data()
+        .with_reader(nest_meta::query::stores)
+        .map_err(sql)?;
+    let row = rows
+        .into_iter()
+        .find(|r| r.name == name && nest_data::is_archive(r.id))
+        .ok_or_else(|| NestError::Invalid(format!("no archive store named {name}")))?;
+    let cfg: nest_data::ArchiveConfig = serde_json::from_str(&row.config)
+        .map_err(|e| NestError::Io(format!("archive {name}: {e}")))?;
+    if !cfg.gateways.contains(&vfs.data().id()) {
+        return Err(NestError::Invalid(format!(
+            "this host is not a gateway of archive {name}; run it on one of its gateways"
+        )));
+    }
+    vfs.data().archive(row.id).ok_or_else(|| {
+        NestError::Invalid(format!(
+            "archive {name} is not healthy here (is {} mounted?)",
+            cfg.path
+        ))
+    })
 }
 
 /// The `hf` program: on PATH, else where Homebrew or pip put it (the

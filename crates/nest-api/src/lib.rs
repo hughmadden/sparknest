@@ -827,6 +827,9 @@ struct HfImportReq {
     /// Place each blob on the host with the most free space.
     #[serde(default)]
     spread: bool,
+    /// Put the blobs in this archive store (this node must be a gateway).
+    #[serde(default)]
+    archive: Option<String>,
 }
 
 async fn hf_import(State(api): State<Api>, Json(r): Json<HfImportReq>) -> R<serde_json::Value> {
@@ -842,7 +845,17 @@ async fn hf_import(State(api): State<Api>, Json(r): Json<HfImportReq>) -> R<serd
         r#move: r.r#move,
         copy: r.copy,
         spread: r.spread,
+        archive: r.archive.filter(|a| !a.is_empty()),
     };
+    if let Some(a) = &opts.archive {
+        if opts.spread {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "--archive and --spread do not go together".into(),
+            ));
+        }
+        api.placer.archive_here(a)?;
+    }
     Ok(Json(json!({ "job": api.placer.hf_import(opts) })))
 }
 
@@ -959,6 +972,10 @@ struct HfDownloadReq {
     revision: Option<String>,
     /// Files downloading at once across the cluster (default 4).
     in_flight: Option<usize>,
+    /// Download into this archive store instead of hosts (this node must
+    /// be one of its gateways).
+    #[serde(default)]
+    archive: Option<String>,
     /// Unused (the daemon finds hf itself); kept for older CLIs.
     #[allow(dead_code)]
     hf: Option<String>,
@@ -978,6 +995,19 @@ async fn hf_download(State(api): State<Api>, Json(r): Json<HfDownloadReq>) -> R<
         .to_string();
     if repo.is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "no repo given".into()));
+    }
+    if let Some(archive) = r.archive.filter(|a| !a.is_empty()) {
+        if !r.host.is_empty() || !r.hosts.is_empty() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "a download goes into an archive or onto hosts, not both".into(),
+            ));
+        }
+        let job = api
+            .placer
+            .hf_download_archive(api.hub.clone(), repo, r.kind, r.revision, archive)
+            .await?;
+        return Ok(Json(json!({ "job": job })));
     }
     let hosts = if r.host.is_empty() {
         r.hosts

@@ -1674,6 +1674,238 @@ impl Placer {
         Ok(id)
     }
 
+    /// Download a Hugging Face repo into an archive store (ADR-055), on
+    /// this host, a gateway of it: the files the hub lacks at that commit
+    /// are fetched into a scratch hub on the archive's own filesystem, then
+    /// imported from there (hard links, nothing copied twice) and the
+    /// scratch hub removed. Returns the job id.
+    pub async fn hf_download_archive(
+        self: &Arc<Self>,
+        hub: String,
+        repo: String,
+        kind: String,
+        revision: Option<String>,
+        archive: String,
+    ) -> NestResult<u64> {
+        let a = self.archive_here(&archive)?;
+        let mount_hub = self.mount_hub(&hub)?;
+        crate::hfimport::driver(None)?;
+        let cached = crate::hfimport::cached_revision(&mount_hub, &repo, &kind);
+        let rev = revision.clone().or(cached.clone());
+        let plan =
+            crate::hfimport::repo_plan(None, &mount_hub, &repo, &kind, rev.as_deref()).await?;
+        let is_sha = |r: &str| r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit());
+        let branch = match (&revision, &cached) {
+            (None, None) => Some("main".to_string()),
+            (Some(r), _) if !is_sha(r) => Some(r.clone()),
+            _ => None,
+        };
+        let repo_dir = crate::hfimport::repo_dir(&kind, &repo);
+        let snap = mount_hub.join(&repo_dir).join("snapshots").join(&plan.sha);
+        let all: Vec<(String, u64)> = plan
+            .files
+            .iter()
+            .map(|f| (f.name.clone(), f.size))
+            .collect();
+        let missing: Vec<(String, u64)> = {
+            let snap = snap.clone();
+            tokio::task::spawn_blocking(move || {
+                all.into_iter()
+                    .filter(|(n, _)| std::fs::metadata(snap.join(n)).is_err())
+                    .collect()
+            })
+            .await
+            .map_err(|e| NestError::Io(e.to_string()))?
+        };
+        let need: u64 = missing.iter().map(|f| f.1).sum();
+        let free = a.store.capacity().map(|c| c.free).unwrap_or(0);
+        if need > free {
+            return Err(NestError::Invalid(format!(
+                "archive {archive} has {} GiB free; the download needs {} GiB",
+                free >> 30,
+                need.div_ceil(1 << 30)
+            )));
+        }
+        // Scratch hubs live beside the archive's objects, one directory per
+        // gateway; whatever an earlier run left there is stale.
+        let scratch_root = std::path::Path::new(&a.config.path)
+            .join(format!("hf-download-{}", self.vfs.data().id().0));
+        let id = self.next_job.load(Ordering::Relaxed);
+        let scratch = scratch_root.join(format!("{}-{id}", now_ms()));
+        {
+            let (root, me) = (scratch_root.clone(), scratch.clone());
+            tokio::task::spawn_blocking(move || {
+                if let Ok(rd) = std::fs::read_dir(&root) {
+                    for e in rd.flatten() {
+                        if e.path() != me {
+                            let _ = std::fs::remove_dir_all(e.path());
+                        }
+                    }
+                }
+                std::fs::create_dir_all(me.join("hub"))
+            })
+            .await
+            .map_err(|e| NestError::Io(e.to_string()))?
+            .map_err(|e| NestError::Io(format!("{}: {e}", scratch.display())))?;
+        }
+        let what = format!("hf download {repo} -> archive {archive}");
+        tracing::info!(%repo, %archive, sha = %plan.sha, files = missing.len(), "hf download into an archive started");
+        Ok(
+            self.local_job(what, move |vfs, progress, notes| async move {
+                {
+                    let mut p = progress.lock();
+                    p.total_files = missing.len() as u64;
+                    p.total_bytes = need;
+                }
+                if missing.is_empty() {
+                    notes.lock().push("already complete in the cluster".into());
+                }
+                let scratch_hub = scratch.join("hub");
+                // 1. Fetch into the scratch hub, mirroring byte progress.
+                let fetch = Arc::new(Mutex::new(crate::hfimport::FetchProgress::new(&missing)));
+                let run = if missing.is_empty() {
+                    Ok(())
+                } else {
+                    let (h, r, k, sha, f) = (
+                        scratch_hub.clone(),
+                        repo.clone(),
+                        kind.clone(),
+                        plan.sha.clone(),
+                        fetch.clone(),
+                    );
+                    let task = tokio::spawn(async move {
+                        crate::hfimport::fetch_files(None, &h, &r, &k, &sha, f).await
+                    });
+                    while !task.is_finished() {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let f = fetch.lock();
+                        let mut p = progress.lock();
+                        p.copied_bytes = f.done_bytes();
+                        if p.cancelled {
+                            drop(p);
+                            drop(f);
+                            fetch.lock().cancelled = true;
+                        }
+                    }
+                    task.await.map_err(|e| NestError::Io(e.to_string()))?
+                };
+                let failed: Vec<String> = fetch
+                    .lock()
+                    .files
+                    .iter()
+                    .filter(|f| f.state != crate::hfimport::FetchState::Done)
+                    .map(|f| {
+                        if f.error.is_empty() {
+                            f.name.clone()
+                        } else {
+                            format!("{}: {}", f.name, f.error)
+                        }
+                    })
+                    .collect();
+                // 2. Import what arrived (a repo whose files all failed has
+                // nothing to import). Progress stays at the bytes downloaded;
+                // files count as they are imported.
+                let arrived = fetch
+                    .lock()
+                    .files
+                    .iter()
+                    .any(|f| f.state == crate::hfimport::FetchState::Done);
+                let imported = if arrived {
+                    let outcomes = Arc::new(Mutex::new(Vec::new()));
+                    let opts = crate::hfimport::HfImportOptions {
+                        src: scratch_hub.join(&repo_dir),
+                        hub: hub.clone(),
+                        mount_hub: Some(mount_hub.clone()),
+                        hf: None,
+                        r#move: false,
+                        copy: true,
+                        spread: false,
+                        archive: Some(archive.clone()),
+                    };
+                    // The import counts its own files; the job's totals stay
+                    // what was downloaded.
+                    let ip = Arc::new(Mutex::new(crate::import::ImportProgress::default()));
+                    let r =
+                        crate::hfimport::run(vfs.clone(), opts, ip.clone(), outcomes.clone(), None)
+                            .await;
+                    let ip = ip.lock().clone();
+                    let mut p = progress.lock();
+                    p.files = ip.files + ip.adopted;
+                    p.errors.extend(ip.errors);
+                    drop(p);
+                    let mut n = notes.lock();
+                    for o in outcomes.lock().iter() {
+                        if o.status != "done" {
+                            n.push(format!("{}: {} ({})", o.repo, o.status, o.note));
+                        }
+                    }
+                    r
+                } else {
+                    Ok(())
+                };
+                // 3. The scratch hub goes, whatever happened (and its parent
+                // when nothing else is downloading there).
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(&scratch);
+                    scratch.parent().map(std::fs::remove_dir)
+                })
+                .await;
+                run?;
+                imported?;
+                if let Some(b) = branch {
+                    let ref_path = mount_hub.join(&repo_dir).join("refs").join(b);
+                    let sha = plan.sha.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Some(d) = ref_path.parent() {
+                            let _ = std::fs::create_dir_all(d);
+                        }
+                        std::fs::write(&ref_path, &sha)
+                    })
+                    .await;
+                }
+                if !failed.is_empty() {
+                    return Err(NestError::Io(format!(
+                        "{} files failed (e.g. {}); run it again to fetch them",
+                        failed.len(),
+                        failed[0]
+                    )));
+                }
+                Ok(())
+            }),
+        )
+    }
+
+    /// Archive store `name`, which this host must be a healthy gateway of
+    /// (`hfimport::archive_here`); otherwise the error names its gateways.
+    pub fn archive_here(&self, name: &str) -> NestResult<Arc<nest_data::Archive>> {
+        crate::hfimport::archive_here(&self.vfs, name).map_err(|e| {
+            let gateways = self.archive_stores().ok().and_then(|v| {
+                v.into_iter()
+                    .find(|(_, n, _)| n == name)
+                    .map(|(_, _, c)| c.gateways)
+            });
+            match (e, gateways) {
+                (NestError::Invalid(m), Some(g)) if m.contains("not a gateway") => {
+                    let names = self.nodes().unwrap_or_default();
+                    let g: Vec<String> = g
+                        .iter()
+                        .map(|id| {
+                            names
+                                .iter()
+                                .find(|h| h.node == *id)
+                                .map_or(id.0.to_string(), |h| h.name.clone())
+                        })
+                        .collect();
+                    NestError::Invalid(format!(
+                        "archive {name} is reached through {}; run this there",
+                        g.join(", ")
+                    ))
+                }
+                (e, _) => e,
+            }
+        })
+    }
+
     /// Delete Hugging Face repos from the hub through `hf cache rm` (see
     /// `hfimport::remove`), as a job whose note is hf's summary.
     pub fn hf_remove(

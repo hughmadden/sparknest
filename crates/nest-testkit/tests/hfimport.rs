@@ -112,6 +112,7 @@ fn opts(src: PathBuf, mv: bool, mount_hub: Option<PathBuf>) -> HfImportOptions {
         r#move: mv,
         copy: true,
         spread: false,
+        archive: None,
     }
 }
 
@@ -305,4 +306,161 @@ async fn spread_import_leaves_one_copy_spread_over_the_hosts() {
     let ip = p.import_progress(job.id).unwrap();
     assert!(ip.spread_files > 0, "{ip:?}");
     assert_eq!(ip.spread_files + ip.kept_files, 12, "{ip:?}");
+}
+
+/// Live stores holding the current generation of `path`'s file.
+fn live_stores(c: &TestCluster, path: &str) -> Vec<u64> {
+    let conn = c.node(1).meta.open_reader().unwrap();
+    let (id, _) = nest_place::selector::resolve_path(&conn, path).unwrap();
+    let a = nest_meta::query::getattr(&conn, id).unwrap().unwrap();
+    let mut v: Vec<u64> = nest_meta::query::replicas(&conn, id)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.generation == a.generation && r.state == ReplicaState::Live)
+        .map(|r| r.store.0)
+        .collect();
+    v.sort();
+    v
+}
+
+/// Into an archive (ADR-055): every blob's one copy is in the archive,
+/// hard-linked from a source on its filesystem, none on a host; the models
+/// read through the gateway from any host; importing again changes
+/// nothing; a host that is not a gateway is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn import_into_an_archive_links_blobs_there_and_nowhere_else() {
+    use std::os::unix::fs::MetadataExt;
+    let c = ready(3).await;
+    let p = c.node(1).placer.clone();
+    // One disk holds both the archive and the cache, like /mnt/scratch.
+    let disk = c.state_dir(1).parent().unwrap().join("scratch-disk");
+    let archive = disk.join("sparknest");
+    std::fs::create_dir_all(&archive).unwrap();
+    let r = p
+        .add_store("scratch", archive.to_str().unwrap(), &["n1".into()])
+        .await
+        .unwrap();
+    assert!(r.iter().all(|(_, r)| r.is_ok()), "{r:?}");
+    let sid = p.stores().await.unwrap()[0].id.0;
+    let src = fake_cache(&disk.join("hf"));
+
+    let mut o = opts(src.clone(), false, None);
+    o.archive = Some("scratch".into());
+    // Only a gateway takes it.
+    assert!(c.node(2).placer.archive_here("scratch").is_err());
+    let job = wait_job(&c, p.hf_import(o.clone())).await;
+    assert!(job.error.is_none(), "{job:?}");
+    assert!(
+        job.notes.iter().all(|n| n.ends_with(": done")),
+        "{:?}",
+        job.notes
+    );
+    c.converge().await;
+
+    for (path, body) in [
+        (
+            "/hub/models--org--old/snapshots/c1/model.bin",
+            vec![3u8; 3 << 20],
+        ),
+        (
+            "/hub/models--org--old/snapshots/c1/sub/config.json",
+            b"{\"a\":1}".to_vec(),
+        ),
+        (
+            "/hub/datasets--org--new/snapshots/c2/train.parquet",
+            vec![5u8; 1 << 20],
+        ),
+    ] {
+        assert_eq!(read_path(&c, path).await, body, "{path}");
+    }
+    for blob in [
+        "/hub/models--org--old/blobs/etag-weights",
+        "/hub/models--org--old/blobs/etag-config",
+        "/hub/datasets--org--new/blobs/etag-data",
+    ] {
+        assert_eq!(live_stores(&c, blob), vec![sid], "{blob}");
+    }
+    // The archive's object is the source file itself: a hard link.
+    let weights = src.join("hub/models--org--old/blobs/etag-weights");
+    assert_eq!(std::fs::metadata(&weights).unwrap().nlink(), 2);
+    // No blob went into a host's store (refs, written in place, did).
+    for n in 1..=3 {
+        let big: Vec<_> = c
+            .node(n)
+            .data
+            .store()
+            .scan()
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.size > 64)
+            .collect();
+        assert!(big.is_empty(), "objects on n{n}: {big:?}");
+    }
+    // A host without a copy reads through the gateway.
+    let conn = c.node(3).meta.open_reader().unwrap();
+    let (id, _) =
+        nest_place::selector::resolve_path(&conn, "/hub/models--org--old/blobs/etag-weights")
+            .unwrap();
+    let v3 = &c.node(3).vfs;
+    let (fh, _) = v3.open(id, 0).await.unwrap();
+    assert_eq!(v3.read(fh, (3 << 20) - 4, 16).await.unwrap(), vec![3u8; 4]);
+    v3.release(fh, None).await;
+
+    // Again: everything is there already.
+    let job = wait_job(&c, p.hf_import(o)).await;
+    assert!(job.error.is_none(), "{job:?}");
+    let ip = p.import_progress(job.id).unwrap();
+    assert_eq!(ip.files, 0, "{ip:?}");
+    assert_eq!(
+        live_stores(&c, "/hub/models--org--old/blobs/etag-weights"),
+        vec![sid]
+    );
+}
+
+/// From another filesystem the blobs are copied into the archive; a blob
+/// the cluster already has on a host gains the archive's copy beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn import_into_an_archive_copies_from_another_filesystem() {
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        return;
+    }
+    let c = ready(1).await;
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata(shm).unwrap().dev() == std::fs::metadata(c.state_dir(1)).unwrap().dev() {
+        return;
+    }
+    let p = c.node(1).placer.clone();
+    let archive = c.state_dir(1).join("archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    p.add_store("nas", archive.to_str().unwrap(), &["n1".into()])
+        .await
+        .unwrap();
+    let sid = p.stores().await.unwrap()[0].id.0;
+    let root = shm.join(format!("nest-hf-archive-{}", std::process::id()));
+    let src = fake_cache(&root);
+    // The model is already on this host (an ordinary import); the dataset
+    // is not.
+    let mut first = opts(src.join("hub/models--org--old"), false, None);
+    first.copy = true;
+    assert!(wait_job(&c, p.hf_import(first)).await.error.is_none());
+    let mut o = opts(src.clone(), false, None);
+    o.archive = Some("nas".into());
+    let job = wait_job(&c, p.hf_import(o)).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    assert_eq!(
+        live_stores(&c, "/hub/models--org--old/blobs/etag-weights"),
+        vec![1, sid],
+        "an archive copy beside the host's"
+    );
+    assert_eq!(
+        live_stores(&c, "/hub/datasets--org--new/blobs/etag-data"),
+        vec![sid]
+    );
+    assert_eq!(
+        read_path(&c, "/hub/datasets--org--new/snapshots/c2/train.parquet").await,
+        vec![5u8; 1 << 20]
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }

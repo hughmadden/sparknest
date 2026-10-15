@@ -127,9 +127,18 @@ nest group set gpus hostA,hostB,hostC
 nest rule set qwen hf:Qwen/Qwen3-8B --hosts @gpus --auto   # keep copies there
 nest store add nas /mnt/nas/sparknest --gateways @all       # archive store
 nest offload hf:old/model --store nas                       # free local space
+nest hf import /mnt/nas/hf --archive nas --wait             # a cache straight in
+nest hf download org/name --archive nas --wait              # from the Hub, straight in
 nest plan --free @gpus=500GiB && nest plan apply <id>       # hit free-space targets
 nest backup create /projects --name nightly --store nas
 ```
+
+`--archive` puts a model in an archive store without passing through any
+host's disk; run it on one of the archive's gateways. A cache on the
+archive's own filesystem is hard-linked in (nothing copied); one elsewhere
+is copied in, paced. A download is fetched into a scratch hub on the
+archive's filesystem, then linked in. Either way the model reads through
+the gateway until `nest replicate` puts copies on hosts.
 
 `nest <command> --help` documents each command.
 

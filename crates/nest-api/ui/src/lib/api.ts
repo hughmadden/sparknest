@@ -113,6 +113,8 @@ export interface NodeStatus {
   offgrid?: boolean;
 }
 export interface Status {
+  /** This node's id. */
+  me?: number;
   leader?: number;
   entries: number;
   nodes: NodeStatus[];

@@ -13,9 +13,12 @@
 //! the file is copied straight into the store instead of linked (one pass,
 //! no FUSE round trips); smaller batches keep the metadata close behind.
 //! `import_entries` imports an explicit list of files to namespace paths
-//! (used by `nest hf import` to put blobs where huggingface_hub looks).
+//! (used by `nest hf import` to put blobs where huggingface_hub looks),
+//! into this host's store or, as its gateway, into an archive store
+//! (ADR-055): the object goes into the archive's objects, and the entry is
+//! committed together with the archive's copy and without one here.
 
-use nest_data::Vfs;
+use nest_data::{Archive, Vfs};
 use nest_meta::{Command, Reply, SealPolicy, query};
 use nest_store::ObjectKey;
 use nest_types::{FileId, NestError, NestResult, Timestamp};
@@ -319,14 +322,14 @@ pub async fn run(
                     },
                 });
                 if full(&pending) {
-                    flush(&vfs, &mut pending, opts.r#move, opts.copy, &progress).await?;
+                    flush(&vfs, &mut pending, opts.r#move, opts.copy, None, &progress).await?;
                 }
             } else {
                 progress.lock().skipped += 1;
             }
         }
     }
-    flush(&vfs, &mut pending, opts.r#move, opts.copy, &progress).await?;
+    flush(&vfs, &mut pending, opts.r#move, opts.copy, None, &progress).await?;
     if progress.lock().cancelled {
         return Err(NestError::Io(
             "cancelled; what was imported stays, the rest of the source is untouched".into(),
@@ -423,6 +426,7 @@ async fn flush(
     pending: &mut Vec<Pending>,
     mv: bool,
     copy: bool,
+    archive: Option<&Arc<Archive>>,
     progress: &Arc<Mutex<ImportProgress>>,
 ) -> NestResult<()> {
     if pending.is_empty() {
@@ -439,11 +443,16 @@ async fn flush(
         Reply::FileIds(f) => f,
         other => return Err(NestError::Io(format!("unexpected {other:?}"))),
     };
-    let store = vfs.data().store().clone();
+    let store = match archive {
+        Some(a) => a.store.clone(),
+        None => vfs.data().store().clone(),
+    };
     let me = vfs.data().id();
     let srcs: Vec<PathBuf> = batch.iter().map(|p| p.src.clone()).collect();
     let pr = progress.clone();
+    let st = store.clone();
     let linked: Vec<Result<bool, String>> = tokio::task::spawn_blocking(move || {
+        let store = st;
         srcs.iter()
             .enumerate()
             .map(|(i, s)| {
@@ -460,16 +469,38 @@ async fn flush(
     for (i, (p, l)) in batch.iter().zip(&linked).enumerate() {
         match l {
             Ok(_) => {
-                cmds.push(Command::Import {
+                let file = FileId(first.0 + i as u64);
+                let import = Command::Import {
                     parent: p.parent,
                     name: p.name.clone(),
-                    file: FileId(first.0 + i as u64),
+                    file,
                     perm: p.perm,
                     size: p.size,
                     mtime: p.mtime,
                     node: me,
                     sealed: p.seal,
                     now,
+                };
+                cmds.push(match archive {
+                    None => import,
+                    // Import records a copy on this host's store; in the
+                    // same step the archive's copy replaces it, so the
+                    // entry is never without its one real copy. Existing
+                    // commands only: hosts of any version apply it.
+                    Some(a) => Command::Batch(vec![
+                        import,
+                        Command::PublishReplica {
+                            file,
+                            generation: nest_types::Generation(1),
+                            store: a.id,
+                        },
+                        Command::RetireReplica {
+                            file,
+                            generation: nest_types::Generation(1),
+                            store: me.live_store(),
+                            allow_last: false,
+                        },
+                    ]),
                 });
                 idx.push(i);
             }
@@ -480,10 +511,20 @@ async fn flush(
         return Ok(());
     }
     let results = match meta.propose(Command::Batch(cmds)).await? {
-        Reply::Batch(r) => r,
+        // A nested batch fails as a whole on its first failure (it is one
+        // command): report that failure.
+        Reply::Batch(r) => r
+            .into_iter()
+            .map(|r| match r {
+                Ok(Reply::Batch(inner)) => inner
+                    .into_iter()
+                    .find(Result::is_err)
+                    .unwrap_or(Ok(Reply::Done)),
+                other => other,
+            })
+            .collect::<Vec<_>>(),
         other => return Err(NestError::Io(format!("unexpected {other:?}"))),
     };
-    let store = vfs.data().store().clone();
     let mut to_unlink = Vec::new();
     let mut to_drop = Vec::new();
     {
@@ -527,6 +568,65 @@ async fn flush(
     Ok(())
 }
 
+/// `adopt_local` for an archive: `src` becomes the archive's copy of
+/// `file` (linked from the archive's filesystem, else copied with `copy`).
+/// Ok(false) when the archive already has it.
+async fn adopt_archive(
+    vfs: &Vfs,
+    a: &Arc<Archive>,
+    file: FileId,
+    src: &std::path::Path,
+    size: u64,
+    copy: bool,
+    progress: &Arc<Mutex<ImportProgress>>,
+) -> NestResult<bool> {
+    let attr = vfs
+        .data()
+        .with_reader(|c| query::getattr(c, file))
+        .map_err(sql)?
+        .ok_or(NestError::NotFound)?;
+    if attr.kind != nest_types::FileKind::Regular || attr.gen_state != nest_types::GenState::Stable
+    {
+        return Ok(false);
+    }
+    if attr.size != size {
+        return Err(NestError::Invalid(format!(
+            "{} bytes here but {} in the cluster; left alone",
+            size, attr.size
+        )));
+    }
+    let held = vfs
+        .data()
+        .with_reader(|c| query::has_live_replica(c, file, attr.generation, a.id))
+        .map_err(sql)?;
+    if held {
+        return Ok(false);
+    }
+    let key = ObjectKey::new(file, attr.generation);
+    let (store, src, pr) = (a.store.clone(), src.to_path_buf(), progress.clone());
+    tokio::task::spawn_blocking(move || {
+        let _ = store.delete(key);
+        place(&store, &src, key, copy, &pr)
+    })
+    .await
+    .map_err(|e| NestError::Io(e.to_string()))?
+    .map_err(NestError::Io)?;
+    let r = vfs
+        .data()
+        .meta()
+        .propose(Command::PublishReplica {
+            file,
+            generation: attr.generation,
+            store: a.id,
+        })
+        .await;
+    if let Err(e) = r {
+        let _ = a.store.delete(key);
+        return Err(e);
+    }
+    Ok(true)
+}
+
 /// One regular file to import to an exact namespace path.
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -544,6 +644,7 @@ pub async fn import_entries(
     entries: Vec<Entry>,
     mv: bool,
     copy: bool,
+    archive: Option<&Arc<Archive>>,
     progress: &Arc<Mutex<ImportProgress>>,
 ) -> NestResult<()> {
     let mut dirs: std::collections::HashMap<String, FileId> = std::collections::HashMap::new();
@@ -589,11 +690,14 @@ pub async fn import_entries(
         };
         if let Some(file) = existing {
             // Content-addressed blobs the cluster already has: this host's
-            // file becomes its copy (a hard link, nothing transferred).
-            let r = if e.seal {
-                vfs.adopt_local(file, &real, md.len()).await
-            } else {
-                Ok(false)
+            // (or the archive's) file becomes its copy (a hard link,
+            // nothing transferred).
+            let r = match (e.seal, archive) {
+                (false, _) => Ok(false),
+                (true, None) => vfs.adopt_local(file, &real, md.len()).await,
+                (true, Some(a)) => {
+                    adopt_archive(vfs, a, file, &real, md.len(), copy, progress).await
+                }
             };
             let mut p = progress.lock();
             match r {
@@ -616,8 +720,8 @@ pub async fn import_entries(
             seal: e.seal,
         });
         if full(&pending) {
-            flush(vfs, &mut pending, mv, copy, progress).await?;
+            flush(vfs, &mut pending, mv, copy, archive, progress).await?;
         }
     }
-    flush(vfs, &mut pending, mv, copy, progress).await
+    flush(vfs, &mut pending, mv, copy, archive, progress).await
 }

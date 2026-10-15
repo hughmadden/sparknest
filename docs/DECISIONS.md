@@ -1415,3 +1415,41 @@ does not remove the wakeups); a longer attribute TTL (helps repeated
 scans only, and delays other hosts' changes); the adaptive READDIRPLUS
 mode (plain listings would save the attribute columns, but listings of
 large directories switch between the two and lose the point).
+
+## ADR-055 — Hugging Face imports and downloads straight into an archive store (2026-10-15)
+
+**Context.** A model meant for an archive (raptor's `/mnt/scratch`, the NAS
+share at `/mnt/models`) had to land on a host first and then be offloaded:
+the bytes crossed the host's NVMe twice, and a cache already sitting on the
+archive's disk (`/mnt/scratch/hf`) was copied off it only to be copied back.
+
+**Decision.**
+1. `nest hf import SRC --archive NAME` and `nest hf download REPO --archive
+   NAME` (the API's `archive` field; the Download dialog's Archive choice)
+   run on a gateway of that archive and put the blobs in it, never on a
+   host. Other hosts refuse, naming the gateways.
+2. **Import.** Each blob goes into the archive's objects: hard-linked when
+   the source is on the archive's filesystem (CIFS links within a share
+   too), else copied with the archive's paced, direct writes. A blob the
+   cluster already has gains the archive's copy the same way. Snapshot
+   links are mirrored from the source (hf would write blobs through the
+   mount onto this host). Refs are small mutable files and stay on the
+   host, as any write through the mount.
+3. **Recorded with existing commands.** `Import` records its copy on the
+   importing host's store; a `Batch` of `Import`, `PublishReplica` into
+   the archive and `RetireReplica` of the host's copy commits the entry
+   with the archive's copy only, all or nothing. No new command, so it
+   needs no version gate (ADR-018); retiring a copy that was never written
+   deletes nothing.
+4. **Download.** The files the hub lacks at the planned commit are fetched
+   one at a time by `sparknest-hf-fetch` into a scratch hub on the
+   archive's filesystem (`<archive>/hf-download-<node>/`), then imported
+   from there as in 2 (hard links: nothing is written twice) and the
+   scratch hub removed. The branch ref is written as for other downloads.
+   A gateway clears what an earlier, interrupted run left in its scratch
+   directory.
+
+**Alternatives.** Downloading onto a host and offloading (two writes, and
+the host needs the room); letting hf write into the archive through a
+second FUSE mount (no such mount exists); a new `Import` variant naming a
+store (needs every host upgraded first, for no gain over the batch).
