@@ -536,12 +536,50 @@ async fn selected_files(api: &Api, selector: &str) -> Result<Vec<selector::Entry
     Ok(entries)
 }
 
+/// `0.4.1` as (0, 4, 1); anything unparsable as 0.
+fn semver(v: &str) -> (u64, u64, u64) {
+    let mut p = v.split(['.', '-']).map(|x| x.parse().unwrap_or(0));
+    (
+        p.next().unwrap_or(0),
+        p.next().unwrap_or(0),
+        p.next().unwrap_or(0),
+    )
+}
+
+/// Refuse a new kind of log entry until every host runs a version that
+/// decodes it (ADR-018): an older host would stop applying the log.
+async fn require_every_host_upgraded(api: &Api, what: &str) -> Result<(), ApiError> {
+    let mine = env!("CARGO_PKG_VERSION");
+    let behind: Vec<String> = api
+        .placer
+        .status()
+        .await?
+        .into_iter()
+        .filter_map(|n| match &n.info {
+            Some(i) if semver(&i.version) >= semver(mine) => None,
+            Some(i) => Some(format!("{} runs {}", n.name, i.version)),
+            None => Some(format!("{} does not answer", n.name)),
+        })
+        .collect();
+    if behind.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError(
+        StatusCode::CONFLICT,
+        format!(
+            "{what} needs every host on {mine} or later first: {}",
+            behind.join(", ")
+        ),
+    ))
+}
+
 /// Mark files always passthrough on hosts with a complete local copy
 /// (ADR-053), or return them to each host's policy.
 async fn set_passthrough(
     State(api): State<Api>,
     Json(r): Json<PassthroughReq>,
 ) -> R<serde_json::Value> {
+    require_every_host_upgraded(&api, "marking files passthrough").await?;
     let entries = selected_files(&api, &r.selector).await?;
     let mut changed = 0;
     let mut errors = Vec::new();
@@ -1644,4 +1682,16 @@ async fn set_group(
 async fn delete_group(State(api): State<Api>, Path(name): Path<String>) -> R<serde_json::Value> {
     api.placer.delete_group(&name).await?;
     Ok(Json(json!({ "deleted": name })))
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn semver_orders_releases() {
+        use super::semver;
+        assert!(semver("0.4.1") > semver("0.4.0"));
+        assert!(semver("0.10.0") > semver("0.9.9"));
+        assert!(semver("1.0.0") >= semver("1.0.0-rc1"));
+        assert_eq!(semver("junk"), (0, 0, 0));
+    }
 }

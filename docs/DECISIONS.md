@@ -1373,6 +1373,9 @@ gave up passthrough for nothing.
    by hosts. A selector (a path, a tree or hf:org/name) marks its files
    as they are; files added later are not marked until it is set again.
 2. `sole` counts only other fabric hosts' live copies.
+3. Hosts that predate the command cannot decode it (ADR-018), so setting
+   the flag is refused until every host answers with the version of the
+   host taking the request, or later.
 
 **Alternatives.** A selector rule evaluated at open (follows new files,
 but costs a selector match per open and a second place to look); marking
