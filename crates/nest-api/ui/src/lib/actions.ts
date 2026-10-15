@@ -1,7 +1,7 @@
 // Actions on a selection (a path or hf:org/name), shared by the treemap's
 // context menu, model details and the files list.
 
-import { post, api, type TreeNode } from "./api";
+import { get, post, api, type TreeNode } from "./api";
 import { app, startJob, targets, toast, go } from "./state.svelte";
 import { pick, inform, confirm, openMenu, openPlace, type MenuItem } from "./ui.svelte";
 import { human, selLabel } from "./format";
@@ -93,6 +93,48 @@ export async function keepOn(selector: string) {
   }
 }
 
+export interface PassthroughState {
+  files: number;
+  always: number;
+}
+export const passthroughState = (selector: string) =>
+  get<PassthroughState>("/v1/passthrough?selector=" + encodeURIComponent(selector));
+
+/** Hand a selection's files to the kernel on every host that has them all
+ *  (ADR-053), or return them to each host's policy. Asks when `always` is
+ *  not given. Resolves to whether anything changed. */
+export async function setPassthrough(selector: string, always?: boolean): Promise<boolean> {
+  const label = selLabel(selector);
+  if (always === undefined) {
+    let s: PassthroughState;
+    try {
+      s = await passthroughState(selector);
+    } catch (e) {
+      toast((e as Error).message, true);
+      return false;
+    }
+    const all = s.files > 0 && s.always === s.files;
+    const ok = await confirm(
+      all ? `Return ${label} to each host's policy?` : `Always passthrough ${label}?`,
+      all
+        ? "Hosts go back to their own passthrough policy: reads of files with copies on several hosts may be spread over them again."
+        : `Hosts with a complete local copy hand ${s.files === 1 ? "this file" : `these ${s.files.toLocaleString()} files`} to the kernel: the lowest latency, but reads are never spread over other copies.${s.always ? ` ${s.always.toLocaleString()} already are.` : ""}`,
+      all ? "Return" : "Always passthrough",
+    );
+    if (!ok) return false;
+    always = !all;
+  }
+  try {
+    const r = await post<{ files: number; changed: number; errors: string[] }>("/v1/passthrough", { selector, always });
+    if (r.errors.length) toast(`${r.errors.length} file${r.errors.length === 1 ? "" : "s"} of ${label} not changed: ${r.errors[0]}`, true);
+    else toast(always ? `${label}: always passthrough where a host has it all` : `${label}: back to each host's policy`);
+    return true;
+  } catch (e) {
+    toast((e as Error).message, true);
+    return false;
+  }
+}
+
 /** The context menu for a treemap block (or any node with a selector). */
 export function nodeMenu(n: TreeNode, x: number, y: number, scope: string | null, zoom?: () => void) {
   const sel = n.selector;
@@ -111,6 +153,7 @@ export function nodeMenu(n: TreeNode, x: number, y: number, scope: string | null
     { label: "Place…", icon: "target", hint: "hosts, replicas, archive", run: () => openPlace(sel, n.kind === "repo" ? n.name : selLabel(sel)) },
     { label: "Copy to…", icon: "copy", run: () => copyTo(sel) },
     { label: "Keep on… (rule)", icon: "pin", run: () => keepOn(sel) },
+    { label: "Passthrough…", icon: "bolt", hint: "lowest latency", run: () => setPassthrough(sel) },
     { sep: true, label: "" },
   );
   if (isHost) items.push({ label: `Remove from ${scope}`, icon: "trash", danger: true, run: () => removeFrom(sel, [scope!]) });

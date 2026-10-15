@@ -257,6 +257,13 @@ fn format_is_pinned() {
             },
             "SetReadPattern",
         ),
+        (
+            Command::SetPassthrough {
+                file: f,
+                always: false,
+            },
+            "SetPassthrough",
+        ),
     ];
     for (i, (c, name)) in cmds.iter().enumerate() {
         assert_eq!(tag(c) as usize, i, "Command::{name} moved");

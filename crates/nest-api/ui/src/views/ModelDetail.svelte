@@ -2,7 +2,7 @@
   import { get, type Readiness, type TreeNode, type HostUsage } from "../lib/api";
   import { app, runningJobs, startJob, go, singleFlight } from "../lib/state.svelte";
   import { human, ago, selLabel, splitRepo } from "../lib/format";
-  import { copyTo, keepOn, removeFrom, nodeMenu, deleteModel } from "../lib/actions";
+  import { copyTo, keepOn, removeFrom, nodeMenu, deleteModel, setPassthrough, passthroughState, type PassthroughState } from "../lib/actions";
   import { openPlace } from "../lib/ui.svelte";
   import Treemap from "../components/Treemap.svelte";
   import Icon from "../components/Icon.svelte";
@@ -23,9 +23,12 @@
   }
   let d = $state<Detail | null>(null);
   let err = $state("");
+  // How many of its files hosts always hand to the kernel (ADR-053).
+  let pt = $state<PassthroughState | null>(null);
   async function load() {
     try {
       d = await get<Detail>("/v1/hf/detail?selector=" + encodeURIComponent(selector));
+      pt = await passthroughState(selector).catch(() => null);
       err = "";
     } catch (e) {
       err = (e as Error).message;
@@ -77,6 +80,19 @@
       <button class="btn danger" onclick={() => removeFrom(selector)}><Icon name="trash" size={15} /> Remove from…</button>
       <button class="btn danger" onclick={() => deleteModel(selector)} title="Delete the repo from the hub with hf: every copy, every host"><Icon name="trash" size={15} /> Delete model</button>
     </div>
+    {#if pt?.files}
+      {@const all = pt.always === pt.files}
+      <label class="check small" title="Hosts with a complete local copy hand these files to the kernel: the lowest latency, but reads are never spread over other copies. Off: each host's own passthrough policy.">
+        <input type="checkbox" checked={all} indeterminate={!all && pt.always > 0}
+          onchange={async (e) => {
+            const on = e.currentTarget.checked;
+            if (await setPassthrough(selector, on)) pt = await passthroughState(selector).catch(() => pt);
+            else e.currentTarget.checked = all;
+          }} />
+        Always passthrough on hosts with a full copy
+        {#if !all && pt.always}<span class="muted mono">({pt.always} of {pt.files} files)</span>{/if}
+      </label>
+    {/if}
 
     {#if d.revisions.length || d.rules.length}
       <div class="row">

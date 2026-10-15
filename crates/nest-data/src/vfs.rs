@@ -1548,6 +1548,25 @@ impl Vfs {
             .unwrap_or(false)
     }
 
+    /// Whether reads of `a` could be spread: another fabric host holds a
+    /// live copy. Off-grid hosts' copies never take part (ADR-047), so they
+    /// do not cost this host its passthrough (ADR-053).
+    fn spreadable_elsewhere(&self, a: &FileAttr) -> bool {
+        let me = self.me();
+        let offgrid = self.offgrid_hosts();
+        self.q(|c| query::replicas(c, a.id))
+            .map(|rs| {
+                rs.iter().any(|r| {
+                    r.generation == a.generation
+                        && r.state == nest_types::ReplicaState::Live
+                        && !crate::is_archive(r.store)
+                        && NodeId(r.store.0) != me
+                        && !offgrid.contains(&NodeId(r.store.0))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// The open object to serve `generation` of `file` from, cached for
     /// STABLE generations (a remote read used to cost two queries, a stat
     /// and an open per request).
@@ -1664,17 +1683,21 @@ impl Vfs {
             .ok_or(NestError::Invalid("bad file handle".into()))
     }
 
-    fn choose_mode(&self, a: &FileAttr, writable: bool) -> OpenMode {
+    /// `pinned`: the file is marked always passthrough (ADR-053).
+    fn choose_mode(&self, a: &FileAttr, writable: bool, pinned: bool) -> OpenMode {
         if a.sealed && !writable && a.gen_state == GenState::Stable {
             let key = ObjectKey::new(a.id, a.generation);
-            let allowed = match self.cfg.passthrough {
-                Passthrough::Always => true,
-                // Other copies exist: let the daemon spread the reads,
-                // unless they are scattered (the local disk answers those
-                // fastest).
-                Passthrough::Sole => !self.live_elsewhere(a) || self.patterns.is_random(a.id),
-                Passthrough::Never => false,
-            };
+            let allowed = pinned
+                || match self.cfg.passthrough {
+                    Passthrough::Always => true,
+                    // Other fabric hosts hold copies: let the daemon spread
+                    // the reads, unless they are scattered (the local disk
+                    // answers those fastest).
+                    Passthrough::Sole => {
+                        !self.spreadable_elsewhere(a) || self.patterns.is_random(a.id)
+                    }
+                    Passthrough::Never => false,
+                };
             if allowed
                 && self.d.servable(key)
                 && let Ok(f) = self.d.store().open_read(key)
@@ -1703,10 +1726,12 @@ impl Vfs {
         }
         self.d.wait_caught_up(self.cfg.catch_up_wait).await;
         self.usage.record_open(file);
-        if !writable && let Ok(scattered) = self.q(|c| query::read_scattered(c, file)) {
+        let mut pinned = false;
+        if !writable && let Ok((scattered, always)) = self.q(|c| query::read_hints(c, file)) {
             self.patterns.seed(file, scattered);
+            pinned = always;
         }
-        let mode = self.choose_mode(&a, writable);
+        let mode = self.choose_mode(&a, writable, pinned);
         let fh = self.new_handle(file, flags);
         if writable && flags & oflags::TRUNC != 0 {
             let r = self.truncate(file, 0, Some(fh)).await;

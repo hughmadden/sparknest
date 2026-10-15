@@ -435,3 +435,72 @@ async fn a_host_moves_off_the_fabric_and_back() {
     let h = file(&c, 4, "back", b"on the fabric again").await;
     assert_eq!(read_all(&c, 3, h).await, b"on the fabric again");
 }
+
+/// Whether `node` opens `f` for passthrough.
+async fn passthrough(c: &TestCluster, node: u64, f: FileId) -> bool {
+    let v = &c.node(node).vfs;
+    let (fh, mode) = v.open(f, RO).await.unwrap();
+    v.release(fh, None).await;
+    matches!(mode, nest_data::OpenMode::Passthrough(_))
+}
+
+async fn mark(c: &TestCluster, f: FileId, always: bool) {
+    c.node(1)
+        .meta
+        .propose(Command::SetPassthrough { file: f, always })
+        .await
+        .unwrap();
+    c.converge().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn passthrough_gives_way_to_fabric_copies_unless_the_file_is_marked() {
+    // Every host on the `sole` policy (ADR-053).
+    let mut t = nest_testkit::fast_tuning();
+    t.vfs.passthrough = nest_data::Passthrough::Sole;
+    let mut c = TestCluster::start_with(3, t).await;
+    c.eventually("all nodes serving", Duration::from_secs(8), |c| {
+        (1..=3).all(|i| c.node(i).data.caught_up() && c.node(i).data.session().is_some())
+    })
+    .await;
+    c.add_offgrid(4).await;
+    c.eventually("off-grid host serving", Duration::from_secs(8), |c| {
+        c.node(4).data.caught_up() && c.node(4).data.session().is_some()
+    })
+    .await;
+    let f = file(&c, 1, "engram", &vec![3u8; 64 << 10]).await;
+    c.node(1)
+        .meta
+        .propose(Command::Seal {
+            file: f,
+            sealed: true,
+            now: Timestamp(1),
+        })
+        .await
+        .unwrap();
+    c.converge().await;
+
+    assert!(passthrough(&c, 1, f).await, "the only copy");
+    // An off-grid copy is never read from by fabric hosts: no reason to
+    // give up the kernel's path.
+    replicate(&c, f, 1, 4).await;
+    assert!(passthrough(&c, 1, f).await, "gave way to an off-grid copy");
+    // A second fabric copy: the daemon spreads reads over both.
+    replicate(&c, f, 1, 2).await;
+    assert!(
+        !passthrough(&c, 1, f).await,
+        "kept passthrough beside a fabric copy"
+    );
+
+    // Marked: every host with a complete copy hands it to the kernel.
+    mark(&c, f, true).await;
+    assert!(passthrough(&c, 1, f).await);
+    assert!(passthrough(&c, 2, f).await);
+    assert!(
+        !passthrough(&c, 3, f).await,
+        "passthrough without a local copy"
+    );
+    // Unmarked: back to the host's policy.
+    mark(&c, f, false).await;
+    assert!(!passthrough(&c, 1, f).await);
+}

@@ -156,6 +156,10 @@ pub fn router(api: Api) -> Router {
         .route("/v1/fsck", post(fsck))
         .route("/v1/seal-policy", post(seal_policy))
         .route("/v1/read-pattern", post(read_pattern))
+        .route(
+            "/v1/passthrough",
+            get(get_passthrough).post(set_passthrough),
+        )
         .route("/v1/where", get(where_))
         .route("/v1/replicate", post(replicate))
         .route("/v1/evict", post(evict))
@@ -512,6 +516,78 @@ async fn read_pattern(
         }
     }
     Ok(Json(json!({ "changed": changed, "errors": errors })))
+}
+
+#[derive(Deserialize)]
+struct PassthroughReq {
+    /// A path (file or tree) or hf:org/name.
+    selector: String,
+    /// Always passthrough where a complete local copy exists, or back to
+    /// each host's policy.
+    always: bool,
+}
+
+/// The distinct files a selector names.
+async fn selected_files(api: &Api, selector: &str) -> Result<Vec<selector::Entry>, ApiError> {
+    let sel = api.selector(selector)?;
+    let mut entries = api.placer.manifest(&sel).await?.entries;
+    entries.sort_by_key(|e| e.file);
+    entries.dedup_by_key(|e| e.file);
+    Ok(entries)
+}
+
+/// Mark files always passthrough on hosts with a complete local copy
+/// (ADR-053), or return them to each host's policy.
+async fn set_passthrough(
+    State(api): State<Api>,
+    Json(r): Json<PassthroughReq>,
+) -> R<serde_json::Value> {
+    let entries = selected_files(&api, &r.selector).await?;
+    let mut changed = 0;
+    let mut errors = Vec::new();
+    for chunk in entries.chunks(512) {
+        let cmds = chunk
+            .iter()
+            .map(|e| nest_meta::Command::SetPassthrough {
+                file: e.file,
+                always: r.always,
+            })
+            .collect();
+        let nest_meta::Reply::Batch(results) = api
+            .vfs
+            .data()
+            .meta()
+            .propose(nest_meta::Command::Batch(cmds))
+            .await?
+        else {
+            return Err(NestError::Io("unexpected reply".into()).into());
+        };
+        for (res, e) in results.into_iter().zip(chunk) {
+            match res {
+                Ok(_) => changed += 1,
+                Err(err) => errors.push(format!("{}: {err}", e.path)),
+            }
+        }
+    }
+    Ok(Json(
+        json!({ "files": entries.len(), "changed": changed, "errors": errors }),
+    ))
+}
+
+/// How many of a selector's files are marked always passthrough.
+async fn get_passthrough(State(api): State<Api>, Query(q): Query<DetailQ>) -> R<serde_json::Value> {
+    let entries = selected_files(&api, &q.selector).await?;
+    let c = api.conn()?;
+    let mut always = 0;
+    for e in &entries {
+        if query::read_hints(&c, e.file)
+            .map_err(|e| NestError::Io(e.to_string()))?
+            .1
+        {
+            always += 1;
+        }
+    }
+    Ok(Json(json!({ "files": entries.len(), "always": always })))
 }
 
 #[derive(Deserialize)]

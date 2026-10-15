@@ -331,6 +331,20 @@ pub fn read_scattered(c: &Connection, file: FileId) -> rusqlite::Result<bool> {
     Ok(flags.unwrap_or(0) & crate::apply::FLAG_READ_SCATTERED != 0)
 }
 
+/// How a regular file is to be read: (scattered, always passthrough), from
+/// its `SetReadPattern` (ADR-031) and `SetPassthrough` (ADR-053) flags.
+pub fn read_hints(c: &Connection, file: FileId) -> rusqlite::Result<(bool, bool)> {
+    let flags = c
+        .prepare_cached("SELECT flags FROM files WHERE id = ?1 AND kind = 1")?
+        .query_row(params![file.0 as i64], |r| r.get::<_, i64>(0))
+        .optional()?
+        .unwrap_or(0);
+    Ok((
+        flags & crate::apply::FLAG_READ_SCATTERED != 0,
+        flags & crate::apply::FLAG_PASSTHROUGH != 0,
+    ))
+}
+
 /// A directory's own sealing policy (bits 8-9 of `files.flags`).
 pub fn seal_policy(c: &Connection, dir: FileId) -> rusqlite::Result<crate::SealPolicy> {
     let flags: Option<i64> = c

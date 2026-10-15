@@ -245,6 +245,13 @@ pub enum Command {
         file: FileId,
         scattered: bool,
     },
+    /// Hand a regular file to the kernel (passthrough) on every host with a
+    /// complete local copy, whatever the host's policy (ADR-053). Set by
+    /// whoever knows the file's latency matters, never learned.
+    SetPassthrough {
+        file: FileId,
+        always: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

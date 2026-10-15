@@ -5,6 +5,10 @@ what is next. Keep entries short; link to benchmarks and ADRs.
 
 ## 2026-10-15 — counters socket directory, UI reloads on upgrade
 
+- Files can be marked always passthrough (ADR-053): `nest passthrough
+  SEL always|default`, a toggle on a model's page, the Passthrough… menu
+  item. Hosts with a complete local copy hand them to the kernel whatever
+  their policy. `sole` no longer gives up passthrough over an off-grid copy.
 - The counters stream moved to /srv/sparknest/run/rdma-counters.sock so
   containers mount the directory and survive daemon restarts (ADR-052).
 - The web UI reloads itself when its node starts serving a different UI,

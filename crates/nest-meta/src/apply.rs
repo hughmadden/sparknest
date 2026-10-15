@@ -13,6 +13,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 const FLAG_SEAL_PENDING: i64 = 1;
 /// Regular files: reads are scattered (ADR-031).
 pub(crate) const FLAG_READ_SCATTERED: i64 = 1 << 10;
+/// Always passthrough where a complete local copy exists (ADR-053).
+pub(crate) const FLAG_PASSTHROUGH: i64 = 1 << 11;
 
 enum Fail {
     Nest(NestError),
@@ -282,6 +284,19 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
                      WHERE id = ?1 AND kind = 1",
                 )?
                 .execute(params![file.0 as i64, *scattered, FLAG_READ_SCATTERED])?;
+            if n == 0 {
+                return err(NestError::NotFound);
+            }
+            Ok(Reply::Done)
+        }
+        Command::SetPassthrough { file, always } => {
+            // Like the read pattern: a hint, read at open.
+            let n = c
+                .prepare_cached(
+                    "UPDATE files SET flags = CASE WHEN ?2 THEN flags | ?3 ELSE flags & ~?3 END \
+                     WHERE id = ?1 AND kind = 1",
+                )?
+                .execute(params![file.0 as i64, *always, FLAG_PASSTHROUGH])?;
             if n == 0 {
                 return err(NestError::NotFound);
             }

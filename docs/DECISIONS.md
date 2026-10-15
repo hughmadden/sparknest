@@ -1350,3 +1350,31 @@ The daemon creates `run/` (mode 0755) and nothing else goes in it;
 containers mount the directory, which outlives the socket, and reconnect
 after a restart. The 0.4.0 path is removed at start, not kept: nothing
 depended on it yet. Protocol and permissions are unchanged.
+
+## ADR-053 — Files marked always passthrough (2026-10-15)
+
+**Context.** Fabric hosts run `passthrough = "sole"`: a file with copies on
+other hosts is served by the daemon so its reads can be spread (ADR-030),
+unless its reads are scattered (ADR-031, learned after 64 MiB of wasted
+readahead, and cleared again by hosts that see it stream). The LLM
+engine's engram tables want the kernel's path from the first read on
+every host that holds them, whatever was learned. Separately, `sole`
+counted off-grid hosts' copies as "elsewhere", though reads are never
+spread to them: a fabric host sharing a file only with an off-grid host
+gave up passthrough for nothing.
+
+**Decision.**
+1. A per-file flag (`Command::SetPassthrough`, bit 11 of `files.flags`,
+   beside the scattered bit): a host with a complete local copy of a
+   marked file hands it to the kernel at open, whatever its policy. A
+   host without one reads it as usual. Set by people or tools (`nest
+   passthrough SEL always|default`, `POST /v1/passthrough`, a toggle on a
+   model's page and the Passthrough… menu item), never learned or cleared
+   by hosts. A selector (a path, a tree or hf:org/name) marks its files
+   as they are; files added later are not marked until it is set again.
+2. `sole` counts only other fabric hosts' live copies.
+
+**Alternatives.** A selector rule evaluated at open (follows new files,
+but costs a selector match per open and a second place to look); marking
+the file scattered (also changes how hosts without a copy read it, and
+hosts revise it).

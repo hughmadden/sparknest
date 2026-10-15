@@ -59,6 +59,19 @@ enum Cmd {
         #[arg(short, long)]
         recursive: bool,
     },
+    /// Always hand a file, tree or model to the kernel where a host has it all
+    ///
+    /// Hosts with a complete local copy of a marked file give it to the
+    /// kernel (passthrough) whatever their `passthrough` policy: reads skip
+    /// the daemon, for the lowest latency, but are never spread over other
+    /// copies. `default` returns files to each host's policy; with neither,
+    /// prints how many of the selection's files are marked. A selection is
+    /// a path or hf:org/name[@revision] (hf-dataset: for datasets).
+    Passthrough {
+        selector: String,
+        #[arg(value_parser = ["always", "default"])]
+        mode: Option<String>,
+    },
     /// Remove files or trees in bulk (far faster than `rm -r` through the mount)
     ///
     /// Many entries go into each metadata commit: tens of thousands of
@@ -965,6 +978,31 @@ async fn main() -> Result<()> {
                 json!({ "path": abspath(path), "recursive": recursive, "scattered": pattern == "scattered" }),
             )
             .await?
+        }
+        Cmd::Passthrough { selector, mode } => {
+            let selector = abspath(selector);
+            match mode.as_deref() {
+                Some(m) => {
+                    c.post(
+                        "/v1/passthrough",
+                        json!({ "selector": selector, "always": m == "always" }),
+                    )
+                    .await?
+                }
+                None => {
+                    let v = c
+                        .get(&format!("/v1/passthrough?selector={}", enc(&selector)))
+                        .await?;
+                    if !cli.json {
+                        println!(
+                            "{selector}: {} of {} files always passthrough",
+                            v["always"], v["files"]
+                        );
+                        return Ok(());
+                    }
+                    v
+                }
+            }
         }
         Cmd::Rm {
             paths,
