@@ -9,7 +9,8 @@ what is next. Keep entries short; link to benchmarks and ADRs.
   unless another host owns the file, and listings use READDIRPLUS, so
   stat after readdir costs no request per entry. Before: `du` over the
   mount (24,210 entries) took 0.3–0.8 s on raptor and 5–12 s on the
-  Sparks (~400 µs per `stat`, mostly cross-CPU wakeups).
+  Sparks (~400 µs per `stat`, mostly cross-CPU wakeups). After, on the
+  fleet: raptor 0.3 s, Sparks and off-grid hosts 0.6–1.6 s.
 
 ## 2026-10-15 — 0.4.1: always-passthrough files, counters socket directory, UI fixes
 
