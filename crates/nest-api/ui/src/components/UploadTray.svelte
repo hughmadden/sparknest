@@ -37,7 +37,7 @@
 <style>
   .tray { position: fixed; left: 230px; bottom: 18px; z-index: 70; width: min(380px, calc(100vw - 24px)); padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: rgba(6, 13, 30, 0.94); }
   .head { background: none; border: 0; padding: 0; cursor: pointer; }
-  .list { max-height: 220px; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
+  .list { max-height: 220px; overflow: auto; scrollbar-gutter: stable; display: flex; flex-direction: column; gap: 4px; }
   .u { display: flex; gap: 8px; align-items: center; font-size: 12px; }
   .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ok { color: var(--ok); }

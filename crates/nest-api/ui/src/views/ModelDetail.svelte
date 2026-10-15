@@ -128,7 +128,7 @@
             <span class="spacer"></span>
             <div class="dots">{#each d.hosts as h}<span class="hd" class:on={hover.n.hosts?.includes(h.host)} class:arch={isStore(h.host)} title={h.host}></span>{/each}</div>
           </div>
-          <div class="tiny muted">
+          <div class="tiny muted iline">
             {hover.n.hosts?.length ? `on ${hover.n.hosts.join(", ")}` : "no copy"}
             {#if hoverUse?.last} · opened {ago(hoverUse.last)}{hoverUse.where ? ` on ${hoverUse.where}` : ""}{hoverUse.net ? ` · ${human(hoverUse.net)} over the network` : ""}{/if}
             · {hover.n.children?.length || hover.n.truncated ? "click to zoom in" : "click for actions"}
@@ -155,12 +155,12 @@
   .host.full { border-color: rgba(56, 232, 255, 0.4); box-shadow: 0 0 18px rgba(56, 232, 255, 0.12); }
   .host.fly { border-color: var(--spark); }
   .spark { color: var(--spark); }
-  .info { min-height: 64px; margin-top: 8px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line); background: rgba(4, 12, 28, 0.35); display: flex; flex-direction: column; gap: 3px; }
-  .ipath, .iname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .info { height: 78px; overflow: hidden; margin-top: 8px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line); background: rgba(4, 12, 28, 0.35); display: flex; flex-direction: column; gap: 3px; }
+  .ipath, .iname, .iline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .iname { min-width: 0; max-width: 60%; }
   .irow { flex-wrap: nowrap; gap: 8px; }
   .hint { margin: auto 0; }
-  .dots { display: flex; gap: 3px; flex-wrap: wrap; max-width: 220px; }
+  .dots { display: flex; gap: 3px; flex-wrap: nowrap; overflow: hidden; max-width: 220px; }
   .hd { width: 9px; height: 9px; border-radius: 3px; background: rgba(90, 140, 220, 0.15); }
   .hd.on { background: var(--spark); box-shadow: 0 0 6px var(--spark); }
   .hd.arch.on { background: var(--violet); box-shadow: 0 0 6px var(--violet); }

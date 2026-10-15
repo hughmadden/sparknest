@@ -26,6 +26,10 @@ html, body { margin: 0; height: 100%; color: var(--text); font: 14px/1.45 var(--
 /* Only the root paints the dark base; a body background would be painted
    above the animated backdrop (z-index -1) over the first screen. */
 html { background: var(--bg); }
+/* Reserve the scrollbar's space whether or not it shows: content that grows
+   past the window (a hover panel, a plan) must not narrow the page and
+   reflow everything under the pointer. Every scroll box does the same. */
+html { scrollbar-gutter: stable; }
 body { background: transparent; }
 body { overflow-x: hidden; -webkit-font-smoothing: antialiased; }
 button, input, select { font: inherit; color: inherit; }

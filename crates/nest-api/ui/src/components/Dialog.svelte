@@ -46,7 +46,7 @@
   .bg { position: fixed; inset: 0; z-index: 85; background: rgba(1, 4, 12, 0.6); display: grid; place-items: center; padding: 16px; backdrop-filter: blur(3px); }
   .dlg { width: min(460px, 100%); padding: 20px; animation: rise 0.2s ease-out; background: rgba(8, 16, 34, 0.94); }
   p { margin: 8px 0 0; }
-  .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-top: 14px; max-height: 50vh; overflow: auto; }
+  .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-top: 14px; max-height: 50vh; overflow: auto; scrollbar-gutter: stable; }
   .opt { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: rgba(12, 26, 52, 0.55); cursor: pointer; text-align: left; }
   .opt:hover { border-color: var(--line-hi); }
   .opt.on { border-color: var(--spark); box-shadow: var(--glow); background: rgba(56, 232, 255, 0.1); }

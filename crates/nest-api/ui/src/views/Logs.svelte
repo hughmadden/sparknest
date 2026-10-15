@@ -46,7 +46,7 @@
 </div>
 
 <style>
-  .logs { padding: 8px 0; font-size: 12px; max-height: 75vh; overflow: auto; }
+  .logs { padding: 8px 0; font-size: 12px; max-height: 75vh; overflow: auto; scrollbar-gutter: stable; }
   .ln { display: grid; grid-template-columns: 96px 70px 48px 1fr; gap: 10px; padding: 3px 14px; border-bottom: 1px solid rgba(90, 170, 255, 0.05); animation: rise 0.25s ease-out; }
   .ln:hover { background: rgba(56, 232, 255, 0.04); }
   .ts, .tg { color: var(--faint); }

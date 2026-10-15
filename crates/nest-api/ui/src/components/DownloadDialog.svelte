@@ -175,7 +175,7 @@
   .dlg { width: min(560px, 100%); padding: 20px; display: flex; flex-direction: column; gap: 12px; background: rgba(8, 16, 34, 0.94); animation: rise 0.2s ease-out; }
   h3 { margin: 0; }
   input[type="search"] { width: 100%; }
-  .hits { display: flex; flex-direction: column; gap: 4px; max-height: 40vh; overflow: auto; }
+  .hits { display: flex; flex-direction: column; gap: 4px; max-height: 40vh; overflow: auto; scrollbar-gutter: stable; }
   .hit { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: rgba(12, 26, 52, 0.55); cursor: pointer; text-align: left; }
   .hit:hover { border-color: var(--line-hi); }
   .hit.on { border-color: var(--spark); box-shadow: var(--glow); background: rgba(56, 232, 255, 0.1); }

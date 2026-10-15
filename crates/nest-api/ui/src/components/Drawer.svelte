@@ -22,7 +22,7 @@
      its content scrolls inside. */
   .layer { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 16px; }
   .scrim { position: absolute; inset: 0; background: rgba(1, 4, 12, 0.45); animation: fade 0.2s; }
-  .drawer { position: relative; width: min(680px, 100%); max-height: 100%; overflow: auto; padding: 22px; background: rgba(6, 13, 30, 0.8); animation: pop 0.24s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .drawer { position: relative; width: min(680px, 100%); max-height: 100%; overflow: auto; scrollbar-gutter: stable; padding: 22px; background: rgba(6, 13, 30, 0.8); animation: pop 0.24s cubic-bezier(0.2, 0.8, 0.2, 1); }
   .drawer.wide { width: min(1040px, 100%); }
   .close { position: absolute; top: 12px; right: 12px; z-index: 2; }
   @keyframes pop { from { transform: scale(0.97) translateY(10px); opacity: 0; } to { transform: none; opacity: 1; } }

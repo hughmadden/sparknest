@@ -91,7 +91,9 @@
     return [Math.min(1, c[0] * f), Math.min(1, c[1] * f), Math.min(1, c[2] * f)];
   }
 
-  function layout() {
+  // `animate`: blocks glide from where they were. Only for a change of data
+  // or zoom; a resize snaps, so a reflow under the pointer never animates.
+  function layout(animate: boolean) {
     const out: Item[] = [];
     const place = (n: TreeNode, r: Rect, level: number, color: [number, number, number], key: string) => {
       const kids = (n.children ?? []).filter((c) => c.bytes > 0);
@@ -117,11 +119,13 @@
     place(current, { x: 0, y: 0, w: W, h: H }, 0, PALETTE[0], "");
     // Animate from where each block was (or from its parent).
     const from = new Map<string, Rect>();
-    for (const it of out) {
-      const p = prev.get(it.key) ?? prev.get(it.parentKey);
-      if (p) from.set(it.key, p);
+    if (animate) {
+      for (const it of out) {
+        const p = prev.get(it.key) ?? prev.get(it.parentKey);
+        if (p) from.set(it.key, p);
+      }
     }
-    anim = { start: performance.now(), from };
+    anim = { start: animate ? performance.now() : 0, from };
     labelsDirty = true;
     items = out;
     prev = new Map(out.map((it) => [it.key, it.r]));
@@ -340,11 +344,13 @@
     };
   });
 
+  let laidFor: { current: TreeNode | null; root: TreeNode | null } = { current: null, root: null };
   $effect(() => {
-    void current;
-    void root;
     void H;
-    if (W) layout();
+    if (!W) return;
+    const changed = current !== laidFor.current || root !== laidFor.root;
+    laidFor = { current, root };
+    layout(changed);
   });
 </script>
 

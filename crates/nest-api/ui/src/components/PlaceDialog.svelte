@@ -239,7 +239,7 @@
 
 <style>
   .bg { position: fixed; inset: 0; z-index: 75; background: rgba(1, 4, 12, 0.5); display: grid; place-items: center; padding: 16px; backdrop-filter: blur(2px); }
-  .dlg { width: min(860px, 100%); max-height: calc(100vh - 32px); overflow: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; background: rgba(8, 16, 34, 0.82); animation: rise 0.2s ease-out; }
+  .dlg { width: min(860px, 100%); max-height: calc(100vh - 32px); overflow: auto; scrollbar-gutter: stable; padding: 20px; display: flex; flex-direction: column; gap: 14px; background: rgba(8, 16, 34, 0.82); animation: rise 0.2s ease-out; }
   h3 { margin: 0; }
   .spark { color: var(--spark); }
   .modes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }

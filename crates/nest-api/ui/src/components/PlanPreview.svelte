@@ -195,7 +195,7 @@
   .amt.add { color: var(--ok); background: rgba(61, 255, 197, 0.1); }
   .amt.drop { color: var(--warn); background: rgba(255, 193, 94, 0.1); }
   .amt.off { color: var(--violet); background: rgba(155, 123, 255, 0.12); }
-  .files { padding: 2px 8px 8px 26px; display: flex; flex-direction: column; max-height: 320px; overflow: auto; }
+  .files { padding: 2px 8px 8px 26px; display: flex; flex-direction: column; max-height: 320px; overflow: auto; scrollbar-gutter: stable; }
   .f { display: grid; grid-template-columns: auto 18px minmax(0, 1fr) 76px; gap: 0 8px; align-items: center; padding: 3px 0; border-top: 1px solid rgba(90, 170, 255, 0.07); cursor: pointer; }
   .f.off .p, .f.off .k { opacity: 0.4; text-decoration: line-through; }
   .k { font-weight: 700; text-align: center; }
