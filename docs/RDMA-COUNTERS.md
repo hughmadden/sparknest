@@ -15,7 +15,11 @@ container), e.g. `-v /srv/sparknest/run:/run/sparknest:ro` and connect to
 `/run/sparknest/rdma-counters.sock`. Mount the directory, not the socket:
 the daemon recreates the socket at every start, and a bind mount of the file
 itself would keep pointing at the old one; the directory stays (ADR-052).
-Read-only is fine: connecting to a socket is not a write. `sparknest-rdma-counters`
+Read-only is fine: connecting to a socket is not a write. The directory must
+exist before a container mounts it (Docker would create a missing one as
+root, and the daemon, running as the service user, could not bind in it):
+the daemon creates it at start, and it was created on every host ahead of
+0.4.1. `sparknest-rdma-counters`
 (installed with sparknest) prints the stream as JSON lines and is the
 reference decoder.
 
