@@ -3,7 +3,7 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-## 2026-10-15 — Fast metadata scans (ADR-054)
+## 2026-10-15 — 0.4.2: fast metadata scans (ADR-054)
 
 - LOOKUP and GETATTR are answered on the ring thread that received them
   unless another host owns the file, and listings use READDIRPLUS, so
