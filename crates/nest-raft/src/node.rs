@@ -52,7 +52,7 @@ impl MetaNodeConfig {
             node,
             dir,
             cluster: cluster.into(),
-            heartbeat_ms: 100,
+            heartbeat_ms: 150,
             election_min_ms: 500,
             election_max_ms: 1000,
             snapshot_every: 50_000,

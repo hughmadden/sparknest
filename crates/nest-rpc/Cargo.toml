@@ -19,3 +19,5 @@ parking_lot.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+nix = { workspace = true, features = ["socket", "net", "feature"] }
+libc.workspace = true

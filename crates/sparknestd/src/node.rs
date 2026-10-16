@@ -35,7 +35,11 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Tuning {
-            heartbeat_ms: 100,
+            // A heartbeat's budget is this interval (openraft): above a few
+            // retransmits at the 5 ms floor (ADR-056), so one lost segment
+            // under incast is not a failed heartbeat; elections still fire
+            // after 500 ms of silence (> 3 heartbeats).
+            heartbeat_ms: 150,
             election_min_ms: 500,
             election_max_ms: 1000,
             snapshot_every: 50_000,

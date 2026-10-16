@@ -15,6 +15,7 @@
 pub mod auth;
 mod conn;
 mod filter;
+mod sockopt;
 
 pub use conn::{Handler, Rpc, RpcConfig};
 pub use filter::Filter;
