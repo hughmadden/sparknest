@@ -101,3 +101,5 @@ raw CSV).
   (deferred: needs coordinating a full outage).
 - Faster single-stream reads to off-grid hosts from two copies per chunk
   (deferred: off-grid hosts hold archival copies on slow disks).
+- Soak test on the live cluster: reboot Sparks during model loads, pull a
+  cable, fill a disk (deferred by the user; not part of 0.5.0).
