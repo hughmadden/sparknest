@@ -241,12 +241,11 @@ pub async fn create(
             )));
         }
     }
-    // Manifest: written under a temporary name, cataloged, then named by id.
+    // Manifest: built on this host's disk (SQLite cannot lock on SMB),
+    // cataloged, then copied into the archive named by id.
     let base = common_base(&entries);
-    let tmp = area
-        .root
-        .join("manifests")
-        .join(format!("tmp-{:016x}.sqlite", rand::random::<u64>()));
+    sweep_tmp(&area.root.join("manifests"));
+    let tmp = local_scratch(&vfs)?.join(format!("manifest-{:016x}.sqlite", rand::random::<u64>()));
     let bytes: u64 = entries
         .iter()
         .filter(|e| e.kind == FileKind::Regular)
@@ -318,7 +317,14 @@ pub async fn create(
         Reply::Backup(id) => id,
         other => return Err(NestError::Io(format!("unexpected {other:?}"))),
     };
-    std::fs::rename(&tmp, area.manifest(id)).map_err(io)?;
+    let fin = area.manifest(id);
+    let published = publish_into(
+        &tmp,
+        fin.parent().expect("manifests dir"),
+        &fin.file_name().expect("manifest name").to_string_lossy(),
+    );
+    let _ = std::fs::remove_file(&tmp);
+    published?;
     progress.lock().finished = true;
     Ok(id)
 }
@@ -539,15 +545,61 @@ pub async fn delete(vfs: Arc<Vfs>, area: Arc<BackupArea>, id: u64) -> NestResult
     .expect("blocking task")
 }
 
+/// Where SQLite files bound for an archive are built: SQLite cannot lock
+/// files on an SMB share ("database is locked"), so each is written on this
+/// host's own disk and copied in whole (ADR-056).
+fn local_scratch(vfs: &Vfs) -> NestResult<PathBuf> {
+    let dir = vfs.data().store().root().join("tmp-sqlite");
+    std::fs::create_dir_all(&dir).map_err(io)?;
+    Ok(dir)
+}
+
+/// Copy a finished SQLite file into `dir` under a temporary name and
+/// rename it to `name` there: readers never see a partial file.
+fn publish_into(src: &Path, dir: &Path, name: &str) -> NestResult<PathBuf> {
+    let tmp = dir.join(format!("tmp-{:016x}.sqlite", rand::random::<u64>()));
+    let fin = dir.join(name);
+    let r = std::fs::copy(src, &tmp)
+        .and_then(|_| std::fs::File::open(&tmp)?.sync_all())
+        .and_then(|_| std::fs::rename(&tmp, &fin));
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io(e));
+    }
+    Ok(fin)
+}
+
+/// Remove `tmp-*.sqlite` left in `dir` by runs that died midway (or by
+/// earlier versions, which built them in place and failed on SMB).
+fn sweep_tmp(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let n = e.file_name();
+        let n = n.to_string_lossy();
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(3600));
+        if n.starts_with("tmp-") && n.ends_with(".sqlite") && old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 /// Write a metadata snapshot into `<archive root>/meta/`, keeping `keep`.
 pub fn meta_snapshot(vfs: &Vfs, archive_root: &Path, keep: usize) -> NestResult<PathBuf> {
     let dir = archive_root.join("meta");
     std::fs::create_dir_all(&dir).map_err(io)?;
-    let tmp = dir.join(format!("tmp-{:016x}.sqlite", rand::random::<u64>()));
-    let index = vfs.data().meta().snapshot_to(&tmp).map_err(sql)?;
+    sweep_tmp(&dir);
+    let local = local_scratch(vfs)?.join(format!("meta-{:016x}.sqlite", rand::random::<u64>()));
+    let index = vfs.data().meta().snapshot_to(&local).map_err(sql);
     let secs = Timestamp::now().0 / 1_000_000_000;
-    let fin = dir.join(format!("meta-{secs}-{index}.sqlite"));
-    std::fs::rename(&tmp, &fin).map_err(io)?;
+    let fin =
+        index.and_then(|index| publish_into(&local, &dir, &format!("meta-{secs}-{index}.sqlite")));
+    let _ = std::fs::remove_file(&local);
+    let fin = fin?;
     let mut snaps: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map_err(io)?
         .flatten()
@@ -576,5 +628,52 @@ impl MaxIo for NestError {
             }
             other => sql(other),
         }
+    }
+}
+
+#[cfg(test)]
+mod archive_copy_tests {
+    use super::*;
+
+    #[test]
+    fn a_published_file_appears_whole_and_stale_temporaries_go() {
+        let d = tempfile::tempdir().unwrap();
+        let (local, arch) = (d.path().join("local"), d.path().join("arch"));
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&arch).unwrap();
+        let src = local.join("built.sqlite");
+        let c = Connection::open(&src).unwrap();
+        c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);")
+            .unwrap();
+        drop(c);
+        // Left by an older version that built in place on an SMB share.
+        let stale = arch.join("tmp-00000000deadbeef.sqlite");
+        std::fs::write(&stale, b"").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // One being written right now by another run is left alone.
+        let fresh = arch.join("tmp-00000000cafef00d.sqlite");
+        std::fs::write(&fresh, b"").unwrap();
+        sweep_tmp(&arch);
+        assert!(!stale.exists() && fresh.exists());
+
+        let fin = publish_into(&src, &arch, "meta-1-2.sqlite").unwrap();
+        assert_eq!(fin, arch.join("meta-1-2.sqlite"));
+        let c =
+            Connection::open_with_flags(&fin, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let v: i64 = c.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 42);
+        let left: Vec<_> = std::fs::read_dir(&arch)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("tmp-") && n != "tmp-00000000cafef00d.sqlite")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }
