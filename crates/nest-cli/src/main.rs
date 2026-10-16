@@ -198,6 +198,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GroupCmd,
     },
+    /// Cluster-wide settings, read live by every host.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
     /// Retained backups and metadata snapshots.
     Backup {
         #[command(subcommand)]
@@ -514,6 +519,52 @@ enum GroupCmd {
     Rm {
         name: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCmd {
+    /// List every setting with its value and default.
+    Ls,
+    /// Print one setting's value.
+    Get { name: String },
+    /// Set a value for the whole cluster ("5s", "500ms", or a number in the
+    /// setting's unit). Every host must run this version or later.
+    Set { name: String, value: String },
+    /// Return a setting to its default.
+    Reset { name: String },
+}
+
+/// A setting value in milliseconds from "5s", "500ms", "2m" or a bare
+/// number (already milliseconds).
+fn parse_ms(s: &str) -> Result<u64> {
+    let s = s.trim().to_ascii_lowercase();
+    let split = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: f64 = num.parse().with_context(|| format!("bad duration {s:?}"))?;
+    let scale = match unit {
+        "" | "ms" => 1.0,
+        "s" | "sec" | "secs" => 1_000.0,
+        "m" | "min" | "mins" => 60_000.0,
+        other => bail!("unknown duration unit {other:?} (use ms, s or m)"),
+    };
+    Ok((n * scale).round() as u64)
+}
+
+fn print_setting(s: &Value) {
+    let unit = s["unit"].as_str().unwrap_or("");
+    println!(
+        "{:<20} {:>8} {unit:<3} {}  {}",
+        s["name"].as_str().unwrap_or(""),
+        s["value"],
+        if s["set"].as_bool() == Some(true) {
+            format!("(default {})", s["default"])
+        } else {
+            "(default)".into()
+        },
+        s["about"].as_str().unwrap_or(""),
+    );
 }
 
 /// Parse "500GiB", "1.5T", "200G", "1048576".
@@ -1429,6 +1480,48 @@ async fn main() -> Result<()> {
                 v
             }
         },
+        Cmd::Config { cmd } => {
+            let v = match cmd {
+                ConfigCmd::Ls | ConfigCmd::Get { .. } => c.get("/v1/settings").await?,
+                ConfigCmd::Set { name, value } => {
+                    let ms = parse_ms(value)?;
+                    c.call(
+                        Method::PUT,
+                        &format!("/v1/settings/{}", enc(name)),
+                        Some(json!({ "value": ms })),
+                    )
+                    .await?;
+                    c.get("/v1/settings").await?
+                }
+                ConfigCmd::Reset { name } => {
+                    c.call(Method::DELETE, &format!("/v1/settings/{}", enc(name)), None)
+                        .await?;
+                    c.get("/v1/settings").await?
+                }
+            };
+            let only = match cmd {
+                ConfigCmd::Ls => None,
+                ConfigCmd::Get { name } | ConfigCmd::Set { name, .. } | ConfigCmd::Reset { name } => {
+                    Some(name.as_str())
+                }
+            };
+            let all: Vec<&Value> = v["settings"].as_array().into_iter().flatten().collect();
+            let shown: Vec<&Value> = all
+                .into_iter()
+                .filter(|s| only.is_none_or(|n| s["name"] == n))
+                .collect();
+            if let Some(n) = only
+                && shown.is_empty()
+            {
+                bail!("no setting {n:?}");
+            }
+            if cli.json {
+                json!({ "settings": shown })
+            } else {
+                shown.iter().for_each(|s| print_setting(s));
+                return Ok(());
+            }
+        }
         Cmd::Backup { cmd } => match cmd {
             BackupCmd::Create {
                 selector,

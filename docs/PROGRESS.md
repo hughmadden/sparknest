@@ -3,6 +3,23 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-17 — 0.4.4: reads ride out elections, EIO logged, archive snapshots on SMB (ADR-056)
+
+- Investigated a silent EIO during a model load (2026-10-16): the fabric
+  switch's upgrade reboot dropped every link twice and metadata quorum was
+  lost for ~3 min. Reads now retry through a leader change or lost quorum
+  for `read-recovery-wait` (default 5 s; `nest config set
+  read-recovery-wait 10s`, a cluster setting every host reads live), and
+  every EIO the mount returns is logged, rate-limited.
+- Leader heartbeat-timeout storms during heavy runs: the switch tail-drops
+  1–5% of egress to 100G hosts under incast; Raft's lost segments waited
+  Linux's 200 ms retransmit floor against a 100 ms heartbeat budget. Peer
+  connections now set a 5 ms floor (`TCP_RTO_MIN_US`) and heartbeats go
+  every 150 ms (elections unchanged).
+- Metadata snapshots into the `models` archive (SMB) had never succeeded
+  (SQLite cannot lock there); snapshots and backup manifests are now built
+  on local disk and copied in, and stale temporaries are swept.
+
 ## 2026-10-15 — 0.4.3: Hugging Face imports and downloads into archive stores (ADR-055)
 
 - `nest hf import SRC --archive NAME` and `nest hf download REPO --archive

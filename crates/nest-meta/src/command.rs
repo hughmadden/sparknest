@@ -252,6 +252,13 @@ pub enum Command {
         file: FileId,
         always: bool,
     },
+    /// Set (`Some`) or reset to its default (`None`) a cluster-wide tuning
+    /// value every host reads live (ADR-056). Names and units are defined
+    /// by `nest_types::Setting`; the value is an integer in those units.
+    SetSetting {
+        name: String,
+        value: Option<u64>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

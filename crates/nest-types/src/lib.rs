@@ -268,3 +268,53 @@ mod tests {
         assert_eq!(Timestamp::from_system_time(n.as_system_time()), n);
     }
 }
+
+/// A cluster-wide tuning value, stored in the metadata and read live by
+/// every host (ADR-056). Values are integers in the setting's unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Setting {
+    /// How long a read keeps retrying through a leader change or a lost
+    /// metadata quorum before it fails with EIO (milliseconds).
+    ReadRecoveryWait,
+}
+
+impl Setting {
+    pub const ALL: &'static [Setting] = &[Setting::ReadRecoveryWait];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Setting::ReadRecoveryWait => "read-recovery-wait",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Setting> {
+        Self::ALL.iter().copied().find(|s| s.name() == name)
+    }
+
+    pub fn default_value(self) -> u64 {
+        match self {
+            Setting::ReadRecoveryWait => 5_000,
+        }
+    }
+
+    pub fn unit(self) -> &'static str {
+        match self {
+            Setting::ReadRecoveryWait => "ms",
+        }
+    }
+
+    pub fn about(self) -> &'static str {
+        match self {
+            Setting::ReadRecoveryWait => {
+                "how long reads retry through a leader change or lost quorum before EIO"
+            }
+        }
+    }
+
+    /// Accepted range, so a typo cannot stall every read for an hour.
+    pub fn range(self) -> (u64, u64) {
+        match self {
+            Setting::ReadRecoveryWait => (0, 120_000),
+        }
+    }
+}

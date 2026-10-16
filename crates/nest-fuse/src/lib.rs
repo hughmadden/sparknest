@@ -26,6 +26,7 @@ use nest_meta::{Effect, LockKind};
 use nest_types::{FileAttr, FileId, FileKind, NestError, Timestamp};
 use parking_lot::Mutex;
 
+mod eio;
 mod uring;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -83,8 +84,32 @@ impl std::ops::Deref for Fs {
 /// Extended attribute that exposes (and sets) the seal bit.
 const SEAL_XATTR: &[u8] = b"user.sparknest.sealed";
 
-fn errno(e: &NestError) -> Errno {
-    Errno::from_i32(e.errno())
+/// The mount's EIO log (ADR-056) and the VFS it names files with.
+static EIO: std::sync::OnceLock<(eio::EioLog, std::sync::Weak<Vfs>)> = std::sync::OnceLock::new();
+
+/// `errno` for a reply about `file`: an EIO is logged (rate-limited) with
+/// the operation, the file's path and the reason.
+fn errno_for(op: &str, file: u64, e: &NestError) -> Errno {
+    let n = e.errno();
+    if n == libc::EIO {
+        note_eio(op, file, e);
+    }
+    Errno::from_i32(n)
+}
+
+fn note_eio(op: &str, file: u64, e: &NestError) {
+    let Some((log, vfs)) = EIO.get() else { return };
+    let reason = e.to_string();
+    if let eio::Verdict::Log { summary } = log.note(file, &reason, std::time::Instant::now()) {
+        if let Some((n, files)) = summary {
+            tracing::warn!("{n} more EIO on {files} files in the last 10 s");
+        }
+        let path = vfs
+            .upgrade()
+            .and_then(|v| v.path_string(FileId(file)))
+            .unwrap_or_else(|| format!("file {file}"));
+        tracing::warn!(op, %path, reason = %reason, "EIO returned to a reader");
+    }
 }
 
 /// An inode with open handles. The kernel keeps one I/O mode per inode
@@ -313,32 +338,34 @@ impl Filesystem for Fs {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let eino: u64 = parent.0;
         match self.vfs.lookup_now(fid(parent), name.as_bytes()) {
             Ok(Some(a)) => return reply.entry(&self.ttl, &self.attr(&a), Generation(0)),
             Ok(None) => {}
-            Err(e) => return reply.error(errno(&e)),
+            Err(e) => return reply.error(errno_for("lookup", eino, &e)),
         }
         let inner = self.inner.clone();
         let name = name.as_bytes().to_vec();
         self.spawn(async move {
             match inner.vfs.lookup(fid(parent), &name).await {
                 Ok(a) => reply.entry(&inner.ttl, &inner.attr(&a), Generation(0)),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("lookup", eino, &e)),
             }
         });
     }
 
     fn getattr(&self, _req: &Request, i: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let eino: u64 = i.0;
         match self.vfs.getattr_now(fid(i)) {
             Ok(Some(a)) => return reply.attr(&self.ttl, &self.attr(&a)),
             Ok(None) => {}
-            Err(e) => return reply.error(errno(&e)),
+            Err(e) => return reply.error(errno_for("getattr", eino, &e)),
         }
         let inner = self.inner.clone();
         self.spawn(async move {
             match inner.vfs.getattr(fid(i)).await {
                 Ok(a) => reply.attr(&inner.ttl, &inner.attr(&a)),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("getattr", eino, &e)),
             }
         });
     }
@@ -361,6 +388,7 @@ impl Filesystem for Fs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let eino: u64 = i.0;
         // Ownership changes are accepted and ignored: every file is presented
         // as the mounting user (ADR-007).
         let inner = self.inner.clone();
@@ -378,15 +406,16 @@ impl Filesystem for Fs {
                 .await
             {
                 Ok(a) => reply.attr(&inner.ttl, &inner.attr(&a)),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("setattr", eino, &e)),
             }
         });
     }
 
     fn readlink(&self, _req: &Request, i: INodeNo, reply: ReplyData) {
+        let eino: u64 = i.0;
         match self.vfs.readlink(fid(i)) {
             Ok(t) => reply.data(&t),
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(errno_for("readlink", eino, &e)),
         }
     }
 
@@ -400,6 +429,7 @@ impl Filesystem for Fs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let eino: u64 = parent.0;
         if mode & libc::S_IFMT != libc::S_IFREG {
             reply.error(Errno::EPERM);
             return;
@@ -421,7 +451,7 @@ impl Filesystem for Fs {
                     vfs.release(fh, None).await;
                     reply.entry(&inner.ttl, &inner.attr(&a), Generation(0));
                 }
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("mknod", eino, &e)),
             }
         });
     }
@@ -435,35 +465,38 @@ impl Filesystem for Fs {
         umask: u32,
         reply: ReplyEntry,
     ) {
+        let eino: u64 = parent.0;
         let inner = self.inner.clone();
         let vfs = inner.vfs.clone();
         let name = name.as_bytes().to_vec();
         self.spawn(async move {
             match vfs.mkdir(fid(parent), &name, mode & !umask & 0o7777).await {
                 Ok(a) => reply.entry(&inner.ttl, &inner.attr(&a), Generation(0)),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("mkdir", eino, &e)),
             }
         });
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let eino: u64 = parent.0;
         let vfs = self.vfs.clone();
         let name = name.as_bytes().to_vec();
         self.spawn(async move {
             match vfs.unlink(fid(parent), &name).await {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("unlink", eino, &e)),
             }
         });
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let eino: u64 = parent.0;
         let vfs = self.vfs.clone();
         let name = name.as_bytes().to_vec();
         self.spawn(async move {
             match vfs.rmdir(fid(parent), &name).await {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("rmdir", eino, &e)),
             }
         });
     }
@@ -476,6 +509,7 @@ impl Filesystem for Fs {
         target: &Path,
         reply: ReplyEntry,
     ) {
+        let eino: u64 = parent.0;
         let inner = self.inner.clone();
         let vfs = inner.vfs.clone();
         let name = link_name.as_bytes().to_vec();
@@ -483,7 +517,7 @@ impl Filesystem for Fs {
         self.spawn(async move {
             match vfs.symlink(fid(parent), &name, &target).await {
                 Ok(a) => reply.entry(&inner.ttl, &inner.attr(&a), Generation(0)),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("symlink", eino, &e)),
             }
         });
     }
@@ -498,6 +532,7 @@ impl Filesystem for Fs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let eino: u64 = parent.0;
         if flags.contains(RenameFlags::RENAME_WHITEOUT) {
             reply.error(Errno::EINVAL);
             return;
@@ -514,7 +549,7 @@ impl Filesystem for Fs {
                 .await
             {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("rename", eino, &e)),
             }
         });
     }
@@ -527,25 +562,27 @@ impl Filesystem for Fs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let eino: u64 = i.0;
         let inner = self.inner.clone();
         let vfs = inner.vfs.clone();
         let name = newname.as_bytes().to_vec();
         self.spawn(async move {
             match vfs.link(fid(i), fid(newparent), &name).await {
                 Ok(a) => reply.entry(&inner.ttl, &inner.attr(&a), Generation(0)),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("link", eino, &e)),
             }
         });
     }
 
     fn open(&self, _req: &Request, i: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let eino: u64 = i.0;
         let fs = self.inner.clone();
         let acc = flags.0 & libc::O_ACCMODE;
         let writable = acc == libc::O_WRONLY || acc == libc::O_RDWR;
         self.spawn(async move {
             match fs.vfs.open(fid(i), flags.0).await {
                 Ok((fh, mode)) => fs.answer_open(i.0, fh, mode, writable, reply),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("open", eino, &e)),
             }
         });
     }
@@ -560,6 +597,7 @@ impl Filesystem for Fs {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let eino: u64 = parent.0;
         let fs = self.inner.clone();
         let name = name.as_bytes().to_vec();
         self.spawn(async move {
@@ -591,7 +629,7 @@ impl Filesystem for Fs {
                         fs.open_flags(&mode),
                     );
                 }
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("create", eino, &e)),
             }
         });
     }
@@ -607,6 +645,7 @@ impl Filesystem for Fs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let eino: u64 = _i.0;
         // Local copies and readahead hits complete right here: every hand-off
         // to another thread can cost a deep-idle wake on the Sparks.
         let fast = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -618,7 +657,7 @@ impl Filesystem for Fs {
         });
         match fast {
             Some(Ok(b)) => return reply.data(&b),
-            Some(Err(e)) => return reply.error(errno(&e)),
+            Some(Err(e)) => return reply.error(errno_for("read", eino, &e)),
             None => {}
         }
         // A scattered file with no copy here (page faults on a lookup
@@ -632,7 +671,7 @@ impl Filesystem for Fs {
                     rt.spawn(async move {
                         match vfs.read(fh.0, offset, size).await {
                             Ok(b) => reply.data(&b),
-                            Err(e) => reply.error(errno(&e)),
+                            Err(e) => reply.error(errno_for("read", eino, &e)),
                         }
                     });
                 }
@@ -643,7 +682,7 @@ impl Filesystem for Fs {
         self.spawn(async move {
             match vfs.read(fh.0, offset, size).await {
                 Ok(b) => reply.data(&b),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("read", eino, &e)),
             }
         });
     }
@@ -660,6 +699,7 @@ impl Filesystem for Fs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let eino: u64 = _i.0;
         // The owner writing its own open epoch completes right here.
         let fast = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.vfs.try_write_now(fh.0, offset, data)
@@ -670,7 +710,7 @@ impl Filesystem for Fs {
         });
         match fast {
             Some(Ok(n)) => return reply.written(n),
-            Some(Err(e)) => return reply.error(errno(&e)),
+            Some(Err(e)) => return reply.error(errno_for("write", eino, &e)),
             None => {}
         }
         let vfs = self.vfs.clone();
@@ -678,7 +718,7 @@ impl Filesystem for Fs {
         self.spawn(async move {
             match vfs.write(fh.0, offset, data).await {
                 Ok(n) => reply.written(n),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("write", eino, &e)),
             }
         });
     }
@@ -691,12 +731,13 @@ impl Filesystem for Fs {
         lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        let eino: u64 = _i.0;
         tracing::debug!(fh = fh.0, owner = lock_owner.0, "flush");
         let vfs = self.vfs.clone();
         self.spawn(async move {
             match vfs.flush(fh.0, lock_owner.0).await {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("flush", eino, &e)),
             }
         });
     }
@@ -734,20 +775,22 @@ impl Filesystem for Fs {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let eino: u64 = _i.0;
         let vfs = self.vfs.clone();
         self.spawn(async move {
             match vfs.fsync(fh.0, datasync).await {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("fsync", eino, &e)),
             }
         });
     }
 
     fn opendir(&self, _req: &Request, i: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let eino: u64 = i.0;
         // readdir past the end: validates that `i` is a directory, cheaply.
         match self.vfs.readdir(fid(i), u64::MAX, 0) {
             Ok(_) => reply.opened(FileHandle(0), FopenFlags::empty()),
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(errno_for("opendir", eino, &e)),
         }
     }
 
@@ -759,6 +802,7 @@ impl Filesystem for Fs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let eino: u64 = i.0;
         match self.vfs.readdir(fid(i), offset, 512) {
             Ok(entries) => {
                 for (off, e) in entries {
@@ -768,7 +812,7 @@ impl Filesystem for Fs {
                 }
                 reply.ok();
             }
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(errno_for("readdir", eino, &e)),
         }
     }
 
@@ -782,6 +826,7 @@ impl Filesystem for Fs {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        let eino: u64 = i.0;
         match self.vfs.readdir_plus(fid(i), offset, 512) {
             Ok(entries) => {
                 for e in entries {
@@ -794,7 +839,7 @@ impl Filesystem for Fs {
                 }
                 reply.ok();
             }
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(errno_for("readdirplus", eino, &e)),
         }
     }
 
@@ -806,18 +851,20 @@ impl Filesystem for Fs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let eino: u64 = _i.0;
         // Namespace changes commit without an fsync (ADR-026): make them
         // durable on a majority, as a directory fsync promises.
         let vfs = self.vfs.clone();
         self.spawn(async move {
             match vfs.sync_metadata().await {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("fsyncdir", eino, &e)),
             }
         });
     }
 
     fn statfs(&self, _req: &Request, _i: INodeNo, reply: ReplyStatfs) {
+        let eino: u64 = 1;
         match self.vfs.statfs() {
             Ok((cap, files)) => {
                 let bs = 4096u64;
@@ -832,11 +879,12 @@ impl Filesystem for Fs {
                     bs as u32,
                 )
             }
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(errno_for("statfs", eino, &e)),
         }
     }
 
     fn getxattr(&self, _req: &Request, i: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let eino: u64 = i.0;
         if name.as_bytes() != SEAL_XATTR {
             return reply.error(Errno::from_i32(libc::ENODATA));
         }
@@ -854,7 +902,7 @@ impl Filesystem for Fs {
                     }
                 }
                 Ok(_) => reply.error(Errno::from_i32(libc::ENODATA)),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("getxattr", eino, &e)),
             }
         });
     }
@@ -883,6 +931,7 @@ impl Filesystem for Fs {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        let eino: u64 = i.0;
         if name.as_bytes() != SEAL_XATTR {
             return reply.error(Errno::from_i32(libc::ENOTSUP));
         }
@@ -895,7 +944,7 @@ impl Filesystem for Fs {
         self.spawn(async move {
             match vfs.seal(fid(i), sealed).await {
                 Ok(_) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("setxattr", eino, &e)),
             }
         });
     }
@@ -935,6 +984,7 @@ impl Filesystem for Fs {
         _pid: u32,
         reply: ReplyLock,
     ) {
+        let eino: u64 = _i.0;
         match self
             .vfs
             .getlk(fh.0, lock_owner.0, start, end, typ == libc::F_WRLCK)
@@ -943,7 +993,7 @@ impl Filesystem for Fs {
                 reply.locked(s, e, if w { libc::F_WRLCK } else { libc::F_RDLCK }, pid)
             }
             Ok(None) => reply.locked(start, end, libc::F_UNLCK, 0),
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(errno_for("getlk", eino, &e)),
         }
     }
 
@@ -960,6 +1010,7 @@ impl Filesystem for Fs {
         sleep: bool,
         reply: ReplyEmpty,
     ) {
+        let eino: u64 = _i.0;
         tracing::debug!(
             fh = fh.0,
             owner = lock_owner.0,
@@ -981,7 +1032,7 @@ impl Filesystem for Fs {
                 .await
             {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => reply.error(errno_for("setlk", eino, &e)),
             }
         });
     }
@@ -1103,6 +1154,18 @@ pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
             .arg(&cfg.mountpoint)
             .status();
     }
+    let _ = EIO.set((eio::EioLog::new(), Arc::downgrade(&vfs)));
+    // Report suppressed EIO even when a storm ends without another one.
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if let Some((log, _)) = EIO.get()
+                && let Some((n, files)) = log.flush(std::time::Instant::now())
+            {
+                tracing::warn!("{n} more EIO on {files} files in the last 10 s");
+            }
+        }
+    });
     let inner = Arc::new(Inner {
         vfs: vfs.clone(),
         ttl: cfg.ttl,
@@ -1152,8 +1215,12 @@ pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
             {
                 let vfs = vfs.clone();
                 Arc::new(move |fh, offset, buf: &mut [u8]| {
-                    vfs.try_read_into(fh, offset, buf)
-                        .map(|r| r.map_err(|e| e.errno()))
+                    vfs.try_read_into(fh, offset, buf).map(|r| {
+                        r.map_err(|e| {
+                            let file = vfs.handle_file(fh).map_or(0, |f| f.0);
+                            i32::from(errno_for("read", file, &e))
+                        })
+                    })
                 })
             },
         ) {

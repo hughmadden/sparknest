@@ -1453,3 +1453,57 @@ archive's disk (`/mnt/scratch/hf`) was copied off it only to be copied back.
 the host needs the room); letting hf write into the archive through a
 second FUSE mount (no such mount exists); a new `Import` variant naming a
 store (needs every host upgraded first, for no gain over the batch).
+
+## ADR-056 — Reads ride out elections; cluster settings; control-plane retransmits; archive SQLite built locally (2026-10-17)
+
+**Context.** On 2026-10-16 a model load failed with EIO through the mount on
+two hosts and sparknestd logged nothing. A switch upgrade had dropped every
+fabric link twice, metadata quorum was gone for about three minutes, and a
+read that found no servable copy got one lease-long barrier before failing.
+Separately the leader logged thousands of heartbeat timeouts an hour during
+heavy multi-host runs: the fabric switch tail-drops 1–5% of egress toward the
+100G hosts under incast, Raft rides plain TCP on the same port, Linux waits
+at least 200 ms to retransmit, and openraft gives a heartbeat only its
+interval (100 ms) as budget. And the leader's 6-hourly metadata snapshot into
+the `models` archive (an SMB share) had never succeeded: SQLite cannot lock a
+file there ("database is locked"), leaving an empty `tmp-*.sqlite` per try.
+
+**Decision.**
+1. **Every EIO is logged**, rate-limited: the first of each (file, reason) in
+   a 10 s window at WARN with the operation, path and reason; the rest are
+   counted and reported as "N more EIO on M files in the last 10 s".
+2. **Reads wait out a leader change or a lost quorum.** A read that ends in
+   `Unavailable` (no servable copy: lease lapsed, holders unreachable)
+   retries with backoff (50 ms doubling to 500 ms) until the cluster's read
+   recovery wait is spent, then fails as before. The lease itself is not
+   stretched: it still bounds how long a cut-off host serves its copies.
+3. **Cluster settings.** `Command::SetSetting { name, value }` (appended,
+   ADR-018) stores an integer under `setting:<name>` in the metadata `kv`
+   table; `None` returns it to the default. Every host reads them from its
+   replica, cached for 1 s, so a change applies everywhere within a second
+   of being applied. `nest_types::Setting` names each one with its unit,
+   default and range. The first is `read-recovery-wait` (ms, default 5000,
+   0–120000). `nest config ls|get|set|reset`; `GET /v1/settings`,
+   `PUT /v1/settings/{name}` `{"value": n}`, `DELETE /v1/settings/{name}`.
+   Setting one is refused until every host runs this version or later
+   (as for ADR-053). Raft timing stays in node config: changing election
+   timing on a live cluster invites the elections it should prevent.
+4. **Control-plane retransmits.** Peer connections (dialled and accepted)
+   set `TCP_RTO_MIN_US` to 5 ms, so a lost segment is resent within a few
+   milliseconds; kernels without it keep the default. The heartbeat
+   interval goes from 100 to 150 ms with elections still at 500–1000 ms
+   (more than three heartbeats): openraft wraps each heartbeat in a timeout
+   of exactly the interval, so a floor inside our network layer could not
+   extend it, and raising the election timeouts would slow failover.
+5. **Archive SQLite files are built locally.** Metadata snapshots and backup
+   manifests are written under `<state_dir>/tmp-sqlite/`, then copied into
+   the archive under a temporary name, synced and renamed into place. Each
+   run removes `tmp-*.sqlite` older than an hour from the archive directory.
+
+**Alternatives.** A dedicated Raft connection (TCP head-of-line blocking
+behind data frames costs milliseconds once retransmits do); hedging Raft
+over the 10G LAN (more machinery; revisit if timeouts persist); lossless
+RoCE with PFC (the user declined: ECN removed most drops, and priority
+classes would complicate sharing the fabric with the LLM engine); stretching
+the lease during elections (weakens the guarantee that a cut-off host stops
+serving); SQLite on SMB with `nobrl` (unsafe if two writers ever meet).

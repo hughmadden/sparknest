@@ -28,7 +28,7 @@ use nest_meta::{Command, Effect, LockKind, RenameFlags, Reply, query};
 use nest_store::ObjectKey;
 use nest_types::{
     DirEntry, Epoch, FileAttr, FileId, FileKind, GenState, Generation, NestError, NestResult,
-    NodeId, Timestamp,
+    NodeId, Setting, Timestamp,
 };
 use parking_lot::Mutex;
 use rusqlite::Connection;
@@ -206,7 +206,13 @@ pub struct Vfs {
     fabric: Mutex<Option<Arc<nest_fabric::Fabric>>>,
     /// TCP lanes to and from off-grid hosts (ADR-048).
     lanes: Mutex<Option<Arc<nest_fabric::tcp::Lanes>>>,
+    /// Cluster-wide settings as last read from the metadata (ADR-056).
+    settings: Mutex<(std::time::Instant, HashMap<String, u64>)>,
 }
+
+/// How long a read of the settings stays fresh: a change applies on every
+/// host within this.
+const SETTINGS_TTL: Duration = Duration::from_secs(1);
 
 fn io(e: std::io::Error) -> NestError {
     NestError::from_io(&e)
@@ -323,6 +329,7 @@ impl Vfs {
             fence_hooks: Mutex::new(Vec::new()),
             fabric: Mutex::new(None),
             lanes: Mutex::new(None),
+            settings: Mutex::new((std::time::Instant::now() - SETTINGS_TTL, HashMap::new())),
         });
         d.meta().rpc().register(
             nest_rpc::service::DATA,
@@ -1952,7 +1959,61 @@ impl Vfs {
 
     // ------------------------------------------------------------ data
 
+    /// Read through a handle. A read that finds no copy it may serve (the
+    /// lease lapsed, holders unreachable, the leader changing) retries
+    /// until the cluster's read recovery wait is spent (ADR-056): a model
+    /// load would rather stall through an election than fail.
     pub async fn read(&self, fh: u64, offset: u64, size: u32) -> NestResult<Vec<u8>> {
+        let mut deadline = None;
+        let mut pause = Duration::from_millis(50);
+        loop {
+            match self.read_once(fh, offset, size).await {
+                Err(e @ NestError::Unavailable(_)) => {
+                    let d = *deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(self.setting(Setting::ReadRecoveryWait))
+                    });
+                    let now = tokio::time::Instant::now();
+                    if now >= d {
+                        return Err(e);
+                    }
+                    tracing::debug!(fh, error = %e, "read found no servable copy; retrying");
+                    tokio::time::sleep(pause.min(d - now)).await;
+                    pause = (pause * 2).min(Duration::from_millis(500));
+                }
+                r => return r,
+            }
+        }
+    }
+
+    /// The file an open handle reads, if it is still open.
+    pub fn handle_file(&self, fh: u64) -> Option<FileId> {
+        self.handle(fh).ok().map(|h| h.file)
+    }
+
+    /// A file's path from the mount root (any one of its names), for logs.
+    pub fn path_string(&self, file: FileId) -> Option<String> {
+        self.q(|c| query::path_of(c, file))
+            .ok()
+            .flatten()
+            .map(|p| String::from_utf8_lossy(&p).into_owned())
+    }
+
+    /// The current value of a cluster-wide setting (its default unless set).
+    pub fn setting(&self, s: Setting) -> u64 {
+        let mut g = self.settings.lock();
+        if g.0.elapsed() >= SETTINGS_TTL {
+            if let Ok(rows) = self.q(query::settings) {
+                g.1 = rows.into_iter().collect();
+            }
+            g.0 = std::time::Instant::now();
+        }
+        g.1.get(s.name())
+            .copied()
+            .unwrap_or_else(|| s.default_value())
+    }
+
+    async fn read_once(&self, fh: u64, offset: u64, size: u32) -> NestResult<Vec<u8>> {
         let h = self.handle(fh)?;
         let mut last = NestError::Unavailable("no copy reachable".into());
         for attempt in 0..6 {

@@ -302,6 +302,18 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
             }
             Ok(Reply::Done)
         }
+        Command::SetSetting { name, value } => {
+            let k = format!("setting:{name}");
+            match value {
+                Some(v) => c
+                    .prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?1, ?2)")?
+                    .execute(params![k, *v as i64])?,
+                None => c
+                    .prepare_cached("DELETE FROM kv WHERE k = ?1")?
+                    .execute(params![k])?,
+            };
+            Ok(Reply::Done)
+        }
         Command::DeleteGroup { name } => {
             let n = c
                 .prepare_cached("DELETE FROM groups WHERE name = ?1")?

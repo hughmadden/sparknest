@@ -517,3 +517,14 @@ pub fn groups(c: &Connection) -> rusqlite::Result<Vec<(String, Vec<String>)>> {
     })?;
     rows.collect()
 }
+
+/// Cluster-wide settings that differ from their defaults (ADR-056).
+pub fn settings(c: &Connection) -> rusqlite::Result<Vec<(String, u64)>> {
+    let mut st = c.prepare_cached("SELECT k, v FROM kv WHERE k LIKE 'setting:%' ORDER BY k")?;
+    let rows = st.query_map([], |r| {
+        let k: String = r.get(0)?;
+        let v: i64 = r.get(1)?;
+        Ok((k["setting:".len()..].to_string(), v as u64))
+    })?;
+    rows.collect()
+}

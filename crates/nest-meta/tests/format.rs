@@ -264,6 +264,13 @@ fn format_is_pinned() {
             },
             "SetPassthrough",
         ),
+        (
+            Command::SetSetting {
+                name: String::new(),
+                value: None,
+            },
+            "SetSetting",
+        ),
     ];
     for (i, (c, name)) in cmds.iter().enumerate() {
         assert_eq!(tag(c) as usize, i, "Command::{name} moved");

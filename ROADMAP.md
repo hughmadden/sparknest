@@ -94,3 +94,10 @@ raw CSV).
 - Migration playbook (user-driven): adopt raptor `hub/`, adopt Spark caches,
   symlink `~/.cache/huggingface`, drain `/mnt/scratch`, reformat, register as
   archive.
+
+## Future work
+
+- DR restore test with the cluster down, from the NAS metadata snapshots
+  (deferred: needs coordinating a full outage).
+- Faster single-stream reads to off-grid hosts from two copies per chunk
+  (deferred: off-grid hosts hold archival copies on slow disks).

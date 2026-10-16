@@ -178,6 +178,11 @@ pub fn router(api: Api) -> Router {
         .route("/v1/plans/{id}/apply", post(apply_plan))
         .route("/v1/groups", get(groups))
         .route("/v1/groups/{name}", put(set_group).delete(delete_group))
+        .route("/v1/settings", get(settings))
+        .route(
+            "/v1/settings/{name}",
+            put(set_setting).delete(reset_setting),
+        )
         .route("/v1/backups", get(backups).post(backup_create))
         .route("/v1/backups/{id}/restore", post(backup_restore))
         .route("/v1/backups/{id}", axum::routing::delete(backup_delete))
@@ -1712,6 +1717,90 @@ async fn set_group(
 async fn delete_group(State(api): State<Api>, Path(name): Path<String>) -> R<serde_json::Value> {
     api.placer.delete_group(&name).await?;
     Ok(Json(json!({ "deleted": name })))
+}
+
+/// Cluster-wide settings (ADR-056): every known one with its value,
+/// default, unit and whether it was set.
+async fn settings(State(api): State<Api>) -> R<serde_json::Value> {
+    let set: std::collections::HashMap<String, u64> = api
+        .vfs
+        .data()
+        .with_reader(nest_meta::query::settings)
+        .map_err(|e| NestError::Io(format!("metadata: {e}")))?
+        .into_iter()
+        .collect();
+    let all: Vec<_> = nest_types::Setting::ALL
+        .iter()
+        .map(|s| {
+            let (min, max) = s.range();
+            json!({
+                "name": s.name(),
+                "value": set.get(s.name()).copied().unwrap_or(s.default_value()),
+                "default": s.default_value(),
+                "set": set.contains_key(s.name()),
+                "unit": s.unit(),
+                "min": min,
+                "max": max,
+                "about": s.about(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "settings": all })))
+}
+
+#[derive(Deserialize)]
+struct SettingReq {
+    value: u64,
+}
+
+fn known_setting(name: &str) -> Result<nest_types::Setting, ApiError> {
+    nest_types::Setting::parse(name).ok_or_else(|| {
+        let names: Vec<_> = nest_types::Setting::ALL.iter().map(|s| s.name()).collect();
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no setting {name:?}; known: {}", names.join(", ")),
+        )
+    })
+}
+
+async fn put_setting(
+    api: &Api,
+    s: nest_types::Setting,
+    value: Option<u64>,
+) -> Result<(), ApiError> {
+    require_every_host_upgraded(api, "changing a cluster setting").await?;
+    api.vfs
+        .data()
+        .meta()
+        .propose(nest_meta::Command::SetSetting {
+            name: s.name().into(),
+            value,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn set_setting(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    Json(r): Json<SettingReq>,
+) -> R<serde_json::Value> {
+    let s = known_setting(&name)?;
+    let (min, max) = s.range();
+    if !(min..=max).contains(&r.value) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("{name} must be {min}..={max} {}", s.unit()),
+        ));
+    }
+    put_setting(&api, s, Some(r.value)).await?;
+    Ok(Json(json!({ "name": name, "value": r.value })))
+}
+
+async fn reset_setting(State(api): State<Api>, Path(name): Path<String>) -> R<serde_json::Value> {
+    let s = known_setting(&name)?;
+    put_setting(&api, s, None).await?;
+    Ok(Json(json!({ "name": name, "value": s.default_value() })))
 }
 
 #[cfg(test)]
