@@ -5,6 +5,7 @@
 //! before `install_full_snapshot`.
 
 use crate::state_machine::SnapshotFile;
+use crate::stats::{Kind, Outcome, RaftStats};
 use crate::{Raft, TypeConfig, Vote};
 use bytes::Bytes;
 use futures::FutureExt;
@@ -17,7 +18,8 @@ use openraft::error::{
 };
 use openraft::network::{RPCOption, RaftNetworkFactory, v2::RaftNetworkV2};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderRequest,
+    TransferLeaderResponse, VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, OptionalSend};
 use parking_lot::Mutex;
@@ -26,17 +28,25 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Snapshot bytes per RPC.
 const SNAPSHOT_CHUNK: usize = 4 << 20;
 
+/// Wire format: variants are only ever appended (a host on an older
+/// release answers a variant it does not know with a decode error).
 #[derive(Serialize, Deserialize)]
 enum RaftReq {
     Append(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<TypeConfig>),
     PreVote(VoteRequest<TypeConfig>),
     SnapshotChunk(Chunk),
+    /// The leader is handing leadership to `to_node_id` (ADR-057).
+    TransferLeader(TransferLeaderRequest<TypeConfig>),
+    /// What this host's Raft service understands; a host on 0.4.4 cannot
+    /// decode it, which is the answer too.
+    Features,
 }
 
 /// One piece of a snapshot file in transit.
@@ -65,6 +75,21 @@ enum RaftResp {
     Vote(Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>>),
     /// `None` until the last chunk has been installed.
     SnapshotChunk(Result<Option<SnapshotResponse<TypeConfig>>, String>),
+    /// `Err` when this host's Raft has stopped.
+    TransferLeader(Result<TransferLeaderResponse<TypeConfig>, String>),
+    Features(Features),
+}
+
+/// The Raft requests a host's service understands beyond 0.4.4's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Features {
+    pub transfer_leader: bool,
+}
+
+impl Features {
+    pub const HERE: Features = Features {
+        transfer_leader: true,
+    };
 }
 
 /// Serves incoming Raft RPCs into the local Raft instance.
@@ -73,6 +98,7 @@ pub struct RaftService {
     incarnation: Option<String>,
     snap_dir: PathBuf,
     incoming: Mutex<HashMap<(NodeId, u64), PathBuf>>,
+    legacy: Arc<AtomicBool>,
 }
 
 impl RaftService {
@@ -141,6 +167,12 @@ impl Handler for RaftHandler {
         let me = self.0.clone();
         async move {
             let env: Envelope = nest_rpc::decode(&body).map_err(|e| e.to_string())?;
+            if me.legacy.load(Ordering::Relaxed)
+                && matches!(env.req, RaftReq::TransferLeader(_) | RaftReq::Features)
+            {
+                // What a 0.4.4 host answers to a variant it does not know.
+                return Err("Found an enum discriminant that was not expected".into());
+            }
             if env.incarnation != me.incarnation {
                 return Err(format!(
                     "different cluster incarnation ({:?}, here {:?})",
@@ -154,6 +186,13 @@ impl Handler for RaftHandler {
                 RaftReq::SnapshotChunk(c) => {
                     RaftResp::SnapshotChunk(me.snapshot_chunk(peer, c).await)
                 }
+                RaftReq::TransferLeader(r) => RaftResp::TransferLeader(
+                    me.raft
+                        .handle_transfer_leader(r)
+                        .await
+                        .map_err(|e| e.to_string()),
+                ),
+                RaftReq::Features => RaftResp::Features(Features::HERE),
             };
             nest_rpc::encode(&resp)
                 .map(Bytes::from)
@@ -163,7 +202,15 @@ impl Handler for RaftHandler {
     }
 }
 
-pub fn register(rpc: &Rpc, raft: Raft, snap_dir: PathBuf, incarnation: Option<String>) {
+/// Serve the RAFT service. `legacy` set makes it answer the requests 0.4.4
+/// does not know as 0.4.4 does (tests of mixed-version clusters).
+pub fn register(
+    rpc: &Rpc,
+    raft: Raft,
+    snap_dir: PathBuf,
+    incarnation: Option<String>,
+    legacy: Arc<AtomicBool>,
+) {
     rpc.register(
         service::RAFT,
         Arc::new(RaftHandler(Arc::new(RaftService {
@@ -171,6 +218,7 @@ pub fn register(rpc: &Rpc, raft: Raft, snap_dir: PathBuf, incarnation: Option<St
             incarnation,
             snap_dir,
             incoming: Mutex::new(HashMap::new()),
+            legacy,
         }))),
     );
 }
@@ -178,6 +226,7 @@ pub fn register(rpc: &Rpc, raft: Raft, snap_dir: PathBuf, incarnation: Option<St
 pub struct NetworkFactory {
     pub rpc: Rpc,
     pub incarnation: Option<String>,
+    pub stats: Arc<RaftStats>,
 }
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
@@ -191,6 +240,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
             rpc: self.rpc.clone(),
             target,
             incarnation: self.incarnation.clone(),
+            stats: self.stats.clone(),
         }
     }
 }
@@ -199,32 +249,86 @@ pub struct Network {
     rpc: Rpc,
     target: u64,
     incarnation: Option<String>,
+    stats: Arc<RaftStats>,
 }
 
 fn net_err(e: &(impl std::error::Error + 'static)) -> RPCError<TypeConfig> {
     RPCError::Network(NetworkError::new(e))
 }
 
+/// One Raft request to `target`, timed into `stats`.
+async fn call(
+    rpc: &Rpc,
+    stats: &RaftStats,
+    incarnation: Option<String>,
+    target: u64,
+    kind: Kind,
+    req: RaftReq,
+    timeout: Duration,
+) -> Result<RaftResp, RPCError<TypeConfig>> {
+    let env = Envelope { incarnation, req };
+    let body = nest_rpc::encode(&env).map_err(|e| net_err(&e))?;
+    // Dropped by openraft before the answer: recorded as a timeout.
+    let timing = stats.time(target, kind);
+    let r = rpc
+        .call(NodeId(target), service::RAFT, body.into(), timeout)
+        .await;
+    let (outcome, r) = match r {
+        Ok(b) => match nest_rpc::decode::<RaftResp>(&b) {
+            Ok(resp) => (Outcome::Ok, Ok(resp)),
+            Err(e) => (Outcome::Error, Err(net_err(&e))),
+        },
+        Err(e @ RpcError::Unreachable(..)) => (
+            Outcome::Unreachable,
+            Err(RPCError::Unreachable(Unreachable::new(&e))),
+        ),
+        Err(e @ RpcError::Timeout(_)) => (Outcome::Timeout, Err(net_err(&e))),
+        Err(e) => (Outcome::Error, Err(net_err(&e))),
+    };
+    timing.finish(outcome);
+    r
+}
+
+/// Ask `target` which Raft requests it understands. `None`: no answer, or
+/// a host on 0.4.4 (it cannot decode the question).
+pub(crate) async fn features(
+    rpc: &Rpc,
+    incarnation: Option<String>,
+    target: NodeId,
+    timeout: Duration,
+) -> Option<Features> {
+    let env = Envelope {
+        incarnation,
+        req: RaftReq::Features,
+    };
+    let body = nest_rpc::encode(&env).ok()?;
+    let b = rpc
+        .call(target, service::RAFT, body.into(), timeout)
+        .await
+        .ok()?;
+    match nest_rpc::decode::<RaftResp>(&b).ok()? {
+        RaftResp::Features(f) => Some(f),
+        _ => None,
+    }
+}
+
 impl Network {
     async fn send(
         &self,
+        kind: Kind,
         req: RaftReq,
         timeout: Duration,
     ) -> Result<RaftResp, RPCError<TypeConfig>> {
-        let env = Envelope {
-            incarnation: self.incarnation.clone(),
+        call(
+            &self.rpc,
+            &self.stats,
+            self.incarnation.clone(),
+            self.target,
+            kind,
             req,
-        };
-        let body = nest_rpc::encode(&env).map_err(|e| net_err(&e))?;
-        match self
-            .rpc
-            .call(NodeId(self.target), service::RAFT, body.into(), timeout)
-            .await
-        {
-            Ok(b) => nest_rpc::decode(&b).map_err(|e| net_err(&e)),
-            Err(e @ RpcError::Unreachable(..)) => Err(RPCError::Unreachable(Unreachable::new(&e))),
-            Err(e) => Err(net_err(&e)),
-        }
+            timeout,
+        )
+        .await
     }
 
     async fn vote_like(
@@ -232,7 +336,7 @@ impl Network {
         req: RaftReq,
         option: &RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
-        match self.send(req, ttl(option)).await? {
+        match self.send(Kind::Vote, req, ttl(option)).await? {
             RaftResp::Vote(r) => r.map_err(|e| net_err(&e)),
             _ => Err(unexpected()),
         }
@@ -255,8 +359,30 @@ impl RaftNetworkV2<TypeConfig> for Network {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
-        match self.send(RaftReq::Append(rpc), ttl(&option)).await? {
+        let kind = if rpc.entries.is_empty() {
+            Kind::Heartbeat
+        } else {
+            Kind::Append
+        };
+        match self.send(kind, RaftReq::Append(rpc), ttl(&option)).await? {
             RaftResp::Append(r) => r.map_err(|e| net_err(&e)),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn transfer_leader(
+        &mut self,
+        req: TransferLeaderRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<TransferLeaderResponse<TypeConfig>, RPCError<TypeConfig>> {
+        // A host on 0.4.4 answers with a decode error: it keeps its lease
+        // until the new leader's vote (marked as a transfer) arrives.
+        match self
+            .send(Kind::Transfer, RaftReq::TransferLeader(req), ttl(&option))
+            .await?
+        {
+            RaftResp::TransferLeader(Ok(r)) => Ok(r),
+            RaftResp::TransferLeader(Err(e)) => Err(net_err(&std::io::Error::other(e))),
             _ => Err(unexpected()),
         }
     }
@@ -317,7 +443,11 @@ impl RaftNetworkV2<TypeConfig> for Network {
                     done,
                 });
                 let resp = self
-                    .send(req, ttl(&option).max(Duration::from_secs(30)))
+                    .send(
+                        Kind::Snapshot,
+                        req,
+                        ttl(&option).max(Duration::from_secs(30)),
+                    )
                     .await
                     .map_err(|e| match e {
                         RPCError::Unreachable(u) => StreamingError::Unreachable(u),
@@ -345,5 +475,72 @@ impl RaftNetworkV2<TypeConfig> for Network {
             r = send_all => r,
             closed = cancel => Err(StreamingError::Closed(closed)),
         }
+    }
+}
+
+#[cfg(test)]
+mod wire {
+    use super::*;
+
+    /// `RaftReq` and `Envelope` as 0.4.4 has them.
+    #[derive(Serialize, Deserialize)]
+    #[allow(dead_code)]
+    enum RaftReq044 {
+        Append(AppendEntriesRequest<TypeConfig>),
+        Vote(VoteRequest<TypeConfig>),
+        PreVote(VoteRequest<TypeConfig>),
+        SnapshotChunk(Chunk),
+    }
+    #[derive(Serialize, Deserialize)]
+    struct Envelope044 {
+        incarnation: Option<String>,
+        req: RaftReq044,
+    }
+
+    fn enc(req: RaftReq) -> Vec<u8> {
+        nest_rpc::encode(&Envelope {
+            incarnation: Some("r1".into()),
+            req,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn variants_are_appended() {
+        // What 0.4.4 sends still decodes here, in place.
+        let v = VoteRequest::<TypeConfig>::new(Vote::new(3, 2), None);
+        let old = nest_rpc::encode(&Envelope044 {
+            incarnation: None,
+            req: RaftReq044::PreVote(v.clone()),
+        })
+        .unwrap();
+        let env: Envelope = nest_rpc::decode(&old).unwrap();
+        assert!(matches!(env.req, RaftReq::PreVote(r) if r == v));
+        let old = nest_rpc::encode(&Envelope044 {
+            incarnation: Some("r1".into()),
+            req: RaftReq044::Vote(v.clone()),
+        })
+        .unwrap();
+        assert_eq!(enc(RaftReq::Vote(v)), old);
+    }
+
+    /// A host on 0.4.4 fails to decode the new requests: its handler
+    /// answers with that error, which the sender treats as "cannot".
+    #[test]
+    fn a_0_4_4_host_cannot_decode_the_new_requests() {
+        let tl = TransferLeaderRequest::<TypeConfig>::new(Vote::new_committed(4, 1), 2, None);
+        for b in [
+            enc(RaftReq::TransferLeader(tl.clone())),
+            enc(RaftReq::Features),
+        ] {
+            assert!(nest_rpc::decode::<Envelope044>(&b).is_err());
+        }
+        let env: Envelope = nest_rpc::decode(&enc(RaftReq::TransferLeader(tl.clone()))).unwrap();
+        assert!(matches!(env.req, RaftReq::TransferLeader(r) if r == tl));
+        let resp = nest_rpc::encode(&RaftResp::Features(Features::HERE)).unwrap();
+        assert!(matches!(
+            nest_rpc::decode::<RaftResp>(&resp).unwrap(),
+            RaftResp::Features(f) if f.transfer_leader
+        ));
     }
 }

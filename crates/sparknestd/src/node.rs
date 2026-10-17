@@ -30,6 +30,9 @@ pub struct Tuning {
     /// How long a re-found coordinator waits for more members once a
     /// majority is present (ADR-026).
     pub recovery_grace: Duration,
+    /// Leadership handoffs: on shutdown and to the preferred leader
+    /// (ADR-057).
+    pub handoff: nest_raft::HandoffConfig,
 }
 
 impl Default for Tuning {
@@ -51,6 +54,7 @@ impl Default for Tuning {
             fabric: Some(nest_fabric::FabricConfig::default()),
             boot_id: None,
             recovery_grace: Duration::from_secs(10),
+            handoff: nest_raft::HandoffConfig::default(),
         }
     }
 }
@@ -162,6 +166,7 @@ impl Node {
         mc.election_max_ms = tuning.election_max_ms;
         mc.snapshot_every = tuning.snapshot_every;
         mc.propose_deadline = tuning.propose_deadline;
+        mc.handoff = tuning.handoff.clone();
         if let crate::recovery::Outcome::Join(inc) = &outcome {
             mc.join_incarnation = inc.clone();
         }

@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+mod leadership;
+pub use leadership::{HandoffConfig, PeerHealth};
+
 #[derive(Clone, Debug)]
 pub struct MetaNodeConfig {
     pub node: NodeId,
@@ -44,6 +47,8 @@ pub struct MetaNodeConfig {
     /// Joining a running cluster with empty state: its incarnation, until
     /// the snapshot it sends brings it along (ADR-026).
     pub join_incarnation: Option<String>,
+    /// Leadership handoffs: on shutdown and to the preferred leader.
+    pub handoff: HandoffConfig,
 }
 
 impl MetaNodeConfig {
@@ -59,6 +64,7 @@ impl MetaNodeConfig {
             propose_deadline: Duration::from_secs(15),
             apply_wait: Duration::from_secs(120),
             join_incarnation: None,
+            handoff: HandoffConfig::default(),
         }
     }
 }
@@ -97,6 +103,7 @@ pub struct MetaNode {
     /// The re-found this node's metadata descends from (ADR-026).
     incarnation: Option<String>,
     seq: AtomicU64,
+    lead: Arc<leadership::State>,
 }
 
 struct MetaService {
@@ -232,18 +239,26 @@ impl MetaNode {
         }
         .validate()?;
         let snap_dir = sm.snap_dir().to_path_buf();
+        let lead = Arc::new(leadership::State::new());
         let raft = Raft::new(
             cfg.node.0,
             Arc::new(config),
             NetworkFactory {
                 rpc: rpc.clone(),
                 incarnation: incarnation.clone(),
+                stats: lead.stats.clone(),
             },
             log,
             sm,
         )
         .await?;
-        network::register(&rpc, raft.clone(), snap_dir, incarnation.clone());
+        network::register(
+            &rpc,
+            raft.clone(),
+            snap_dir,
+            incarnation.clone(),
+            lead.legacy.clone(),
+        );
         rpc.register(
             service::META,
             Arc::new(MetaService {
@@ -275,7 +290,7 @@ impl MetaNode {
                 }
             });
         }
-        Ok(Arc::new(MetaNode {
+        let node = Arc::new(MetaNode {
             cfg,
             raft,
             rpc,
@@ -284,7 +299,11 @@ impl MetaNode {
             startup_committed,
             incarnation,
             seq: AtomicU64::new(1),
-        }))
+            lead,
+        });
+        leadership::watch_leader(&node);
+        leadership::watch_preferred(&node);
+        Ok(node)
     }
 
     pub fn id(&self) -> NodeId {
@@ -666,10 +685,6 @@ impl MetaNode {
             .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([id.0])), false)
             .await?;
         Ok(())
-    }
-
-    pub async fn shutdown(&self) {
-        let _ = self.raft.shutdown().await;
     }
 }
 
