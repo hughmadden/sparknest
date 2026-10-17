@@ -1507,3 +1507,92 @@ RoCE with PFC (the user declined: ECN removed most drops, and priority
 classes would complicate sharing the fabric with the LLM engine); stretching
 the lease during elections (weakens the guarantee that a cut-off host stops
 serving); SQLite on SMB with `nobrl` (unsafe if two writers ever meet).
+
+## ADR-057 — A 10G standby for the control plane and data; remote writes over RDMA; leader handoff and a preferred leader; serve cache closed on fence (2026-10-17)
+
+**Context.** ADR-056 shortened control-plane retransmits but left every
+fabric host's control connection, and all of its non-RDMA data, on the one
+CRS804 fabric switch: a switch reboot (2026-10-16) or a pulled cable takes
+quorum with it although every host also sits on a 10G LAN (172.22.x).
+Remote writes travel inside requests on the Raft connection, so a 1 MiB
+write delays the heartbeats queued behind it. A daemon stop drops the
+leader without telling anyone (an election per restart), and the leader
+lands wherever the last election did, although raptor (400G, always on)
+is the best placed. A daemon restart replaces the FUSE mount: containers
+that bind `/mnt/sparknest` privately keep a dead mount until restarted.
+The serve cache keeps an object open up to 2 s after its copy here was
+retired, which holds the disk space.
+
+**Decision.**
+1. **A standby address per member.** `Member { lan: Option<SocketAddr> }`
+   in `node.toml` (each host's 10G address, port as `addr`). Fabric hosts
+   with a `lan` for a peer keep a second, idle control connection to it
+   there, kept up by the dialler (lower node id dials).
+2. **Fail over on link failure only, and come back.** Control requests use
+   the fabric connection while it is up. When it breaks (closed, reset,
+   connect refused) or a request to the peer gets no answer at all for
+   1 s while the standby answers, the peer's requests switch to the
+   standby; slowness alone never switches. Every 2 s the fabric is
+   re-dialled; after 10 s connected it is primary again. Requests in
+   flight at a switch fail as `Unreachable` and openraft resends them; a
+   snapshot transfer restarts from offset 0, which the receiver handles.
+   Nothing is sent twice on purpose (no hedging, ADR-056 stands).
+3. **A standby data lane.** Fabric pairs keep one TCP lane (ADR-048) to
+   each other on the LAN (`node.lanes_fabric`, default 1). Reads use RDMA
+   while a link is up; when link setup fails or a link dies they use the
+   lane, and RDMA is retried as today (`link_retry`, doubling to 30 s).
+   The control connection no longer carries file data between fabric
+   hosts except as a last resort.
+4. **Remote writes over RDMA, pulled by the owner.** A writer on another
+   host registers its buffer and sends a 64-byte `WriteReq` (file, epoch,
+   writer, offset or append, length, buffer address and key). The owner
+   takes a staging slot, RDMA-READs the bytes, applies the write exactly
+   as `owner_mutate` does today (epoch check, append offset chosen there),
+   and answers with a `WriteDone { n | error }` SEND. Pulling, not
+   pushing, means nothing on the owner is reserved per writer and a
+   receiver never runs out of posted buffers (RC has no multi-packet
+   receive; `rnr_retry = 7` would stall the link). Without a link the
+   write goes over the standby lane, and only then over the control
+   connection. Read protocol 3; hosts on 2 still pair for reads and write
+   over TCP.
+5. **Leader handoff on shutdown.** `RaftReq::TransferLeader` (appended)
+   carries openraft's `TransferLeaderRequest`; a stopping leader hands off
+   to the most caught-up voter and waits up to 2 s for it to take over
+   before stopping Raft. A peer that cannot decode it is skipped.
+6. **A preferred leader.** Cluster setting `preferred-leader` (a node id,
+   default none, ADR-056 settings). The leader hands off to it when it has
+   been up, caught up and reachable on its fabric connection for 2 minutes
+   and the last handoff was over 10 minutes ago, so a flapping host never
+   bounces leadership.
+7. **The serve cache follows fencing.** Fencing a key (deletion, eviction,
+   invalidation, a new owner's generation) removes it from the serve
+   cache at once; reads already holding the file finish and its space is
+   freed with the last of them. Entries also expire 2 s after last use
+   (sliding) and at most 30 s after opening.
+8. **The mount survives a restart.** The daemon hands its `/dev/fuse`
+   descriptor to systemd's file-descriptor store (`FileDescriptorStoreMax`)
+   and a restarted daemon takes it back instead of mounting again, so
+   processes and containers keep their mount. The FUSE session is
+   re-initialised on the old descriptor; requests that arrive meanwhile
+   wait in the kernel. Fall back to a fresh mount when there is no stored
+   descriptor (first start, crash with a stale one).
+9. **Health.** `nest net`: per peer, which path control and data use, the
+   round-trip times our Raft network measures, failovers and returns, and
+   the RoCE retransmit counters (`hw_counters`: `out_of_sequence`,
+   `packet_seq_err`, `local_ack_timeout_err`). Each leader change and each
+   failover is logged at WARN.
+10. **Benchmark first.** `benchmarks/M12-CONTROL-PATH.md`: control call
+    round trip and Raft commit latency on the fabric and on the LAN, idle
+    and under load, with ADR-056's 5 ms retransmit floor on both. If the
+    LAN proves as good as the fabric under load, revisit which is primary.
+
+**Alternatives.** Hedged duplicate Raft sends on both networks (duplicate
+snapshot chunks restart transfers; needs dedup; rejected in ADR-056);
+the LAN as permanent primary (decided against until measured); pushing
+writes into credited slots on the owner (one round trip faster, but needs
+per-writer reservations and credit reclaim); a SEND carrying the write
+(posted 1 MiB receives per connection; an empty queue stalls the link
+under `rnr_retry = 7`); preferred leader in `node.toml` (could differ
+between hosts; settings are set once and persist); rslave bind
+propagation in containers instead of keeping the mount (needs every
+container changed and still breaks open files).
