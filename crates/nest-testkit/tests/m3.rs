@@ -291,6 +291,32 @@ async fn served_objects_are_not_held_open() {
     // Evicted here: closed at once.
     assert!(v1.evict_from(f, NodeId(1).live_store()).await.unwrap());
     assert_eq!(v1.serving_open(), 0);
+    // Evicted by another host, or the file deleted: closed as soon as the
+    // change applies here, not at the next sweep (ADR-057).
+    let sf = ReadSource::open(&**v1, f, a.generation).await;
+    assert!(sf.is_err(), "served an evicted copy");
+    let h = file(&c, 1, "held", &vec![3u8; 1 << 20]).await;
+    let ha = c.attr(1, h).unwrap();
+    replicate(&c, h, 1, 2).await;
+    drop(ReadSource::open(&**v1, h, ha.generation).await.unwrap());
+    assert_eq!(v1.serving_open(), 1);
+    let v2 = &c.node(2).vfs;
+    assert!(v2.evict_from(h, NodeId(1).live_store()).await.unwrap());
+    c.eventually(
+        "evicted from elsewhere: closed",
+        Duration::from_secs(1),
+        |c| c.node(1).vfs.serving_open() == 0,
+    )
+    .await;
+    let d = file(&c, 1, "doomed", b"bye").await;
+    let da = c.attr(1, d).unwrap();
+    drop(ReadSource::open(&**v1, d, da.generation).await.unwrap());
+    assert_eq!(v1.serving_open(), 1);
+    v2.unlink(FileId::ROOT, b"doomed").await.unwrap();
+    c.eventually("deleted: closed", Duration::from_secs(1), |c| {
+        c.node(1).vfs.serving_open() == 0
+    })
+    .await;
     // Anything else idle is closed within a few seconds.
     let g = file(&c, 1, "other", b"x").await;
     let b = c.attr(1, g).unwrap();

@@ -193,10 +193,11 @@ pub struct Vfs {
     /// Local reads in progress per file (fencing waits for them).
     inflight: Mutex<HashMap<FileId, u32>>,
     /// Objects this host serves to others, kept open: fully re-checked
-    /// (metadata, live replica) at most every `SERVE_TTL`, and in between
-    /// only against the lease and fences. STABLE generations only: their
-    /// bytes never change.
-    serve_files: Mutex<HashMap<ObjectKey, (Arc<std::fs::File>, std::time::Instant)>>,
+    /// (metadata, live replica) when idle `SERVE_TTL` or open
+    /// `SERVE_MAX_AGE`, and in between only against the lease and fences;
+    /// closed as soon as their copy here is invalidated. STABLE
+    /// generations only: their bytes never change.
+    serve_files: Mutex<HashMap<ObjectKey, ServeEntry>>,
     /// Transfers into each archive store at once (a single disk or share
     /// gains nothing from more; dozens of queued offloads once pinned
     /// hundreds of threads on a 150 MB/s disk).
@@ -656,6 +657,18 @@ impl Vfs {
 
     fn on_effect(&self, index: u64, e: &Effect) {
         match e {
+            // Deleted, evicted or superseded by a new owner's generation:
+            // close it now so its space comes back with the last read still
+            // holding it (ADR-057), not at the next sweep.
+            Effect::ReplicaInvalidated {
+                file,
+                generation,
+                store,
+            } if *store == self.me().live_store() => {
+                self.serve_files
+                    .lock()
+                    .remove(&ObjectKey::new(*file, *generation));
+            }
             Effect::OwnershipGranted {
                 file,
                 owner,
@@ -1673,23 +1686,31 @@ impl Vfs {
         let f = Arc::new(self.servable_object(file, generation)?);
         if a.gen_state == GenState::Stable && self.d.servable(key) {
             let mut m = self.serve_files.lock();
-            m.retain(|_, (_, at)| at.elapsed() < SERVE_TTL);
+            m.retain(|_, e| e.live());
             if m.len() >= SERVE_FILES_MAX {
                 m.clear();
             }
-            m.insert(key, (f.clone(), std::time::Instant::now()));
+            let now = std::time::Instant::now();
+            m.insert(
+                key,
+                ServeEntry {
+                    file: f.clone(),
+                    opened: now,
+                    used: now,
+                },
+            );
         }
         Ok(f)
     }
 
-    /// Close served objects not used within `SERVE_TTL`. An open file keeps
-    /// its disk space after it is deleted: a spread import's staging copies
-    /// (served to their new hosts, then removed here) once filled raptor's
-    /// disk because entries were only swept past `SERVE_FILES_MAX`.
+    /// Close served objects not used within `SERVE_TTL`, or open longer
+    /// than `SERVE_MAX_AGE`. An open file keeps its disk space after it is
+    /// deleted: a spread import's staging copies (served to their new hosts,
+    /// then removed here) once filled raptor's disk because entries were
+    /// only swept past `SERVE_FILES_MAX`. Fencing closes them at once
+    /// (`on_effect`); this catches anything else.
     fn sweep_serve_files(&self) {
-        self.serve_files
-            .lock()
-            .retain(|_, (_, at)| at.elapsed() < SERVE_TTL);
+        self.serve_files.lock().retain(|_, e| e.live());
     }
 
     /// Objects kept open for serving (for tests and diagnostics).
@@ -1698,8 +1719,11 @@ impl Vfs {
     }
 
     fn cached_serve_file(&self, key: ObjectKey) -> Option<Arc<std::fs::File>> {
-        let f = match self.serve_files.lock().get(&key) {
-            Some((f, at)) if at.elapsed() < SERVE_TTL => f.clone(),
+        let f = match self.serve_files.lock().get_mut(&key) {
+            Some(e) if e.live() => {
+                e.used = std::time::Instant::now();
+                e.file.clone()
+            }
             _ => return None,
         };
         self.d.may_serve_now(key).then_some(f)
@@ -3058,8 +3082,25 @@ const ARCHIVE_TRANSFERS: usize = 2;
 const ATTR_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long an open served object is trusted before a full re-check.
+/// A served object idle this long is closed.
 const SERVE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// A served object is re-checked against metadata (closed, then reopened
+/// by the full `servable` check) at least this often, however busy.
+const SERVE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
 const SERVE_FILES_MAX: usize = 4096;
+
+/// An object kept open for serving (see `Vfs::serve_files`).
+struct ServeEntry {
+    file: Arc<std::fs::File>,
+    opened: std::time::Instant,
+    used: std::time::Instant,
+}
+
+impl ServeEntry {
+    fn live(&self) -> bool {
+        self.used.elapsed() < SERVE_TTL && self.opened.elapsed() < SERVE_MAX_AGE
+    }
+}
 
 impl nest_fabric::ReadSource for Vfs {
     /// Objects already open for serving: the lease and fences are checked,
