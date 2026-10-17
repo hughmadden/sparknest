@@ -70,6 +70,9 @@ pub(crate) struct Inner {
     conns: Mutex<HashMap<NodeId, ConnSlot>>,
     /// Standby addresses and each such peer's path state (ADR-057).
     pub(crate) paths: Paths,
+    /// Primary dials in progress to peers with a standby, shared by every
+    /// request waiting for one.
+    dials: Mutex<HashMap<NodeId, SharedDial>>,
     pub(crate) filter: Filter,
     pub(crate) shutdown: watch::Sender<bool>,
 }
@@ -143,6 +146,8 @@ async fn writer(
 type ConnSlot = Arc<tokio::sync::Mutex<Option<Arc<Conn>>>>;
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Bytes, RpcError>>>>;
+
+type SharedDial = futures::future::Shared<BoxFuture<'static, Result<Arc<Conn>, RpcError>>>;
 
 /// How long a connection has gone without a word from the peer while we
 /// wait on it (ADR-057). `since` is when the first request was sent after
@@ -460,6 +465,7 @@ impl Rpc {
             pinned: Default::default(),
             conns: Default::default(),
             paths: Default::default(),
+            dials: Default::default(),
             filter: Filter::default(),
             shutdown,
         });
@@ -605,25 +611,42 @@ impl Rpc {
         if !self.inner.paths.has(peer) {
             return self.conn(peer).await;
         }
-        // Dial in a task of its own: a caller with a short budget (a
-        // heartbeat) gives up long before a dead fabric's connect timeout,
-        // and the failover must still happen when the dial fails.
-        let rpc = self.clone();
-        let dial = tokio::spawn(async move {
-            match rpc.conn(peer).await {
-                Err(e @ RpcError::Unreachable(..)) => {
-                    let why = format!("fabric connect failed: {e}");
-                    rpc.inner
-                        .paths
-                        .fail_over(&rpc, peer, &why, None)
-                        .await
-                        .ok_or(e)
+        // Dial in a task of its own, shared by every caller meanwhile: a
+        // caller with a short budget (a heartbeat) gives up long before a
+        // dead fabric's connect timeout, and the failover must still happen
+        // when the dial fails.
+        let dial = {
+            let mut dials = self.inner.dials.lock();
+            match dials.get(&peer) {
+                Some(d) => d.clone(),
+                None => {
+                    let rpc = self.clone();
+                    let task = tokio::spawn(async move {
+                        let r = match rpc.conn(peer).await {
+                            Err(e @ RpcError::Unreachable(..)) => {
+                                let why = format!("fabric connect failed: {e}");
+                                rpc.inner
+                                    .paths
+                                    .fail_over(&rpc, peer, &why, None)
+                                    .await
+                                    .ok_or(e)
+                            }
+                            r => r,
+                        };
+                        rpc.inner.dials.lock().remove(&peer);
+                        r
+                    });
+                    let d = futures::FutureExt::shared(Box::pin(async move {
+                        task.await
+                            .unwrap_or_else(|e| Err(RpcError::Protocol(format!("dial task: {e}"))))
+                    })
+                        as BoxFuture<'static, Result<Arc<Conn>, RpcError>>);
+                    dials.insert(peer, d.clone());
+                    d
                 }
-                r => r,
             }
-        });
+        };
         dial.await
-            .unwrap_or_else(|e| Err(RpcError::Protocol(format!("dial task: {e}"))))
     }
 
     /// The live primary connection to `peer`, without dialling.
