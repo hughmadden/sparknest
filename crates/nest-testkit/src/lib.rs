@@ -103,11 +103,12 @@ impl TestCluster {
         if standby {
             // Pick every node's ports first, so each config names all the
             // standby addresses (they are only read at start).
+            // Lanes at the control port + 2, as on real hosts, so the
+            // standby lanes are found at `lan` + 2.
             for id in 1..=n {
-                let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-                let p = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-                c.addrs.insert(id, loopback(l.local_addr().unwrap()));
-                c.lanes.insert(id, loopback(p.local_addr().unwrap()));
+                let (l, p) = port_pair();
+                c.addrs.insert(id, SocketAddr::from(([127, 0, 0, 1], l)));
+                c.lanes.insert(id, SocketAddr::from(([127, 0, 0, 1], p)));
             }
             for id in 1..=n {
                 let listen = c.listen_addr(c.addrs[&id]);
@@ -208,8 +209,6 @@ impl TestCluster {
                         addr: *a,
                         voter: !self.offgrid.contains(i),
                         lanes: self.lanes.get(i).copied(),
-                        // The standby lanes are at `lan` port + 2: only the
-                        // control standby is exercised here.
                         lan: self
                             .standby
                             .then(|| SocketAddr::from(([127, 0, 0, 2], a.port()))),
@@ -453,6 +452,17 @@ impl TestCluster {
     pub fn attr(&self, id: u64, file: FileId) -> Option<nest_types::FileAttr> {
         let c = self.nodes[&id].meta.open_reader().unwrap();
         nest_meta::query::getattr(&c, file).unwrap()
+    }
+}
+
+/// Two free ports p and p + 2 (every address).
+fn port_pair() -> (u16, u16) {
+    loop {
+        let a = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let p = a.local_addr().unwrap().port();
+        if p < u16::MAX - 2 && std::net::TcpListener::bind(("0.0.0.0", p + 2)).is_ok() {
+            return (p, p + 2);
+        }
     }
 }
 

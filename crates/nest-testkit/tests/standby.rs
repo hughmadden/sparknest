@@ -120,3 +120,71 @@ async fn quorum_survives_losing_the_fabric() {
     c.converge().await;
     assert_eq!(read_all(&c, 1, f).await, b"back on the fabric");
 }
+
+/// ADR-057 item 3: with the RDMA link to a peer down (setup refused, the
+/// old link gone), reads of its copy go over the standby TCP lane on the
+/// LAN, not one request at a time over the control connection. (Pairing
+/// again after the backoff is nest-fabric's failed_link_setups_back_off.)
+/// Needs a RoCE rail here: skips without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn reads_use_the_standby_lane_while_rdma_is_down() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    if nest_fabric::discover(&[]).is_empty() {
+        return;
+    }
+    let mut t = nest_testkit::fast_tuning();
+    t.fabric = Some(nest_fabric::FabricConfig {
+        chunk: 4 << 20,
+        client_slots: 32,
+        server_slots: 16,
+        window: 16,
+        devices: vec![],
+        link_retry: std::time::Duration::from_secs(5),
+        ..nest_fabric::FabricConfig::default()
+    });
+    let c = TestCluster::start_with_standby(2, t).await;
+    c.eventually("serving", Duration::from_secs(8), |c| {
+        (1..=2).all(|i| c.node(i).data.caught_up() && c.node(i).data.session().is_some())
+    })
+    .await;
+    let (f2, l2) = (c.node(2).fabric().unwrap(), c.node(2).vfs.lanes().unwrap());
+    c.eventually("standby lane up", Duration::from_secs(5), |c| {
+        c.node(2).vfs.lanes().unwrap().connected(NodeId(1)) >= 1
+    })
+    .await;
+    let data: Vec<u8> = (0..(24u32 << 20)).map(|i| (i % 251) as u8).collect();
+    let file = write_file(&c, 1, "model", &data).await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        c.attr(2, file)
+            .is_some_and(|a| a.gen_state == GenState::Stable)
+    })
+    .await;
+
+    assert!(read_all(&c, 2, file).await == data);
+    let rdma = f2.stats.read_bytes.load(Ordering::Relaxed);
+    assert!(rdma >= data.len() as u64, "first read over RDMA ({rdma})");
+    assert_eq!(l2.stats.read_bytes.load(Ordering::Relaxed), 0);
+
+    // Node 1 refuses RDMA links from now on, and node 2's link is gone.
+    c.node(1).rpc.register(
+        nest_rpc::service::FABRIC,
+        Arc::new(|_p: NodeId, _b: bytes::Bytes| {
+            Box::pin(async { Err::<bytes::Bytes, _>("RDMA is down".to_string()) })
+                as futures::future::BoxFuture<'static, Result<bytes::Bytes, String>>
+        }),
+    );
+    f2.drop_link(NodeId(1));
+    assert!(read_all(&c, 2, file).await == data);
+    assert!(f2.link_failed(NodeId(1)));
+    assert_eq!(
+        f2.stats.read_bytes.load(Ordering::Relaxed),
+        rdma,
+        "read over RDMA with the link down"
+    );
+    let lane = l2.stats.read_bytes.load(Ordering::Relaxed);
+    assert!(
+        lane >= data.len() as u64,
+        "standby lane carried {lane} bytes"
+    );
+}
