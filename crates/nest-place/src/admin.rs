@@ -89,8 +89,9 @@ pub struct JobProgress {
     pub done_bytes: u64,
     pub failed: Vec<(FileId, String)>,
     pub finished: bool,
-    /// Cancelled: files not yet started are skipped (counted in neither
-    /// done nor failed); files already copying finish.
+    /// Cancelled: files not yet copied are skipped (counted in neither
+    /// done nor failed), those mid-copy stopped and their partial copies
+    /// removed.
     #[serde(default)]
     pub cancelled: bool,
 }
@@ -488,7 +489,19 @@ impl Admin {
                         if progress.lock().cancelled {
                             return (f, size, None);
                         }
-                        (f, size, Some(vfs.replicate_into(f, target).await))
+                        // A cancel stops a file mid-copy too: dropping the
+                        // copy removes its partial staging file once the
+                        // writes already queued land, and nothing is
+                        // published.
+                        let stop = async {
+                            while !progress.lock().cancelled {
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                        };
+                        tokio::select! {
+                            r = vfs.replicate_into(f, target) => (f, size, Some(r)),
+                            _ = stop => (f, size, None),
+                        }
                     }
                 })
                 .buffer_unordered(parallel.max(1))

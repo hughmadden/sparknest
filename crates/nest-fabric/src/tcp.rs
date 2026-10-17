@@ -76,8 +76,13 @@ pub struct LanesConfig {
     /// Bytes of reads this host has outstanding at once, over all peers.
     pub inflight_bytes: u64,
     pub connect_timeout: Duration,
-    /// How long a read may wait for its answer.
+    /// How long a read may wait for its answer. A lane that leaves one
+    /// unanswered this long is closed: the next read goes elsewhere.
     pub read_timeout: Duration,
+    /// How long sent bytes may stay unacknowledged before the kernel
+    /// closes the lane (`TCP_USER_TIMEOUT`); keepalives probe idle lanes
+    /// on the same budget.
+    pub stall_timeout: Duration,
 }
 
 impl Default for LanesConfig {
@@ -88,6 +93,7 @@ impl Default for LanesConfig {
             inflight_bytes: 64 << 20,
             connect_timeout: Duration::from_secs(2),
             read_timeout: Duration::from_secs(30),
+            stall_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -314,9 +320,12 @@ impl Lanes {
             Ok(()) => match tokio::time::timeout(self.cfg.read_timeout, rx).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => Err(NestError::Unavailable(format!("TCP lane to {peer} lost"))),
-                Err(_) => Err(NestError::Unavailable(format!(
-                    "TCP read from {peer} timed out"
-                ))),
+                Err(_) => {
+                    lane.stalled("read");
+                    Err(NestError::Unavailable(format!(
+                        "TCP read from {peer} timed out"
+                    )))
+                }
             },
         };
         lane.pending.lock().remove(&id);
@@ -374,8 +383,10 @@ impl Lanes {
                 Ok(Ok(Ok(n))) => Ok(n),
                 Ok(Ok(Err(e))) => Err(WriteError::Failed(e)),
                 Ok(Err(_)) => Err(unknown("lane lost")),
-                // A late answer finds no waiter (ids are never reused).
-                Err(_) => Err(unknown("no answer")),
+                Err(_) => {
+                    lane.stalled("write");
+                    Err(unknown("no answer"))
+                }
             },
         };
         lane.writes.lock().remove(&id);
@@ -448,6 +459,7 @@ impl Lanes {
     fn run(self: &Arc<Self>, peer: NodeId, s: tokio::net::TcpStream) -> std::io::Result<()> {
         let s = s.into_std()?;
         s.set_nonblocking(false)?;
+        watch_stalls(&s, self.cfg.stall_timeout)?;
         let (out, rx) = mpsc::channel();
         let lane = Arc::new(Lane {
             peer,
@@ -543,6 +555,16 @@ impl Lanes {
 }
 
 impl Lane {
+    /// A request went unanswered for the full timeout: the lane is taken
+    /// to be broken (one direction may be, with the other still carrying
+    /// answers), so close it rather than send more down it.
+    fn stalled(&self, what: &str) {
+        if !self.dead.load(Ordering::SeqCst) {
+            tracing::warn!(peer = %self.peer, what, "TCP lane left a request unanswered; closing it");
+            self.kill();
+        }
+    }
+
     /// Close the lane: its threads exit and its waiting reads fail.
     fn kill(&self) {
         if !self.dead.swap(true, Ordering::SeqCst) {
@@ -771,6 +793,23 @@ fn writer(
         tracing::debug!(peer = %lane.peer, error = %e, "TCP lane write failed");
     }
     lane.kill();
+}
+
+/// Have the kernel close a lane whose sent bytes go unacknowledged for
+/// `timeout`, and probe idle lanes on the same budget, so a connection a
+/// NAT or a peer dropped cannot sit open with requests going nowhere.
+fn watch_stalls(s: &std::net::TcpStream, timeout: Duration) -> std::io::Result<()> {
+    use nix::sys::socket::{setsockopt, sockopt};
+    let secs = timeout.as_secs().max(1) as u32;
+    let ms = timeout.as_millis().clamp(1, u32::MAX as u128) as u32;
+    let set = || -> nix::Result<()> {
+        setsockopt(s, sockopt::TcpUserTimeout, &ms)?;
+        setsockopt(s, sockopt::KeepAlive, &true)?;
+        setsockopt(s, sockopt::TcpKeepIdle, &secs)?;
+        setsockopt(s, sockopt::TcpKeepInterval, &secs.div_ceil(3))?;
+        setsockopt(s, sockopt::TcpKeepCount, &3)
+    };
+    set().map_err(std::io::Error::from)
 }
 
 fn answer_header(kind: u8, id: u64, len: u32) -> [u8; 1 + ANSWER_LEN] {

@@ -376,3 +376,151 @@ async fn lanes_carry_writes_to_the_owner() {
         Err(WriteError::Unsent(_))
     ));
 }
+
+/// A relay between the dialling host and the accepting one that can
+/// silently drop what the accepting host sends on the lanes open now,
+/// while still carrying the other direction (a NAT that lost one side of
+/// its mapping): lanes opened afterwards are relayed whole.
+struct OneWayCut {
+    addr: std::net::SocketAddr,
+    /// Lanes numbered below this lose the accepting host's bytes.
+    cut_below: Arc<std::sync::atomic::AtomicU64>,
+    opened: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl OneWayCut {
+    async fn start(to: std::net::SocketAddr) -> OneWayCut {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let cut_below = Arc::new(AtomicU64::new(0));
+        let opened = Arc::new(AtomicU64::new(0));
+        let (cut, n) = (cut_below.clone(), opened.clone());
+        tokio::spawn(async move {
+            while let Ok((a, _)) = l.accept().await {
+                let me = n.fetch_add(1, Ordering::SeqCst);
+                let Ok(b) = tokio::net::TcpStream::connect(to).await else {
+                    continue;
+                };
+                let (mut ar, mut aw) = a.into_split();
+                let (mut br, mut bw) = b.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut ar, &mut bw).await;
+                });
+                let cut = cut.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 64 << 10];
+                    loop {
+                        let k = match br.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(k) => k,
+                        };
+                        if me < cut.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        if aw.write_all(&buf[..k]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        OneWayCut {
+            addr,
+            cut_below,
+            opened,
+        }
+    }
+
+    /// Drop the accepting host's bytes on every lane open now.
+    fn cut(&self) {
+        use std::sync::atomic::Ordering;
+        self.cut_below
+            .store(self.opened.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_lane_that_stops_answering_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LanesConfig {
+        per_peer: 3,
+        chunk: 1 << 20,
+        read_timeout: Duration::from_millis(300),
+        ..LanesConfig::default()
+    };
+    let core = Lanes::start(
+        NodeId(1),
+        "lanes-test".into(),
+        b"s".to_vec(),
+        cfg.clone(),
+        Some("127.0.0.1:0".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    let offgrid = Lanes::start(
+        NodeId(8),
+        "lanes-test".into(),
+        b"s".to_vec(),
+        cfg.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let relay = OneWayCut::start(core.local_addr().unwrap()).await;
+    offgrid.dial(NodeId(1), relay.addr);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while core.connected(NodeId(8)) < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lanes did not come up"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let data = pattern(4, 5000);
+    let src = files(dir.path(), &[(11, 1, data.clone())]);
+    offgrid.set_source(Arc::downgrade(&src));
+    assert_eq!(
+        core.read(NodeId(8), FileId(11), Generation(1), 0, 5000)
+            .await
+            .unwrap(),
+        data
+    );
+
+    // The accepting host's requests now vanish on every open lane; the
+    // dialling host's side still looks healthy and never redials by
+    // itself. Each unanswered read closes its lane, so within a few reads
+    // the dialler has opened fresh lanes that carry them again.
+    relay.cut();
+    let start = std::time::Instant::now();
+    let mut failed = 0;
+    loop {
+        match core
+            .read(NodeId(8), FileId(11), Generation(1), 0, 5000)
+            .await
+        {
+            Ok(r) => {
+                assert_eq!(r, data);
+                break;
+            }
+            Err(_) => failed += 1,
+        }
+        assert!(
+            failed <= 3,
+            "reads still going down lanes that stopped answering"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(failed >= 1, "the cut did not take");
+    assert!(start.elapsed() < Duration::from_secs(5));
+    // And they keep working.
+    for _ in 0..20 {
+        assert_eq!(
+            core.read(NodeId(8), FileId(11), Generation(1), 0, 5000)
+                .await
+                .unwrap(),
+            data
+        );
+    }
+}

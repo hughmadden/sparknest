@@ -3,6 +3,20 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-18 — 0.5.1: a stuck TCP lane is replaced; cancel stops mid-file (ADR-060)
+
+- Raptor's reads from oliver hung for 30 s each, three hours after an
+  archive sync: six lanes had stopped carrying raptor's requests (NAT on
+  the WSL host, most likely) while oliver's answers still flowed, so
+  neither end redialled. The Kimi-K3 page (only live copy on oliver)
+  opened empty. A read or write left unanswered now closes its lane, and
+  lanes set `TCP_USER_TIMEOUT` 10 s plus keepalive. New test
+  `a_lane_that_stops_answering_is_replaced` cuts one direction of the
+  lanes through a relay; it fails without the fix.
+- Cancelling a replicate or offload stops files mid-copy as well (it
+  used to let them finish: Kimi-K3 to scratch took about five minutes to
+  settle) and removes their partial copies (`cancel_stops_a_file_mid_copy`).
+
 ## 2026-10-17 — 0.5.0: a 10G standby, remote writes over RDMA, leader handoff (ADR-057–059)
 
 - **10G standby for the control plane** (ADR-057 1–2). Each fabric pair

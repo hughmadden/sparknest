@@ -1712,3 +1712,50 @@ vendored fuser, persisted INIT parameters, NOTIFY_RESEND, handle
 re-derivation, lock and session carry-over, passthrough re-binding; a
 week-scale change with fencing tests first. Wait for kernel support for
 recovering ring requests (none proposed as of 2026-10).
+
+## ADR-060 — A TCP lane that stops answering is closed; cancel stops a copy mid-file (2026-10-18)
+
+**Context.** On 2026-10-18 the Kimi-K3 page in the web UI opened empty.
+Its only live copy was on oliver (off-grid, WSL behind NAT), and every
+read raptor sent oliver waited the full 30 s lane timeout before the
+archive copy answered (the UI gives up at 20 s). Six of oliver's eight
+lanes to raptor had stopped carrying raptor's bytes 3.2 h earlier, during
+a large archive sync that pulled about 477 GB from oliver over them: on
+raptor they held unacknowledged data in exponential backoff (rto 120 s,
+backoff 12), while oliver saw them idle and healthy and its answers still
+arrived, so neither end closed or redialled them. Closing raptor's ends
+(`ss -K`) made oliver redial at once and the page load in 0.18 s. Two
+gaps let it last: a read that timed out left its lane in use, and lanes
+had no `TCP_USER_TIMEOUT`, so the kernel would retry for the default
+~15 retransmits (tens of minutes to hours) before giving up.
+
+**Decision.**
+1. A read or write on a lane that gets no answer within `read_timeout`
+   closes that lane: its other waiting requests fail at once (reads try
+   the next source; writes report an unknown outcome as before), and the
+   dialling end opens a fresh lane within half a second. An answer that
+   is only slow costs one reconnect.
+2. Every lane sets `TCP_USER_TIMEOUT` = 10 s (`LanesConfig::stall_timeout`)
+   and TCP keepalive (idle 10 s, 3 probes 4 s apart), so the kernel itself
+   drops a connection whose bytes go unacknowledged, and idle lanes keep
+   NAT mappings refreshed.
+
+The in-process test `a_lane_that_stops_answering_is_replaced` relays the
+lanes through a proxy that silently drops one direction of every open
+lane, and fails without item 1.
+
+Also in 0.5.1: **a cancelled copy stops mid-file.** Cancelling a
+replicate or offload used to skip only files not yet started; the ones
+copying ran to the end. Cancelling Kimi-K3 to scratch (17 GB files pulled
+from oliver over 10G) took about five minutes to settle. A file mid-copy
+now stops within 200 ms of the cancel reaching its host: the copy is
+dropped, nothing is published, and its staging file is removed once the
+direct writes already queued land (the write ring owns their buffers and
+files, nest-store/src/uring.rs). It counts as neither done nor failed.
+Test: `cancel_stops_a_file_mid_copy`.
+
+**Alternatives.** An application-level ping per lane (the control
+connections' standby probe, ADR-057) would also find it but adds traffic
+to every lane; the timeout already is that signal for a lane in use, and
+the kernel options cover idle ones. Shorter `read_timeout`: a 4 MiB read
+over a busy 10G link can legitimately take seconds.

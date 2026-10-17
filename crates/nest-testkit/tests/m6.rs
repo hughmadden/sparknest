@@ -678,3 +678,78 @@ async fn adding_a_store_again_initializes_its_folder() {
             .is_err()
     );
 }
+
+/// Cancelling stops a file mid-copy: nothing is published and its partial
+/// staging file is removed, rather than the copy running to its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cancel_stops_a_file_mid_copy() {
+    let c = ready(2).await;
+    let p = &c.node(1).placer;
+    let nas = c.state_dir(1).join("nas-midcopy");
+    std::fs::create_dir_all(&nas).unwrap();
+    p.add_store("nas", nas.to_str().unwrap(), &["n1".into()])
+        .await
+        .unwrap();
+    // Big enough that copying it takes far longer than noticing a cancel.
+    let v = c.node(2).vfs.clone();
+    let (a, fh, _) = v
+        .create(FileId::ROOT, b"big", 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    for i in 0..64u64 {
+        v.write(fh, i << 22, vec![i as u8; 4 << 20]).await.unwrap();
+    }
+    v.release(fh, None).await;
+    c.eventually("stable", Duration::from_secs(10), |c| {
+        c.attr(1, a.id)
+            .is_some_and(|x| x.gen_state == GenState::Stable)
+    })
+    .await;
+    // Only n2 has it: n1, the archive's gateway, pulls it over the
+    // in-process fabric.
+    let id = p
+        .replicate(
+            Selector::parse("/big", "/hub").unwrap(),
+            vec!["nas".into()],
+            1,
+        )
+        .await
+        .unwrap();
+    let staged = || -> usize {
+        std::fs::read_dir(&nas)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("staging"))
+            .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
+            .count()
+    };
+    c.eventually("copy under way", Duration::from_secs(10), |_| staged() > 0)
+        .await;
+    // Hold the copy where it is: n2's answers stop arriving (until the
+    // LAN standby takes over, ADR-057, and the copy could carry on).
+    c.node(1).rpc.filter().mute(NodeId(2));
+    p.cancel_job(id).await.unwrap();
+    let t = std::time::Instant::now();
+    let job = wait_job(&c, id).await;
+    assert!(job.cancelled, "{job:?}");
+    // Stopped, not run to an end (copied, or failed on the muted link).
+    let h = &job.hosts["nas"];
+    assert_eq!((h.done_files, h.failed.len()), (0, 0), "{job:?}");
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        t.elapsed()
+    );
+    c.heal();
+    // Long enough for a copy that kept going to have finished.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let nas_id = p.archive_stores().unwrap()[0].0.0;
+    assert!(
+        !stores_of(&c, a.id).contains(&nas_id),
+        "published after cancel"
+    );
+    c.eventually("partial copy removed", Duration::from_secs(5), |_| {
+        staged() == 0
+    })
+    .await;
+}

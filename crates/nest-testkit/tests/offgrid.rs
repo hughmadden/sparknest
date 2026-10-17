@@ -27,6 +27,15 @@ async fn with_offgrid(n: u64, id: u64) -> TestCluster {
         c.node(id).data.caught_up() && c.node(id).data.session().is_some()
     })
     .await;
+    // Its store (and so its name) registered, as node 1 sees it.
+    let name = format!("n{id}");
+    c.eventually("off-grid host named", Duration::from_secs(8), |c| {
+        c.node(1)
+            .placer
+            .nodes()
+            .is_ok_and(|v| v.iter().any(|h| h.name == name))
+    })
+    .await;
     c
 }
 
