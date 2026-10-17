@@ -1622,3 +1622,93 @@ open, and turned up one existing bug.
    the owner could each read the same length and overwrite each other.
 5. **A write that races another host's ownership grant is routed again**
    instead of failing "no reachable node holds this file".
+
+## ADR-059 — Keeping the mount across a restart: spike findings; ADR-057 item 8 not built (2026-10-17)
+
+**Context.** ADR-057 item 8 proposed handing `/dev/fuse` to systemd's fd
+store so a restarted daemon resumes the same FUSE connection. A spike
+(outside the tree, in `~/build/fusefd-spike` on raptor: vendored fuser
+with a no-INIT `Session::resume`, a toy filesystem, our `uring.rs`)
+tested it on raptor's kernel 7.0.0-38 against the v7.0 sources of
+`fs/fuse/dev.c`, `dev_uring.c`, `iomode.c`, `backing.c`.
+
+**Findings.**
+
+1. **The fd store works.** A transient user unit (`Type=notify`,
+   `FileDescriptorStoreMax=4`, default `FileDescriptorStorePreserve=
+   restart`) got the fd back through `LISTEN_FDS`/`LISTEN_FDNAMES` on
+   `systemctl restart` and on SIGKILL with `Restart=always`; `stop`
+   empties the store and leaves a dead mount (our `ExecStopPost`
+   detaches it). FDSTORE needs only `sendmsg` with `SCM_RIGHTS` (nix).
+2. **On /dev/fuse (no io_uring) resuming is sound.** The connection
+   stays initialised (no second INIT; the new process must reuse the
+   negotiated values). Requests issued while no daemon runs wait in the
+   kernel and are answered by the next one (measured: 2 s gap, no
+   error). Requests the dead process had read but not answered stay on
+   its device's processing list while the stored fd keeps the
+   `struct file` alive; `FUSE_NOTIFY_RESEND` (in 7.0, `FUSE_HAS_RESEND`)
+   requeues them with the same unique id marked `FUSE_UNIQUE_RESEND`.
+   Stress: 10 SIGKILL + resume cycles under 32 parallel readers, 61 297
+   reads, none failed, nothing left waiting. Open files, cwds, and
+   containers with a default (rprivate) bind kept working.
+3. **With FUSE over io_uring it is not.** On exit io_uring cancels only
+   ring entries that are idle (`fuse_uring_cancel`: `FRRS_AVAILABLE`);
+   a request already dispatched to an entry stays on that queue's own
+   `fpq`, and `fuse_resend()` walks only `fc->devices`, never ring
+   queues, so it is never answered. The new process can register its
+   queues again (`fc->ring` and `ring->ready` persist; measured, 64
+   queues), but requests queued while no daemon ran stay on their CPU's
+   queue until that queue sees a commit. Stress: the first SIGKILL left
+   8 requests stuck forever, readers in D state, and lookups of the same
+   names piling up in `d_alloc_parallel`; only aborting the connection
+   recovered. A graceful stop narrows the window but cannot close it: the
+   kernel may hand an entry a request (task work) after our last look.
+   Nothing in mainline (checked master, 2026-10) recovers ring requests.
+4. **io_uring cannot be dropped for the resumed connection.** Once a
+   ring is ready `fiq->ops` stays `fuse_io_uring_ops`; a /dev/fuse-only
+   server on such a connection receives nothing (measured: every access
+   timed out). Only a connection that never negotiated
+   `FUSE_OVER_IO_URING` can be resumed.
+5. **What the daemon would have to carry over** (none of it exists
+   today): the kernel keeps file handles (`fh`) chosen by the old
+   process and sends them unchanged (measured), so VFS handles must be
+   re-derivable or persisted; inode numbers are already stable
+   (`ino = FileId`) and lookup counts can be ignored (we ignore FORGET);
+   a passthrough inode stays bound to its backing file in the kernel and
+   every new open of it must answer FOPEN_PASSTHROUGH with a backing id
+   the new process does not know (else EIO, `iomode.c`); the new
+   process's `OpenSession` expires the old session, which drops its
+   POSIX locks and deletes open-but-unlinked files, and write ownership
+   of open writable files lives in memory. Each of these is lifecycle and
+   fencing work that needs its own tests first.
+6. **rslave does not rescue today's remount.** A container binding the
+   mountpoint itself (`-v /mnt/sparknest:/mnt/sparknest:rslave`) keeps a
+   bind of the old FUSE root: the new mount is a sibling on the host, not
+   a child of that bind, so nothing propagates ("Socket not connected").
+   Only binding a parent with rslave (`-v /mnt:/mnt:rslave`) shows the new
+   mount, and open files and cwds inside the old one still break.
+7. **A mount holder** (a small process that owns the connection and
+   forwards requests to the daemon over a Unix socket) would keep
+   io_uring between kernel and holder but adds a hop: 2–2.5 µs per
+   round trip up to 4 KiB, 9 µs at 128 KiB, 44 µs at 1 MiB measured on
+   raptor (memcpy across the socket), i.e. most of what io_uring saved
+   on 4 KiB reads (58–179 → 19–21 µs, M8), plus a second process with its
+   own restart and handle story. Passing the fd back instead of proxying
+   brings back findings 3–5.
+
+**Decision.** ADR-057 item 8 is not built in 0.5.0: FUSE over io_uring
+stays required (the user's standing rule), and a resumed io_uring
+connection can lose requests. The choice between
+"the mount survives restarts" (no io_uring on the mount: 4 KiB reads back
+to 58–179 µs, 128 KiB to 0.4 GB/s; plus the carry-over work in 5) and
+"keep io_uring" (restarts replace the mount) is the user's. Until then
+containers that must ride out a restart bind a parent directory with
+`rslave` and are restarted if they held files open; a restart remains an
+operation to schedule (memory: no restart while the mount is in use).
+
+**Alternatives.** Build the resumable mode behind `fuse.keep_mount =
+true` (forces `io_uring = false`): fd store, `Session::resume` in
+vendored fuser, persisted INIT parameters, NOTIFY_RESEND, handle
+re-derivation, lock and session carry-over, passthrough re-binding; a
+week-scale change with fencing tests first. Wait for kernel support for
+recovering ring requests (none proposed as of 2026-10).
