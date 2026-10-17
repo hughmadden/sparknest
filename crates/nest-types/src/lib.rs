@@ -377,3 +377,43 @@ pub struct PeerRaftStats {
     /// Leader only: milliseconds since the peer last acknowledged.
     pub last_ack_ms: Option<u64>,
 }
+
+/// How this host reaches one peer, for `nest net` (ADR-057).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerNet {
+    pub peer: NodeId,
+    /// Control requests use the LAN standby connection right now.
+    pub control_on_standby: bool,
+    /// Seconds since control last moved (or the standby was set up).
+    pub control_since_s: u64,
+    pub failovers: u64,
+    pub returns: u64,
+    /// The standby connection answers its probes.
+    pub standby_up: bool,
+    pub standby_rtt_us: Option<u64>,
+    pub standby_addr: Option<String>,
+    /// Why control last moved.
+    pub reason: Option<String>,
+    /// An RDMA link is up, and its protocol (3 also carries writes).
+    pub rdma_link: bool,
+    pub rdma_protocol: Option<u32>,
+    /// Link setup failed lately: reads use the TCP lane meanwhile.
+    pub rdma_backing_off: bool,
+    /// TCP lanes open to the peer, and whether they carry writes.
+    pub lanes: u32,
+    pub lanes_writable: bool,
+    /// Raft round trips to the peer as this host measures them.
+    pub raft: Option<PeerRaftStats>,
+}
+
+/// One host's view of the network (`AdminReq::Net`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetReport {
+    pub node: NodeId,
+    pub leader: Option<NodeId>,
+    pub term: u64,
+    pub peers: Vec<PeerNet>,
+    /// The NIC's loss and congestion counters per RDMA port, cumulative
+    /// since the driver loaded, as `name=value` pairs (absent ones left out).
+    pub nic: Vec<(String, Vec<(String, u64)>)>,
+}

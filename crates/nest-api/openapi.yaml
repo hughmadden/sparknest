@@ -1757,6 +1757,28 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 
+  /v1/net:
+    get:
+      tags: [cluster]
+      summary: Every host's view of the network (ADR-057)
+      description: >-
+        Per host and peer: whether control requests use the LAN standby,
+        failovers and returns, the RDMA link and its protocol, TCP lanes,
+        Raft round trips; and each RDMA port's NIC loss counters. A host
+        that does not answer (down, or older than 0.5.0) carries `error`.
+      operationId: net
+      responses:
+        "200":
+          description: One entry per host.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NetStatus"
+        default:
+          $ref: "#/components/responses/Error"
+
   /v1/cluster/remove:
     post:
       tags: [cluster]
@@ -2848,6 +2870,85 @@ components:
         errors:
           type: integer
 
+    NetStatus:
+      type: object
+      required: [node, name, offgrid, error, report]
+      properties:
+        node:
+          type: integer
+        name:
+          type: string
+        offgrid:
+          type: boolean
+        error:
+          type: [string, "null"]
+        report:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/NetReport"
+    NetReport:
+      type: object
+      required: [node, leader, term, peers, nic]
+      properties:
+        node:
+          type: integer
+        leader:
+          type: [integer, "null"]
+        term:
+          type: integer
+        peers:
+          type: array
+          items:
+            $ref: "#/components/schemas/PeerNet"
+        nic:
+          description: Per RDMA port (`device/port`), `[name, value]` counter pairs.
+          type: array
+          items:
+            type: array
+            prefixItems:
+              - type: string
+              - type: array
+                items:
+                  type: array
+                  prefixItems:
+                    - type: string
+                    - type: integer
+    PeerNet:
+      type: object
+      required: [peer, control_on_standby, control_since_s, failovers, returns, standby_up, standby_rtt_us, standby_addr, reason, rdma_link, rdma_protocol, rdma_backing_off, lanes, lanes_writable, raft]
+      properties:
+        peer:
+          type: integer
+        control_on_standby:
+          type: boolean
+        control_since_s:
+          type: integer
+        failovers:
+          type: integer
+        returns:
+          type: integer
+        standby_up:
+          type: boolean
+        standby_rtt_us:
+          type: [integer, "null"]
+        standby_addr:
+          type: [string, "null"]
+        reason:
+          type: [string, "null"]
+        rdma_link:
+          type: boolean
+        rdma_protocol:
+          type: [integer, "null"]
+        rdma_backing_off:
+          type: boolean
+        lanes:
+          type: integer
+        lanes_writable:
+          type: boolean
+        raft:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/PeerRaftStats"
     PeerRaftStats:
       type: object
       required: [peer, voter, heartbeat, append, vote, snapshot, transfer, matched, lag, last_ack_ms]

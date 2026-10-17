@@ -12,6 +12,7 @@ nest-meta.workspace = true
 nest-data.workspace = true
 nest-store.workspace = true
 nest-rpc.workspace = true
+nest-fabric.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -83,6 +83,26 @@ async fn quorum_survives_losing_the_fabric() {
         }
     }
     assert_eq!(read_all(&c, 2, before).await, b"on the fabric");
+    // `nest net` shows it: every host answers, the leader's peers on the
+    // LAN with a reason, and Raft heartbeats measured.
+    let net = c.node(1).placer.net().await.unwrap();
+    assert_eq!(net.len(), 3);
+    for h in &net {
+        assert!(h.error.is_none(), "{}: {:?}", h.name, h.error);
+    }
+    let lr = net
+        .iter()
+        .find(|h| h.node == NodeId(leader))
+        .and_then(|h| h.report.clone())
+        .unwrap();
+    assert_eq!(lr.leader, Some(NodeId(leader)));
+    assert_eq!(lr.peers.len(), 2);
+    for p in &lr.peers {
+        assert!(p.control_on_standby, "{p:?}");
+        assert!(p.standby_up && p.failovers >= 1, "{p:?}");
+        assert!(p.reason.is_some(), "{p:?}");
+        assert!(p.raft.as_ref().is_some_and(|r| r.heartbeat.ok > 0), "{p:?}");
+    }
     for a in 1..=3u64 {
         for b in (1..=3u64).filter(|b| *b != a) {
             let p = c.node(a).rpc.path(NodeId(b)).unwrap();

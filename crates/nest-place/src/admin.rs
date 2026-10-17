@@ -195,6 +195,9 @@ pub(crate) enum AdminReq {
         id: u64,
         cancel: bool,
     },
+    /// How this host reaches each peer (`nest net`, ADR-057). Older hosts
+    /// cannot decode it and answer with an error.
+    Net,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -231,6 +234,7 @@ pub(crate) enum AdminResp {
     Jobs(Vec<crate::placer::ClusterJob>),
     JobStarted(u64),
     HfFetch(crate::hfimport::FetchProgress),
+    Net(Box<nest_types::NetReport>),
 }
 
 /// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
@@ -292,6 +296,78 @@ impl Admin {
         });
         rpc.register(service::ADMIN, Arc::new(AdminService(Arc::downgrade(&a))));
         a
+    }
+
+    /// How this host reaches each peer: control path, RDMA link, TCP lanes,
+    /// Raft round trips; and its NIC's loss counters (ADR-057).
+    pub fn net(&self) -> nest_types::NetReport {
+        let d = self.vfs.data();
+        let meta = d.meta();
+        let m = meta.metrics();
+        let me = d.id();
+        let raft: HashMap<NodeId, nest_types::PeerRaftStats> =
+            meta.raft_peers().into_iter().map(|p| (p.peer, p)).collect();
+        let paths: HashMap<NodeId, nest_rpc::PathState> = meta.rpc().paths().into_iter().collect();
+        let fabric = self.vfs.fabric();
+        let lanes = self.vfs.lanes();
+        let peers = m
+            .membership_config
+            .nodes()
+            .map(|(id, _)| NodeId(*id))
+            .filter(|n| *n != me)
+            .map(|peer| {
+                let path = paths.get(&peer);
+                nest_types::PeerNet {
+                    peer,
+                    control_on_standby: path.is_some_and(|p| p.on_standby),
+                    control_since_s: path
+                        .and_then(|p| p.since.elapsed().ok())
+                        .map_or(0, |d| d.as_secs()),
+                    failovers: path.map_or(0, |p| p.failovers),
+                    returns: path.map_or(0, |p| p.returns),
+                    standby_up: path.is_some_and(|p| p.standby_up),
+                    standby_rtt_us: path
+                        .and_then(|p| p.standby_rtt)
+                        .map(|d| d.as_micros() as u64),
+                    standby_addr: path.and_then(|p| p.standby_addr).map(|a| a.to_string()),
+                    reason: path.and_then(|p| p.reason.clone()),
+                    rdma_link: fabric.as_ref().is_some_and(|f| f.has_link(peer)),
+                    rdma_protocol: fabric.as_ref().and_then(|f| f.link_protocol(peer)),
+                    rdma_backing_off: fabric.as_ref().is_some_and(|f| f.link_failed(peer)),
+                    lanes: lanes.as_ref().map_or(0, |l| l.connected(peer) as u32),
+                    lanes_writable: lanes.as_ref().is_some_and(|l| l.writable(peer)),
+                    raft: raft.get(&peer).cloned(),
+                }
+            })
+            .collect();
+        let nic = fabric
+            .as_ref()
+            .map(|f| nest_fabric::counters::hw_counters(&f.ports()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| {
+                let pairs = [
+                    ("out_of_sequence", c.out_of_sequence),
+                    ("packet_seq_err", c.packet_seq_err),
+                    ("local_ack_timeout_err", c.local_ack_timeout_err),
+                    ("rnr_nak_retry_err", c.rnr_nak_retry_err),
+                    ("np_cnp_sent", c.np_cnp_sent),
+                    ("rp_cnp_handled", c.rp_cnp_handled),
+                    ("roce_adp_retrans", c.roce_adp_retrans),
+                ]
+                .into_iter()
+                .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+                .collect();
+                (format!("{}/{}", c.device, c.port), pairs)
+            })
+            .collect();
+        nest_types::NetReport {
+            node: me,
+            leader: m.current_leader.map(NodeId),
+            term: m.current_term,
+            peers,
+            nic,
+        }
     }
 
     pub fn info(&self) -> NodeInfo {
@@ -485,6 +561,7 @@ impl Handler for AdminService {
             let req: AdminReq = nest_rpc::decode(&body).map_err(|e| e.to_string())?;
             let resp = match req {
                 AdminReq::Info => AdminResp::Info(Box::new(a.info())),
+                AdminReq::Net => AdminResp::Net(Box::new(a.net())),
                 AdminReq::StartReplicate {
                     job,
                     files,

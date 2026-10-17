@@ -243,6 +243,14 @@ enum Cmd {
     /// numbers (ADR-030): an idle local disk first, then whichever source
     /// has the lowest latency × (in flight + 1).
     Io,
+    /// How each host reaches the others: which network control requests
+    /// use, the RDMA link, TCP lanes, Raft round trips, NIC loss counters
+    ///
+    /// Control requests use the fabric and move to the 10G LAN standby only
+    /// when the fabric connection breaks or goes silent; data reads use the
+    /// LAN lane while an RDMA link is down (ADR-057). `ctl lan` marks a peer
+    /// failed over; `rdma off` one whose link is backing off.
+    Net,
     /// Drop the clean page cache on every host (or --host), for cold-cache
     /// benchmarks
     ///
@@ -797,6 +805,123 @@ impl Client {
     }
     async fn post(&self, p: &str, b: Value) -> Result<Value> {
         self.call(Method::POST, p, Some(b)).await
+    }
+}
+
+/// `nest net`: per host, one line per peer.
+fn print_net(v: &serde_json::Value) {
+    let hosts = v.as_array().cloned().unwrap_or_default();
+    let names: std::collections::HashMap<u64, String> = hosts
+        .iter()
+        .map(|h| {
+            (
+                h["node"].as_u64().unwrap_or(0),
+                h["name"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    let us = |x: &serde_json::Value| match x.as_u64() {
+        Some(0) | None => "-".to_string(),
+        Some(u) if u >= 10_000 => format!("{:.0}ms", u as f64 / 1000.0),
+        Some(u) if u >= 1000 => format!("{:.1}ms", u as f64 / 1000.0),
+        Some(u) => format!("{u}us"),
+    };
+    for h in &hosts {
+        let host = h["name"].as_str().unwrap_or("?");
+        let Some(r) = h["report"].as_object() else {
+            println!(
+                "{host}: {}",
+                h["error"]
+                    .as_str()
+                    .unwrap_or("no answer (older than 0.5.0?)")
+            );
+            continue;
+        };
+        let leader = r["leader"]
+            .as_u64()
+            .and_then(|l| names.get(&l).cloned())
+            .unwrap_or_else(|| "none".into());
+        println!("{host}: leader {leader}, term {}", r["term"]);
+        println!(
+            "    {:<9} {:<4} {:>6} {:<8} {:>6} {:>8} {:>8} {:>8} {:>5} {:>5}",
+            "peer", "ctl", "moves", "rdma", "lanes", "hb", "hb max", "standby", "t/o", "lag"
+        );
+        for p in r["peers"].as_array().into_iter().flatten() {
+            let peer = p["peer"]
+                .as_u64()
+                .and_then(|id| names.get(&id).cloned())
+                .unwrap_or_else(|| p["peer"].to_string());
+            let ctl = if p["control_on_standby"].as_bool() == Some(true) {
+                "lan"
+            } else {
+                "fab"
+            };
+            let moves = format!(
+                "{}/{}",
+                p["failovers"].as_u64().unwrap_or(0),
+                p["returns"].as_u64().unwrap_or(0)
+            );
+            let rdma = if p["rdma_link"].as_bool() == Some(true) {
+                format!("up v{}", p["rdma_protocol"].as_u64().unwrap_or(0))
+            } else if p["rdma_backing_off"].as_bool() == Some(true) {
+                "off".to_string()
+            } else {
+                "-".to_string()
+            };
+            let lanes = match (
+                p["lanes"].as_u64().unwrap_or(0),
+                p["lanes_writable"].as_bool(),
+            ) {
+                (0, _) => "-".to_string(),
+                (n, Some(true)) => format!("{n} rw"),
+                (n, _) => format!("{n} r"),
+            };
+            let standby = if p["standby_addr"].is_null() {
+                "-".to_string()
+            } else if p["standby_up"].as_bool() == Some(true) {
+                us(&p["standby_rtt_us"])
+            } else {
+                "down".to_string()
+            };
+            let hb = &p["raft"]["heartbeat"];
+            let lag = p["raft"]["lag"]
+                .as_u64()
+                .map_or("-".to_string(), |l| l.to_string());
+            println!(
+                "    {:<9} {:<4} {:>6} {:<8} {:>6} {:>8} {:>8} {:>8} {:>5} {:>5}",
+                peer,
+                ctl,
+                moves,
+                rdma,
+                lanes,
+                us(&hb["ewma_us"]),
+                us(&hb["max_10s_us"]),
+                standby,
+                hb["timeouts"].as_u64().unwrap_or(0),
+                lag,
+            );
+            if let Some(why) = p["reason"].as_str()
+                && p["control_on_standby"].as_bool() == Some(true)
+            {
+                println!(
+                    "              on the LAN since {}s: {why}",
+                    p["control_since_s"]
+                );
+            }
+        }
+        for port in r["nic"].as_array().into_iter().flatten() {
+            let name = port[0].as_str().unwrap_or("?");
+            let vals: Vec<String> = port[1]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|kv| kv[1].as_u64().unwrap_or(0) > 0)
+                .map(|kv| format!("{}={}", kv[0].as_str().unwrap_or("?"), kv[1]))
+                .collect();
+            if !vals.is_empty() {
+                println!("    nic {name}: {}", vals.join(" "));
+            }
+        }
     }
 }
 
@@ -1738,6 +1863,14 @@ async fn main() -> Result<()> {
                 {
                     wait_job(&c, id).await?;
                 }
+            }
+            v
+        }
+        Cmd::Net => {
+            let v = c.get("/v1/net").await?;
+            if !cli.json {
+                print_net(&v);
+                return Ok(());
             }
             v
         }

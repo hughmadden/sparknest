@@ -13,6 +13,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// One host's answer to `Placer::net`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NetStatus {
+    pub node: NodeId,
+    pub name: String,
+    pub offgrid: bool,
+    pub error: Option<String>,
+    pub report: Option<nest_types::NetReport>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostRef {
     pub node: NodeId,
@@ -706,6 +716,34 @@ impl Placer {
                 info: r.ok(),
             })
             .collect())
+    }
+
+    /// Every host's view of the network (`nest net`, ADR-057). A host that
+    /// cannot answer (down, or older than 0.5.0) carries its error.
+    pub async fn net(&self) -> NestResult<Vec<NetStatus>> {
+        let nodes = self.nodes()?;
+        let reports = futures::future::join_all(nodes.into_iter().map(|h| async move {
+            let r = if h.node == self.vfs.data().id() {
+                Ok(self.admin.net())
+            } else {
+                admin::call(self.rpc(), h.node, &AdminReq::Net, Duration::from_secs(3))
+                    .await
+                    .and_then(|r| match r {
+                        AdminResp::Net(n) => Ok(*n),
+                        AdminResp::Err(e) => Err(NestError::Io(e)),
+                        _ => Err(NestError::Io("unexpected".into())),
+                    })
+            };
+            NetStatus {
+                node: h.node,
+                name: h.name,
+                offgrid: h.offgrid,
+                error: r.as_ref().err().map(|e| e.to_string()),
+                report: r.ok(),
+            }
+        }))
+        .await;
+        Ok(reports)
     }
 
     /// Which hosts hold a complete current copy of everything selected.

@@ -1125,6 +1125,7 @@ dependencies = [
  "bytes",
  "futures",
  "nest-data",
+ "nest-fabric",
  "nest-meta",
  "nest-rpc",
  "nest-store",

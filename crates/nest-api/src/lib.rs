@@ -207,6 +207,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/web", get(web_info))
         .route("/v1/cluster", get(cluster))
         .route("/v1/cluster/raft", get(cluster_raft))
+        .route("/v1/net", get(net))
         .route("/v1/cluster/remove", post(cluster_remove))
         .route("/v1/cluster/role", post(cluster_role))
         .route("/v1/cluster/add", post(cluster_add))
@@ -1050,6 +1051,12 @@ async fn cluster_raft(State(api): State<Api>) -> R<serde_json::Value> {
         "term": m.current_term,
         "peers": meta.raft_peers(),
     })))
+}
+
+/// Every host's view of the network: control path, RDMA link, TCP lanes,
+/// Raft round trips, NIC loss counters (ADR-057).
+async fn net(State(api): State<Api>) -> R<Vec<nest_place::placer::NetStatus>> {
+    Ok(Json(api.placer.net().await?))
 }
 
 #[derive(Deserialize)]

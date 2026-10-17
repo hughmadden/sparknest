@@ -207,6 +207,14 @@ impl Node {
             mc.join_incarnation = inc.clone();
         }
         let meta = MetaNode::start(mc, rpc.clone(), handler).await?;
+        // A host whose control requests have fallen back to the LAN is not
+        // handed leadership (ADR-057): its fabric link is degraded.
+        {
+            let rpc = rpc.clone();
+            meta.set_peer_health(Arc::new(move |peer| {
+                !rpc.path(peer).is_some_and(|p| p.on_standby)
+            }));
+        }
         let voters: BTreeMap<u64, BasicNode> = cfg
             .cluster
             .members
