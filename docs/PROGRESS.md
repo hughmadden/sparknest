@@ -3,6 +3,29 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-17 — 0.5.0 in progress: remote writes over RDMA (ADR-057 item 4)
+
+- A write to a file another host owns is pulled by the owner: the writer
+  SENDs a 64-byte `WriteReq` naming a remote-readable outgoing slot, the
+  owner RDMA-READs it into a staging slot of its own (queued when none is
+  free, never reserved per writer), applies it through the same
+  `owner_mutate` as every remote write and SENDs `WriteDone`. Fabric
+  protocol 3; links record the lower protocol, so 0.4 hosts (2) still pair
+  for reads and take writes over TCP. QPs now allow 16 outstanding READs.
+- Without a link, writes use a TCP lane to the owner that takes them (lane
+  frame kind 4, after a probe: a 0.4 host closes a lane on unknown
+  frames), then the control connection. A write whose answer is lost is
+  EIO, never resent.
+- Appends at the owner are serialised per object: two concurrent appends
+  could read the same end and overwrite each other.
+- raptor loopback, 1 MiB writes at 8 in flight: 52 GB/s over RDMA against
+  13 GB/s over loopback TCP, and a control call behind them waits p99
+  115 us instead of 1.2–3.4 ms ([M12-REMOTE-WRITES](../benchmarks/M12-REMOTE-WRITES.md)).
+  Through the VFS both stop near 2 GB/s per file (the apply path).
+- Found, not fixed (predates this work): concurrent first writes from
+  several hosts to a STABLE file can fail `Unavailable("no reachable node
+  holds this file")` while ownership is being granted.
+
 ## 2026-10-17 — 0.4.4: reads ride out elections, EIO logged, archive snapshots on SMB (ADR-056)
 
 - Investigated a silent EIO during a model load (2026-10-16): the fabric
