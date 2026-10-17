@@ -301,3 +301,69 @@ async fn served_objects_are_not_held_open() {
     })
     .await;
 }
+
+/// Remote writes without RDMA (this cluster has no fabric and fabric hosts
+/// keep no lanes to each other): over the control connection, each applied
+/// once, with appends from two remote hosts landing whole at the end the
+/// owner chooses (ADR-057).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn remote_writes_and_appends_from_two_hosts() {
+    let c = ready(3).await;
+    let f = file(&c, 1, "log", b"start\n").await;
+    // Hosts 2 and 3 append; host 1, which holds the content, owns it.
+    let rec = 1000usize;
+    let mut tasks = Vec::new();
+    let mut handles = Vec::new();
+    for node in [2u64, 3] {
+        let v = c.node(node).vfs.clone();
+        let (fh, _) = v.open(f, oflags::WRONLY | oflags::APPEND).await.unwrap();
+        handles.push((node, fh));
+        // Join the epoch first: concurrent first writes to a STABLE file
+        // race for ownership ("no reachable node holds this file"), a
+        // separate issue from how the bytes travel.
+        let first: Vec<u8> = [node as u8, 255]
+            .iter()
+            .copied()
+            .cycle()
+            .take(rec)
+            .collect();
+        v.write(fh, 0, first).await.unwrap();
+        for t in 0..4u8 {
+            let v = v.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..10u8 {
+                    let tag = [node as u8, t * 10 + i];
+                    let r: Vec<u8> = tag.iter().copied().cycle().take(rec).collect();
+                    assert_eq!(v.write(fh, 0, r).await.unwrap() as usize, rec);
+                }
+            }));
+        }
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_eq!(c.attr(2, f).unwrap().owner, Some(NodeId(1)));
+    // A positioned write from host 3 over the head.
+    let (fh, _) = c.node(3).vfs.open(f, oflags::WRONLY).await.unwrap();
+    c.node(3).vfs.write(fh, 0, b"START".to_vec()).await.unwrap();
+    c.node(3).vfs.release(fh, None).await;
+    for (node, fh) in handles {
+        c.node(node).vfs.release(fh, None).await;
+    }
+    wait_stable(&c, f).await;
+    let got = read_all(&c, 2, f).await;
+    assert_eq!(&got[..6], b"START\n");
+    let body = &got[6..];
+    assert_eq!(body.len(), 82 * rec, "lost or duplicated appends");
+    let mut seen: Vec<(u8, u8)> = body
+        .chunks(rec)
+        .map(|r| {
+            assert!(r.chunks(2).all(|p| p == &r[..2]), "appends overlapped");
+            (r[0], r[1])
+        })
+        .collect();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 82);
+    assert_eq!(read_all(&c, 3, f).await, got);
+}

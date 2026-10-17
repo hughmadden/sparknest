@@ -165,6 +165,9 @@ struct Owned {
     open: tokio::sync::RwLock<bool>,
     /// Bumped on every mutation; a lingering finalize aborts if it moved.
     activity: AtomicU64,
+    /// Held from choosing an append's offset (the end) until its bytes are
+    /// written, so concurrent appends from any writers never overlap.
+    append: Mutex<()>,
     /// True once revocation completed; mutations wait for it.
     fenced: watch::Receiver<bool>,
 }
@@ -569,9 +572,12 @@ impl Vfs {
     pub fn attach_fabric(self: &Arc<Self>, fabric: Arc<nest_fabric::Fabric>) {
         let src: Arc<dyn nest_fabric::ReadSource> = self.clone();
         fabric.set_source(Arc::downgrade(&src));
+        let sink: Arc<dyn nest_fabric::WriteSink> = self.clone();
+        fabric.set_sink(Arc::downgrade(&sink));
         fabric.set_io_stats(self.io.clone());
-        // The fabric holds a Weak; keep the trait object alive with us.
+        // The fabric holds Weaks; keep the trait objects alive with us.
         std::mem::forget(src);
+        std::mem::forget(sink);
         *self.fabric.lock() = Some(fabric);
     }
 
@@ -584,13 +590,33 @@ impl Vfs {
     pub fn attach_lanes(self: &Arc<Self>, lanes: Arc<nest_fabric::tcp::Lanes>) {
         let src: Arc<dyn nest_fabric::ReadSource> = self.clone();
         lanes.set_source(Arc::downgrade(&src));
-        // The lanes hold a Weak; keep the trait object alive with us.
+        let sink: Arc<dyn nest_fabric::WriteSink> = self.clone();
+        lanes.set_sink(Arc::downgrade(&sink));
+        // The lanes hold Weaks; keep the trait objects alive with us.
         std::mem::forget(src);
+        std::mem::forget(sink);
         *self.lanes.lock() = Some(lanes);
     }
 
     pub fn lanes(&self) -> Option<Arc<nest_fabric::tcp::Lanes>> {
         self.lanes.lock().clone()
+    }
+
+    /// Replace the transports this host sends with (serving is unchanged),
+    /// returning the old ones: benchmarks compare paths with it.
+    #[doc(hidden)]
+    pub fn swap_transports(
+        &self,
+        fabric: Option<Arc<nest_fabric::Fabric>>,
+        lanes: Option<Arc<nest_fabric::tcp::Lanes>>,
+    ) -> (
+        Option<Arc<nest_fabric::Fabric>>,
+        Option<Arc<nest_fabric::tcp::Lanes>>,
+    ) {
+        (
+            std::mem::replace(&mut *self.fabric.lock(), fabric),
+            std::mem::replace(&mut *self.lanes.lock(), lanes),
+        )
     }
 
     /// How to fetch whole chunks from `peer`: TCP lanes when either end is
@@ -1209,6 +1235,7 @@ impl Vfs {
             participants: Mutex::new(HashSet::new()),
             open: tokio::sync::RwLock::new(true),
             activity: AtomicU64::new(0),
+            append: Mutex::new(()),
             fenced,
         });
         let mut owned = self.owned.lock();
@@ -1420,15 +1447,19 @@ impl Vfs {
         }
         o.activity.fetch_add(1, Ordering::SeqCst);
         let f = o.file.clone();
+        let o2 = o.clone();
         let resp = tokio::task::spawn_blocking(move || -> std::io::Result<DataResp> {
             match op {
                 OwnerOp::Write {
-                    offset,
-                    append,
-                    data,
+                    append: true, data, ..
                 } => {
-                    let off = if append { f.metadata()?.len() } else { offset };
-                    f.write_all_at(&data, off)?;
+                    // The owner chooses an append's offset: the end, now.
+                    let _end = o2.append.lock();
+                    f.write_all_at(&data, f.metadata()?.len())?;
+                    Ok(DataResp::Written(data.len() as u32))
+                }
+                OwnerOp::Write { offset, data, .. } => {
+                    f.write_all_at(&data, offset)?;
                     Ok(DataResp::Written(data.len() as u32))
                 }
                 OwnerOp::Truncate(size) => {
@@ -1454,6 +1485,27 @@ impl Vfs {
             self.schedule_finalize(file);
         }
         Ok(resp)
+    }
+
+    /// A write from another host, however it arrived (the control
+    /// connection, an RDMA pull, a TCP lane): one path, one set of checks.
+    async fn owner_write(&self, op: nest_fabric::WriteOp, data: bytes::Bytes) -> NestResult<u32> {
+        let resp = self
+            .owner_mutate(
+                op.file,
+                op.epoch,
+                Some(op.writer),
+                OwnerOp::Write {
+                    offset: op.offset,
+                    append: op.append,
+                    data,
+                },
+            )
+            .await?;
+        match resp {
+            DataResp::Written(n) => Ok(n),
+            other => Err(NestError::Io(format!("unexpected response {other:?}"))),
+        }
     }
 
     async fn owner_leave(&self, file: FileId, epoch: Epoch, writer: Writer) {
@@ -1509,19 +1561,19 @@ impl Vfs {
                 offset,
                 append,
                 data,
-            } => {
-                self.owner_mutate(
-                    file,
-                    epoch,
-                    Some(writer),
-                    OwnerOp::Write {
+            } => self
+                .owner_write(
+                    nest_fabric::WriteOp {
+                        file,
+                        epoch,
+                        writer,
                         offset,
                         append,
-                        data,
                     },
+                    data.into(),
                 )
                 .await
-            }
+                .map(DataResp::Written),
             DataReq::Truncate {
                 file,
                 epoch,
@@ -2401,12 +2453,12 @@ impl Vfs {
         o.participants.lock().insert((self.me(), fh));
         o.activity.fetch_add(1, Ordering::SeqCst);
         let r = (|| {
-            let off = if h.append {
-                o.file.metadata()?.len()
+            if h.append {
+                let _end = o.append.lock();
+                o.file.write_all_at(data, o.file.metadata()?.len())?;
             } else {
-                offset
-            };
-            o.file.write_all_at(data, off)?;
+                o.file.write_all_at(data, offset)?;
+            }
             Ok::<_, std::io::Error>(data.len() as u32)
         })();
         Some(r.map_err(io))
@@ -2420,7 +2472,7 @@ impl Vfs {
         let op = OwnerOp::Write {
             offset,
             append: h.append,
-            data,
+            data: data.into(),
         };
         match self.mutate(&h, fh, false, op).await? {
             DataResp::Written(n) => Ok(n),
@@ -2482,32 +2534,47 @@ impl Vfs {
                 self.owner_mutate(h.file, epoch, Some(writer), op.clone())
                     .await
             } else {
-                let req = match &op {
+                let r = match &op {
                     OwnerOp::Write {
                         offset,
                         append,
                         data,
-                    } => DataReq::Write {
-                        file: h.file,
-                        epoch,
-                        writer,
-                        offset: *offset,
-                        append: *append,
-                        data: data.clone(),
-                    },
-                    OwnerOp::Truncate(size) => DataReq::Truncate {
-                        file: h.file,
-                        epoch,
-                        writer: Some(writer),
-                        size: *size,
-                    },
-                    OwnerOp::Fsync { data_only } => DataReq::Fsync {
-                        file: h.file,
-                        epoch,
-                        data_only: *data_only,
-                    },
+                    } => {
+                        let op = nest_fabric::WriteOp {
+                            file: h.file,
+                            epoch,
+                            writer,
+                            offset: *offset,
+                            append: *append,
+                        };
+                        self.remote_write(owner, op, data.clone())
+                            .await
+                            .map(DataResp::Written)
+                    }
+                    OwnerOp::Truncate(size) => {
+                        self.call(
+                            owner,
+                            &DataReq::Truncate {
+                                file: h.file,
+                                epoch,
+                                writer: Some(writer),
+                                size: *size,
+                            },
+                        )
+                        .await
+                    }
+                    OwnerOp::Fsync { data_only } => {
+                        self.call(
+                            owner,
+                            &DataReq::Fsync {
+                                file: h.file,
+                                epoch,
+                                data_only: *data_only,
+                            },
+                        )
+                        .await
+                    }
                 };
-                let r = self.call(owner, &req).await;
                 if r.is_ok() {
                     *h.remote.lock() = Some((owner, epoch));
                 }
@@ -2522,6 +2589,57 @@ impl Vfs {
             }
         }
         Err(NestError::Busy("ownership kept changing".into()))
+    }
+
+    /// Send a write to `owner` (ADR-057): over RDMA when a link to it speaks
+    /// writes, else over a TCP lane that takes them, else in a request on
+    /// the control connection. A transport is skipped only when the write
+    /// never reached the owner (`WriteError::Unsent`). Once it may have,
+    /// its error is final: a write whose answer was lost is EIO, never
+    /// resent, since a resent append would land twice.
+    async fn remote_write(
+        &self,
+        owner: NodeId,
+        op: nest_fabric::WriteOp,
+        data: bytes::Bytes,
+    ) -> NestResult<u32> {
+        use nest_fabric::WriteError;
+        let fabric = self
+            .fabric()
+            .filter(|f| data.len() <= f.max_write() && !self.offgrid_hosts().contains(&owner));
+        if let Some(f) = fabric {
+            match f.write(owner, op, &data).await {
+                Ok(n) => return Ok(n),
+                Err(WriteError::Failed(e)) => return Err(e),
+                Err(WriteError::Unsent(e)) => {
+                    tracing::debug!(%owner, error = %e, "write not sent over RDMA");
+                }
+            }
+        }
+        if let Some(l) = self
+            .lanes()
+            .filter(|l| data.len() <= l.chunk() && l.writable(owner))
+        {
+            match l.write(owner, op, data.clone()).await {
+                Ok(n) => return Ok(n),
+                Err(WriteError::Failed(e)) => return Err(e),
+                Err(WriteError::Unsent(e)) => {
+                    tracing::debug!(%owner, error = %e, "write not sent over a TCP lane");
+                }
+            }
+        }
+        let req = DataReq::Write {
+            file: op.file,
+            epoch: op.epoch,
+            writer: op.writer,
+            offset: op.offset,
+            append: op.append,
+            data: data.to_vec(),
+        };
+        match self.call(owner, &req).await? {
+            DataResp::Written(n) => Ok(n),
+            other => Err(NestError::Io(format!("unexpected response {other:?}"))),
+        }
     }
 
     /// Catch up with the leader, bounded by one lease. False if we could not.
@@ -3098,6 +3216,19 @@ impl nest_fabric::ReadSource for Vfs {
     }
 }
 
+/// Writes other hosts send over RDMA or TCP lanes: applied exactly as a
+/// `DataReq::Write` is.
+impl nest_fabric::WriteSink for Vfs {
+    fn write(
+        &self,
+        op: nest_fabric::WriteOp,
+        data: bytes::Bytes,
+    ) -> futures::future::BoxFuture<'static, Result<u32, NestError>> {
+        let me = self.arc();
+        Box::pin(async move { me.owner_write(op, data).await })
+    }
+}
+
 /// `Inflight` for reads that outlive a borrow (served through the fabric's
 /// ring).
 struct InflightOwned {
@@ -3126,7 +3257,9 @@ enum OwnerOp {
     Write {
         offset: u64,
         append: bool,
-        data: Vec<u8>,
+        /// Shared, not copied: an RDMA write's bytes stay in the fabric's
+        /// staging slot until applied.
+        data: bytes::Bytes,
     },
     Truncate(u64),
     Fsync {

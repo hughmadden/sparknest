@@ -247,3 +247,157 @@ async fn fast_path_readahead_from_a_non_runtime_thread() {
     assert_eq!(total, size);
     c.node(2).vfs.release(rfh, None).await;
 }
+
+/// ADR-057: writes to a file another host owns travel over RDMA (the
+/// owner pulls them), land exactly once with the right bytes, and appends
+/// from two hosts never overlap. Also measures 1 MiB remote writes against
+/// the same writes over the control connection (`NEST_BENCH_MIB` sizes it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn remote_writes_go_over_rdma() {
+    let Some(c) = fabric_cluster(3).await else {
+        return;
+    };
+    let v1 = &c.node(1).vfs;
+    let (a, fh1, _) = v1
+        .create(FileId::ROOT, b"shared", 0o644, oflags::RDWR)
+        .await
+        .unwrap();
+    v1.write(fh1, 0, b"head".to_vec()).await.unwrap();
+    c.converge().await;
+    let v2 = &c.node(2).vfs;
+    let (fh2, _) = v2.open(a.id, oflags::RDWR).await.unwrap();
+    let f1 = c.node(1).fabric().unwrap();
+    let f2 = c.node(2).fabric().unwrap();
+    let pulled = || f1.stats.pulled.load(Ordering::Relaxed);
+    let before = pulled();
+    let data: Vec<u8> = (0..(3u64 << 20) + 777).map(pattern).collect();
+    for (i, chunk) in data.chunks(1 << 20).enumerate() {
+        let n = v2
+            .write(fh2, 4 + ((i as u64) << 20), chunk.to_vec())
+            .await
+            .unwrap();
+        assert_eq!(n as usize, chunk.len());
+    }
+    assert_eq!(c.attr(2, a.id).unwrap().owner, Some(NodeId(1)));
+    assert_eq!(pulled() - before, 4, "writes did not go over RDMA");
+    assert!(f2.stats.writes.load(Ordering::Relaxed) >= 4);
+    // Node 3 reads through the owner: the bytes as written.
+    let v3 = &c.node(3).vfs;
+    let (rfh, _) = v3.open(a.id, 0).await.unwrap();
+    let mut got = Vec::new();
+    loop {
+        let b = v3.read(rfh, got.len() as u64, 1 << 20).await.unwrap();
+        if b.is_empty() {
+            break;
+        }
+        got.extend_from_slice(&b);
+    }
+    v3.release(rfh, None).await;
+    assert_eq!(&got[..4], b"head");
+    assert!(got[4..] == data[..], "remote write bytes differ");
+    v2.release(fh2, None).await;
+    v1.release(fh1, None).await;
+
+    // Appends from two hosts at once, one over RDMA and one local.
+    let (b, fh, _) = v1
+        .create(FileId::ROOT, b"log", 0o644, oflags::WRONLY | oflags::APPEND)
+        .await
+        .unwrap();
+    v1.write(fh, 0, vec![0u8; 0]).await.unwrap();
+    c.converge().await;
+    let (fh2, _) = v2
+        .open(b.id, oflags::WRONLY | oflags::APPEND)
+        .await
+        .unwrap();
+    let rec = 4096usize;
+    let mut tasks = Vec::new();
+    for (node, h) in [(1u64, fh), (2, fh2)] {
+        for t in 0..4u8 {
+            let v = c.node(node).vfs.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..16u8 {
+                    let tag = [node as u8, t * 16 + i];
+                    let rec: Vec<u8> = tag.iter().copied().cycle().take(rec).collect();
+                    v.write(h, 0, rec).await.unwrap();
+                }
+            }));
+        }
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    v2.release(fh2, None).await;
+    v1.release(fh, None).await;
+    c.eventually("log stable", Duration::from_secs(5), |c| {
+        c.attr(3, b.id)
+            .is_some_and(|x| x.gen_state == GenState::Stable)
+    })
+    .await;
+    let bytes = std::fs::read(c.node(1).data.store().path(nest_store::ObjectKey::new(
+        b.id,
+        c.attr(1, b.id).unwrap().generation,
+    )))
+    .unwrap();
+    assert_eq!(bytes.len(), 2 * 64 * rec, "lost or duplicated appends");
+    let mut seen: Vec<(u8, u8)> = bytes
+        .chunks(rec)
+        .map(|r| {
+            assert!(r.chunks(2).all(|p| p == &r[..2]), "appends overlapped");
+            (r[0], r[1])
+        })
+        .collect();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 128);
+
+    // 1 MiB remote writes: RDMA, then the same over the control connection
+    // (a fabric limited to protocol 2 cannot write).
+    let mib: u64 = std::env::var("NEST_BENCH_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let (d, fh1, _) = v1
+        .create(FileId::ROOT, b"bench", 0o644, oflags::RDWR)
+        .await
+        .unwrap();
+    v1.write(fh1, 0, vec![1]).await.unwrap();
+    c.converge().await;
+    let (fh2, _) = v2.open(d.id, oflags::RDWR).await.unwrap();
+    let buf = vec![7u8; 1 << 20];
+    let run = |inflight: usize| {
+        let v2 = v2.clone();
+        let buf = buf.clone();
+        async move {
+            let t = std::time::Instant::now();
+            let mut done = 0u64;
+            while done < mib {
+                let batch: Vec<_> = (0..inflight as u64)
+                    .take_while(|k| done + k < mib)
+                    .map(|k| v2.write(fh2, (done + k) << 20, buf.clone()))
+                    .collect();
+                let n = batch.len() as u64;
+                for r in futures::future::join_all(batch).await {
+                    r.unwrap();
+                }
+                done += n;
+            }
+            (mib << 20) as f64 / t.elapsed().as_secs_f64() / 1e9
+        }
+    };
+    let before = pulled();
+    let rdma1 = run(1).await;
+    let rdma8 = run(8).await;
+    assert_eq!(pulled() - before, 2 * mib, "bench writes not over RDMA");
+    // Force the control connection: no fabric, no lanes for this node.
+    let saved = c.node(2).vfs.swap_transports(None, None);
+    let tcp1 = run(1).await;
+    let tcp8 = run(8).await;
+    assert_eq!(pulled() - before, 2 * mib, "control writes went over RDMA");
+    c.node(2).vfs.swap_transports(saved.0, saved.1);
+    eprintln!(
+        "remote 1 MiB writes, {mib} MiB: RDMA {rdma1:.2} GB/s (1 in flight), {rdma8:.2} GB/s (8); \
+         control TCP {tcp1:.2} GB/s (1), {tcp8:.2} GB/s (8)"
+    );
+    v2.release(fh2, None).await;
+    v1.release(fh1, None).await;
+}
