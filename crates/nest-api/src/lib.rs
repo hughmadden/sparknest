@@ -206,6 +206,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/drop-caches", post(drop_caches))
         .route("/v1/web", get(web_info))
         .route("/v1/cluster", get(cluster))
+        .route("/v1/cluster/raft", get(cluster_raft))
         .route("/v1/cluster/remove", post(cluster_remove))
         .route("/v1/cluster/role", post(cluster_role))
         .route("/v1/cluster/add", post(cluster_add))
@@ -1037,6 +1038,20 @@ async fn cluster(State(api): State<Api>) -> R<serde_json::Value> {
     Ok(Json(api.placer.membership()?))
 }
 
+/// This host's view of each Raft peer (ADR-057): round trips its Raft
+/// network measured per kind of request, and replication progress when it
+/// leads.
+async fn cluster_raft(State(api): State<Api>) -> R<serde_json::Value> {
+    let meta = api.vfs.data().meta();
+    let m = meta.metrics();
+    Ok(Json(json!({
+        "me": meta.id(),
+        "leader": m.current_leader,
+        "term": m.current_term,
+        "peers": meta.raft_peers(),
+    })))
+}
+
 #[derive(Deserialize)]
 struct RemoveReq {
     host: String,
@@ -1729,13 +1744,21 @@ async fn settings(State(api): State<Api>) -> R<serde_json::Value> {
         .map_err(|e| NestError::Io(format!("metadata: {e}")))?
         .into_iter()
         .collect();
+    let names: HashMap<u64, String> = api
+        .placer
+        .nodes()
+        .map(|n| n.into_iter().map(|h| (h.node.0, h.name)).collect())
+        .unwrap_or_default();
     let all: Vec<_> = nest_types::Setting::ALL
         .iter()
         .map(|s| {
             let (min, max) = s.range();
+            let value = set.get(s.name()).copied().unwrap_or(s.default_value());
             json!({
                 "name": s.name(),
-                "value": set.get(s.name()).copied().unwrap_or(s.default_value()),
+                "value": value,
+                // A host-valued setting: the host's name (none when 0).
+                "host": s.is_host().then(|| names.get(&value).cloned()).flatten(),
                 "default": s.default_value(),
                 "set": set.contains_key(s.name()),
                 "unit": s.unit(),
@@ -1750,7 +1773,100 @@ async fn settings(State(api): State<Api>) -> R<serde_json::Value> {
 
 #[derive(Deserialize)]
 struct SettingReq {
-    value: u64,
+    value: SettingValue,
+}
+
+/// A number in the setting's unit, or for a host-valued setting
+/// (`preferred-leader`) a host name, stored as its node id.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SettingValue {
+    Number(u64),
+    Host(String),
+}
+
+fn setting_value(api: &Api, s: nest_types::Setting, v: SettingValue) -> Result<u64, ApiError> {
+    match v {
+        SettingValue::Host(h) if s.is_host() && h.parse::<u64>().is_err() => {
+            let hosts: Vec<(u64, String)> = api
+                .placer
+                .nodes()?
+                .into_iter()
+                .map(|h| (h.node.0, h.name))
+                .collect();
+            host_value(s, SettingValue::Host(h), &hosts)
+        }
+        v => host_value(s, v, &[]),
+    }
+}
+
+/// A setting's value from a request: a number, or for a host-valued
+/// setting a host's name (or `node<id>`) among `hosts`.
+fn host_value(
+    s: nest_types::Setting,
+    v: SettingValue,
+    hosts: &[(u64, String)],
+) -> Result<u64, ApiError> {
+    match v {
+        SettingValue::Number(n) => Ok(n),
+        SettingValue::Host(h) if s.is_host() => {
+            if let Ok(n) = h.parse() {
+                return Ok(n);
+            }
+            hosts
+                .iter()
+                .find(|(id, name)| *name == h || format!("node{id}") == h)
+                .map(|(id, _)| *id)
+                .ok_or_else(|| bad(format!("unknown host {h:?}")))
+        }
+        SettingValue::Host(h) => Err(bad(format!(
+            "{} takes a number ({}), not {h:?}",
+            s.name(),
+            s.unit()
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod setting_tests {
+    use super::{SettingValue, host_value};
+    use nest_types::Setting;
+
+    fn parse(v: serde_json::Value) -> SettingValue {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_host_setting_takes_a_name_or_an_id() {
+        let hosts = vec![(1, "raptor".to_string()), (4, "kiwi".to_string())];
+        let s = Setting::PreferredLeader;
+        let v = |j| host_value(s, parse(j), &hosts).map_err(|e| e.1);
+        assert_eq!(v(serde_json::json!("raptor")), Ok(1));
+        assert_eq!(v(serde_json::json!("node4")), Ok(4));
+        assert_eq!(v(serde_json::json!("4")), Ok(4));
+        assert_eq!(v(serde_json::json!(7)), Ok(7));
+        assert!(v(serde_json::json!("@all")).is_err());
+        assert!(
+            v(serde_json::json!("emu"))
+                .unwrap_err()
+                .contains("unknown host")
+        );
+        let w = host_value(
+            Setting::ReadRecoveryWait,
+            parse(serde_json::json!("raptor")),
+            &hosts,
+        );
+        assert!(w.is_err());
+        assert_eq!(
+            host_value(
+                Setting::ReadRecoveryWait,
+                parse(serde_json::json!(5000)),
+                &[]
+            )
+            .map_err(|e| e.1),
+            Ok(5000)
+        );
+    }
 }
 
 fn known_setting(name: &str) -> Result<nest_types::Setting, ApiError> {
@@ -1786,15 +1902,34 @@ async fn set_setting(
     Json(r): Json<SettingReq>,
 ) -> R<serde_json::Value> {
     let s = known_setting(&name)?;
+    let value = setting_value(&api, s, r.value)?;
     let (min, max) = s.range();
-    if !(min..=max).contains(&r.value) {
+    if !(min..=max).contains(&value) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             format!("{name} must be {min}..={max} {}", s.unit()),
         ));
     }
-    put_setting(&api, s, Some(r.value)).await?;
-    Ok(Json(json!({ "name": name, "value": r.value })))
+    if s.is_host() && value != 0 {
+        let voter = api
+            .vfs
+            .data()
+            .meta()
+            .metrics()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|v| v == value);
+        if !voter {
+            return Err(bad(format!(
+                "node {value} is not a voter; only a voter can lead"
+            )));
+        }
+    }
+    // 0 for a host means none: back to the default.
+    let stored = (!(s.is_host() && value == 0)).then_some(value);
+    put_setting(&api, s, stored).await?;
+    Ok(Json(json!({ "name": name, "value": value })))
 }
 
 async fn reset_setting(State(api): State<Api>, Path(name): Path<String>) -> R<serde_json::Value> {

@@ -276,14 +276,18 @@ pub enum Setting {
     /// How long a read keeps retrying through a leader change or a lost
     /// metadata quorum before it fails with EIO (milliseconds).
     ReadRecoveryWait,
+    /// The host the leader hands leadership to once that host has been up,
+    /// caught up and reachable for a while (ADR-057). A node id; 0 is none.
+    PreferredLeader,
 }
 
 impl Setting {
-    pub const ALL: &'static [Setting] = &[Setting::ReadRecoveryWait];
+    pub const ALL: &'static [Setting] = &[Setting::ReadRecoveryWait, Setting::PreferredLeader];
 
     pub fn name(self) -> &'static str {
         match self {
             Setting::ReadRecoveryWait => "read-recovery-wait",
+            Setting::PreferredLeader => "preferred-leader",
         }
     }
 
@@ -294,12 +298,14 @@ impl Setting {
     pub fn default_value(self) -> u64 {
         match self {
             Setting::ReadRecoveryWait => 5_000,
+            Setting::PreferredLeader => 0,
         }
     }
 
     pub fn unit(self) -> &'static str {
         match self {
             Setting::ReadRecoveryWait => "ms",
+            Setting::PreferredLeader => "node",
         }
     }
 
@@ -308,6 +314,9 @@ impl Setting {
             Setting::ReadRecoveryWait => {
                 "how long reads retry through a leader change or lost quorum before EIO"
             }
+            Setting::PreferredLeader => {
+                "host the metadata leader moves to once it is settled (0: none)"
+            }
         }
     }
 
@@ -315,6 +324,56 @@ impl Setting {
     pub fn range(self) -> (u64, u64) {
         match self {
             Setting::ReadRecoveryWait => (0, 120_000),
+            Setting::PreferredLeader => (0, u32::MAX as u64),
         }
     }
+
+    /// The value is a host (its node id): `nest config set` also takes the
+    /// host's name.
+    pub fn is_host(self) -> bool {
+        matches!(self, Setting::PreferredLeader)
+    }
+}
+
+/// Round trips of one kind of Raft request to one peer, as this host's Raft
+/// network measured them (ADR-057). Times in microseconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RttStats {
+    /// Requests that got an answer (including an error answer).
+    pub ok: u64,
+    /// Smoothed round trip (EWMA, weight 1/8 per sample).
+    pub ewma_us: u64,
+    pub last_us: u64,
+    /// Slowest answer in the last 10 to 20 seconds.
+    pub max_10s_us: u64,
+    /// No answer within the request's budget.
+    pub timeouts: u64,
+    /// Not sent: no connection to the peer.
+    pub unreachable: u64,
+    /// Answered with an error (e.g. a peer that cannot decode the request).
+    pub errors: u64,
+}
+
+/// One Raft peer as this host sees it (ADR-057). Replication progress is
+/// known only on the leader.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRaftStats {
+    pub peer: NodeId,
+    pub voter: bool,
+    /// Empty append-entries (openraft's heartbeats).
+    pub heartbeat: RttStats,
+    /// Append-entries carrying entries.
+    pub append: RttStats,
+    /// Votes and pre-votes.
+    pub vote: RttStats,
+    /// Snapshot chunks.
+    pub snapshot: RttStats,
+    /// Leadership handoffs sent (ADR-057).
+    pub transfer: RttStats,
+    /// Leader only: the last log index known to be on the peer.
+    pub matched: Option<u64>,
+    /// Leader only: how many entries the peer is behind the leader's log.
+    pub lag: Option<u64>,
+    /// Leader only: milliseconds since the peer last acknowledged.
+    pub last_ack_ms: Option<u64>,
 }

@@ -21,8 +21,9 @@ pub mod network;
 pub mod node;
 pub mod seed;
 pub mod state_machine;
+pub mod stats;
 
-pub use node::{MetaNode, MetaNodeConfig};
+pub use node::{HandoffConfig, MetaNode, MetaNodeConfig, PeerHealth};
 pub use state_machine::{EffectHandler, SmEvent};
 
 use nest_meta::{Command, Reply};

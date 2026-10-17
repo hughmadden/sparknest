@@ -44,6 +44,12 @@ pub fn fast_tuning() -> Tuning {
         fabric: None,
         boot_id: None,
         recovery_grace: Duration::from_millis(500),
+        handoff: nest_raft::HandoffConfig {
+            settle: Duration::from_secs(1),
+            cooldown: Duration::from_secs(4),
+            check_every: Duration::from_millis(100),
+            ..Default::default()
+        },
     }
 }
 
