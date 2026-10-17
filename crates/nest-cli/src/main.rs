@@ -528,7 +528,8 @@ enum ConfigCmd {
     /// Print one setting's value.
     Get { name: String },
     /// Set a value for the whole cluster ("5s", "500ms", or a number in the
-    /// setting's unit). Every host must run this version or later.
+    /// setting's unit; a host name or node id for preferred-leader). Every
+    /// host must run this version or later.
     Set { name: String, value: String },
     /// Return a setting to its default.
     Reset { name: String },
@@ -554,10 +555,15 @@ fn parse_ms(s: &str) -> Result<u64> {
 
 fn print_setting(s: &Value) {
     let unit = s["unit"].as_str().unwrap_or("");
+    let (value, unit) = match (unit, s["host"].as_str()) {
+        ("node", Some(h)) => (format!("{h} ({})", s["value"]), ""),
+        ("node", None) if s["value"] == 0 => ("none".to_string(), ""),
+        _ => (s["value"].to_string(), unit),
+    };
     println!(
-        "{:<20} {:>8} {unit:<3} {}  {}",
+        "{:<20} {:>8} {unit:<4} {}  {}",
         s["name"].as_str().unwrap_or(""),
-        s["value"],
+        value,
         if s["set"].as_bool() == Some(true) {
             format!("(default {})", s["default"])
         } else {
@@ -1484,11 +1490,28 @@ async fn main() -> Result<()> {
             let v = match cmd {
                 ConfigCmd::Ls | ConfigCmd::Get { .. } => c.get("/v1/settings").await?,
                 ConfigCmd::Set { name, value } => {
-                    let ms = parse_ms(value)?;
+                    let cur = c.get("/v1/settings").await?;
+                    let unit = cur["settings"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|s| s["name"] == name.as_str())
+                        .and_then(|s| s["unit"].as_str())
+                        .unwrap_or("ms")
+                        .to_string();
+                    // A host setting takes a name or a node id; the
+                    // daemon resolves names.
+                    let v = match unit.as_str() {
+                        "node" => match value.parse::<u64>() {
+                            Ok(n) => json!(n),
+                            Err(_) => json!(value),
+                        },
+                        _ => json!(parse_ms(value)?),
+                    };
                     c.call(
                         Method::PUT,
                         &format!("/v1/settings/{}", enc(name)),
-                        Some(json!({ "value": ms })),
+                        Some(json!({ "value": v })),
                     )
                     .await?;
                     c.get("/v1/settings").await?
