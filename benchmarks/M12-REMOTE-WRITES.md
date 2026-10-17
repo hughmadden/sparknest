@@ -83,3 +83,28 @@ the inode, which is why 8 in flight comes out slower. RDMA still gains about
 
 Not measured yet: Spark-to-Spark across the CRS804 (needs a deploy of
 0.5.0 to the trial cluster), and mixed read+write load.
+
+## On the trial cluster across the CRS804 (2026-10-17)
+
+Seven fabric hosts, trial cluster on 0.5.0 (rhea on 0.4.4 for the mixed
+runs). Each writer opens the file `O_APPEND` and writes 200 (400 in the
+first run) records of 64 KiB, each a 4-byte host tag repeated; the file is
+then read back from another host and every record checked.
+
+| Owner | Writers (remote) | Records expected | Records found | Torn |
+|---|---|---|---|---|
+| ostrich 0.5.0 | dodo, emu, kiwi, rhea | 1600 | 1600 | 0 |
+| kiwi 0.5.0 | dodo, emu, moa (×3 runs) | 600 | 600, 600, 600 | 0 |
+| rhea 0.4.4 | dodo, emu, moa (×3 runs) | 600 | 563, 597, 587 | 0 |
+| rhea 0.4.4 | its own 3 processes (local) | 600 | 600 | 0 |
+| kiwi 0.5.0 | rhea 0.4.4 | 200 | 200 | 0 |
+
+The ostrich run moved 105 MB of appends and no TCP connection on ostrich
+carried more than 94 KB: the bytes went over RDMA.
+
+**0.4.4 loses concurrent remote appends.** An owner on 0.4.4 applied two
+appends from different hosts at the same end of file, so one overwrote the
+other and both writers saw success (ADR-058 item 4; the append lock on the
+owner is the fix). Local appends on one host are serialised by the kernel
+and were not affected. During a rolling upgrade a file owned by a host
+still on 0.4.4 stays exposed until that host is upgraded.
