@@ -1280,7 +1280,14 @@ impl Vfs {
             if a.sealed {
                 return Err(NestError::NotPermitted("file is sealed".into()));
             }
-            let owner = self.choose_owner(&a, discard).await?;
+            let owner = match self.choose_owner(&a, discard).await {
+                Ok(o) => o,
+                // Another host was granted ownership between our two
+                // metadata reads (its grant retires the copies we looked
+                // for): read the attributes again.
+                Err(NestError::Unavailable(_)) if self.attr_moved(&a)? => continue,
+                Err(e) => return Err(e),
+            };
             let r = self
                 .propose(Command::AcquireOwner {
                     file,
@@ -1296,6 +1303,12 @@ impl Vfs {
             }
         }
         Err(NestError::Busy("ownership kept changing".into()))
+    }
+
+    /// Whether `file`'s generation or its state changed since `a` was read.
+    fn attr_moved(&self, a: &FileAttr) -> NestResult<bool> {
+        let now = self.raw_attr(a.id)?;
+        Ok(now.generation != a.generation || now.gen_state != a.gen_state)
     }
 
     /// Prefer this node (it holds the content, or the content is being

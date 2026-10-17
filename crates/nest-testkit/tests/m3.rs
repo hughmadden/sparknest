@@ -344,9 +344,7 @@ async fn remote_writes_and_appends_from_two_hosts() {
         let v = c.node(node).vfs.clone();
         let (fh, _) = v.open(f, oflags::WRONLY | oflags::APPEND).await.unwrap();
         handles.push((node, fh));
-        // Join the epoch first: concurrent first writes to a STABLE file
-        // race for ownership ("no reachable node holds this file"), a
-        // separate issue from how the bytes travel.
+        // A first record from each host before the concurrent appends.
         let first: Vec<u8> = [node as u8, 255]
             .iter()
             .copied()
@@ -392,4 +390,40 @@ async fn remote_writes_and_appends_from_two_hosts() {
     seen.dedup();
     assert_eq!(seen.len(), 82);
     assert_eq!(read_all(&c, 3, f).await, got);
+}
+
+/// Concurrent first writes from several hosts to a STABLE file: whichever
+/// grant lands first, the others route to its owner (a grant between a
+/// writer's two metadata reads used to fail it with "no reachable node
+/// holds this file").
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_first_writes_from_several_hosts() {
+    let c = ready(3).await;
+    for round in 0..20u8 {
+        let name = format!("race{round}");
+        let f = file(&c, 1, &name, b"x").await;
+        let mut handles = Vec::new();
+        for node in [2u64, 3] {
+            let v = c.node(node).vfs.clone();
+            let (fh, _) = v.open(f, oflags::WRONLY | oflags::APPEND).await.unwrap();
+            handles.push((v, fh));
+        }
+        let mut tasks = Vec::new();
+        for (v, fh) in &handles {
+            for t in 0..4u8 {
+                let (v, fh) = (v.clone(), *fh);
+                tasks.push(tokio::spawn(async move {
+                    v.write(fh, 0, vec![t + 1; 64]).await.map(|_| ())
+                }));
+            }
+        }
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        for (v, fh) in handles {
+            v.release(fh, None).await;
+        }
+        wait_stable(&c, f).await;
+        assert_eq!(read_all(&c, 1, f).await.len(), 1 + 8 * 64, "round {round}");
+    }
 }
