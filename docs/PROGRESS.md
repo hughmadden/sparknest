@@ -25,6 +25,11 @@ what is next. Keep entries short; link to benchmarks and ADRs.
 - Found, not fixed (predates this work): concurrent first writes from
   several hosts to a STABLE file can fail `Unavailable("no reachable node
   holds this file")` while ownership is being granted.
+- The management API's OpenAPI document (ADR-006) is checked in at last:
+  `crates/nest-api/openapi.yaml`, handwritten from the handlers, every
+  route including `/v1/ws` frames and the loopback RDMA counters. A test
+  fails when a `.route(...)` in `nest-api` is not documented, or the
+  document names one that is gone.
 
 ## 2026-10-17 — 0.4.4: reads ride out elections, EIO logged, archive snapshots on SMB (ADR-056)
 

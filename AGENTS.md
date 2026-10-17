@@ -63,7 +63,9 @@ Read in this order: `PROPOSAL.md` (architecture and invariants),
   comment; registered buffers have RAII owners or are never freed.
 - Blocking filesystem/SQLite work goes on dedicated blocking pools; never on
   the FUSE reply path's async executor threads.
-- Public API changes update the OpenAPI document in the same commit.
+- Public API changes update the OpenAPI document
+  (`crates/nest-api/openapi.yaml`) in the same commit; its test fails on a
+  route registered but not documented.
 
 ## Definition of done for a milestone
 

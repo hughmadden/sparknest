@@ -1,0 +1,3022 @@
+openapi: 3.1.0
+info:
+  title: sparknest management API
+  version: 0.5.0
+  description: |
+    HTTP+JSON management API (ADR-006), served by every daemon. Handwritten
+    from the axum handlers in `crates/nest-api/src`; `tests/openapi.rs`
+    checks that every route registered there is documented here.
+
+    Transports and auth:
+    - Unix socket `<state_dir>/api.sock`, mode 0600: no token; access is
+      the socket file's permissions (the daemon's user). The `nest` CLI
+      uses it.
+    - TCP listener `node.api_listen` (when configured): serves the web UI
+      page at `/` without auth and every `/v1/` route behind a bearer
+      token (`bearerToken`). `/v1/download` and `/v1/ws` also accept the
+      token as a `token` query parameter (`queryToken`), since links and
+      WebSockets cannot send headers. A missing or wrong token is 401.
+    - RDMA counters (`/v1/rdma/counters`) are a separate loopback-only
+      listener, `node.counters_listen` (default 127.0.0.1:7403), and are
+      unauthenticated.
+
+    Paths in requests are namespace paths (`/hub/...`) or paths under the
+    serving node's mountpoint, which are translated. A selector is a
+    namespace path, `hf:org/name[@revision]` or `hf-dataset:org/name`.
+    Hosts lists take host names and `@group` names.
+
+    Errors are JSON `{"error": "..."}` with 400 (invalid), 403 (not
+    permitted), 404 (not found), 409 (exists, stale, busy, or a cluster
+    precondition), 503 (no quorum, unavailable) or 500. A body or query
+    that does not parse is rejected by axum with a plain-text 400/415/422.
+
+    Integers are unsigned 64-bit unless noted. Ids (file, node, store,
+    job, plan, backup) are integers.
+servers:
+  - url: http://{host}:{port}
+    description: The TCP listener (`node.api_listen`); the Unix socket serves the same /v1 routes.
+    variables:
+      host:
+        default: 127.0.0.1
+      port:
+        default: "7401"
+security:
+  - bearerToken: []
+tags:
+  - name: files
+  - name: placement
+  - name: jobs
+  - name: plans
+  - name: stores
+  - name: hf
+  - name: cluster
+  - name: web
+  - name: counters
+
+paths:
+  /:
+    get:
+      tags: [web]
+      summary: The web UI page (TCP listener only)
+      operationId: index
+      security: []
+      responses:
+        "200":
+          description: The single-page web UI.
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/status:
+    get:
+      tags: [cluster]
+      summary: This node's view of the cluster and every host's status
+      operationId: status
+      responses:
+        "200":
+          description: Status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/ls:
+    get:
+      tags: [files]
+      summary: List a directory (or describe one file)
+      operationId: ls
+      parameters:
+        - $ref: "#/components/parameters/PathQuery"
+      responses:
+        "200":
+          description: Entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, entries]
+                properties:
+                  path:
+                    type: string
+                    description: The namespace path listed.
+                  entries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/LsEntry"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/seal:
+    post:
+      tags: [files]
+      summary: Seal or unseal a file or (recursive) a tree
+      operationId: seal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+                sealed:
+                  type: boolean
+                  default: true
+                recursive:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          $ref: "#/components/responses/Changed"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/rm:
+    post:
+      tags: [files]
+      summary: Remove a file or (recursive) a tree
+      operationId: rm
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+                recursive:
+                  type: boolean
+                  default: false
+                dry_run:
+                  type: boolean
+                  default: false
+                  description: Count what would be removed; remove nothing.
+      responses:
+        "200":
+          description: What was (or would be) removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [files, dirs, errors]
+                properties:
+                  files:
+                    type: integer
+                  dirs:
+                    type: integer
+                  errors:
+                    type: array
+                    items:
+                      type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/fsck:
+    post:
+      tags: [files]
+      summary: Check this host's objects against the metadata (ADR-026)
+      operationId: fsck
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repair:
+                  type: boolean
+                  default: false
+                  description: Apply the standard non-destructive resolutions; orphans go to lost+found.
+                deep:
+                  type: boolean
+                  default: false
+                  description: Also hash Hugging Face blobs against their names.
+      responses:
+        "200":
+          description: Report.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [host, objects, lost, findings]
+                properties:
+                  host:
+                    type: string
+                  objects:
+                    type: integer
+                  lost:
+                    type: integer
+                    description: Files whose data no longer exists anywhere.
+                  findings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FsckFinding"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/seal-policy:
+    post:
+      tags: [files]
+      summary: Set a directory's seal policy
+      operationId: sealPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, policy]
+              properties:
+                path:
+                  type: string
+                policy:
+                  $ref: "#/components/schemas/SealPolicy"
+      responses:
+        "200":
+          description: The policy set.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, policy]
+                properties:
+                  path:
+                    type: string
+                  policy:
+                    $ref: "#/components/schemas/SealPolicy"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/read-pattern:
+    post:
+      tags: [files]
+      summary: Record how files are read (ADR-031), overriding what hosts learned
+      operationId: readPattern
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, scattered]
+              properties:
+                path:
+                  type: string
+                recursive:
+                  type: boolean
+                  default: false
+                scattered:
+                  type: boolean
+                  description: true reads directly (scattered), false reads ahead (stream).
+      responses:
+        "200":
+          $ref: "#/components/responses/Changed"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/passthrough:
+    get:
+      tags: [files]
+      summary: How many of a selector's files are marked always passthrough
+      operationId: getPassthrough
+      parameters:
+        - $ref: "#/components/parameters/SelectorQuery"
+      responses:
+        "200":
+          description: Counts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [files, always]
+                properties:
+                  files:
+                    type: integer
+                  always:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [files]
+      summary: Mark files always passthrough where a complete local copy exists (ADR-053)
+      operationId: setPassthrough
+      description: 409 unless every host runs this version or later.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [selector, always]
+              properties:
+                selector:
+                  type: string
+                always:
+                  type: boolean
+                  description: false returns the files to each host's policy.
+      responses:
+        "200":
+          description: Files selected and changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [files, changed, errors]
+                properties:
+                  files:
+                    type: integer
+                  changed:
+                    type: integer
+                  errors:
+                    type: array
+                    items:
+                      type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/where:
+    get:
+      tags: [placement]
+      summary: Where a selection is complete, per host
+      operationId: where
+      parameters:
+        - $ref: "#/components/parameters/SelectorQuery"
+        - name: hosts
+          in: query
+          description: Comma-separated hosts or @groups; every host when absent.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Readiness.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [selector, files, bytes, writing, dangling, hosts]
+                properties:
+                  selector:
+                    type: string
+                  files:
+                    type: integer
+                  bytes:
+                    type: integer
+                  writing:
+                    type: integer
+                    description: Files still being written.
+                  dangling:
+                    type: array
+                    description: Symlinks whose targets do not resolve inside the namespace.
+                    items:
+                      type: string
+                  hosts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Readiness"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/replicate:
+    post:
+      tags: [placement]
+      summary: Copy a selection onto hosts or archive stores
+      operationId: replicate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlaceRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/evict:
+    post:
+      tags: [placement]
+      summary: Remove a selection's copies from hosts (never the last copy)
+      operationId: evict
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlaceRequest"
+      responses:
+        "200":
+          description: Per host.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hosts]
+                properties:
+                  hosts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/EvictReport"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/rules:
+    get:
+      tags: [placement]
+      summary: Placement rules
+      operationId: rules
+      responses:
+        "200":
+          description: Rules.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rules]
+                properties:
+                  rules:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, selector, hosts, auto, revision]
+                      properties:
+                        name:
+                          type: string
+                        selector:
+                          type: string
+                        hosts:
+                          type: array
+                          items:
+                            type: string
+                        auto:
+                          type: boolean
+                        revision:
+                          type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/rules/{name}:
+    parameters:
+      - $ref: "#/components/parameters/NamePath"
+    put:
+      tags: [placement]
+      summary: Create or replace a placement rule
+      operationId: setRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [selector, hosts]
+              properties:
+                selector:
+                  type: string
+                hosts:
+                  type: array
+                  description: Hosts, @groups or archive stores that must each hold a complete copy.
+                  items:
+                    type: string
+                auto:
+                  type: boolean
+                  default: false
+                  description: Re-apply automatically after files finish being written.
+      responses:
+        "200":
+          description: The rule's new revision.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [name, revision]
+                properties:
+                  name:
+                    type: string
+                  revision:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [placement]
+      summary: Delete a placement rule
+      operationId: deleteRule
+      responses:
+        "200":
+          $ref: "#/components/responses/DeletedName"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/reconcile:
+    post:
+      tags: [placement]
+      summary: Apply one rule, or every rule
+      operationId: reconcile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: [string, "null"]
+                  description: One rule; every rule when absent.
+                parallel:
+                  type: integer
+                  default: 8
+      responses:
+        "200":
+          description: Jobs started.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/jobs:
+    get:
+      tags: [jobs]
+      summary: Every node's jobs
+      operationId: jobs
+      responses:
+        "200":
+          description: Jobs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ClusterJob"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/jobs/{id}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    get:
+      tags: [jobs]
+      summary: One job, with import progress when it is an import
+      operationId: job
+      responses:
+        "200":
+          description: The job.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job, import]
+                properties:
+                  job:
+                    $ref: "#/components/schemas/ClusterJob"
+                  import:
+                    oneOf:
+                      - $ref: "#/components/schemas/ImportProgress"
+                      - type: "null"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/jobs/{id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    post:
+      tags: [jobs]
+      summary: Cancel a job (files already copied stay)
+      operationId: cancelJob
+      responses:
+        "200":
+          description: Cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cancelled]
+                properties:
+                  cancelled:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/import:
+    post:
+      tags: [files]
+      summary: Import a local directory on this node into the namespace
+      operationId: import
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [src, dst]
+              properties:
+                src:
+                  type: string
+                  description: A directory on this node's local filesystem.
+                dst:
+                  type: string
+                  description: Namespace directory to import into (created if missing).
+                move:
+                  type: boolean
+                  default: false
+                seal:
+                  oneOf:
+                    - $ref: "#/components/schemas/SealMode"
+                    - type: "null"
+                  description: Default `auto`.
+                copy:
+                  type: boolean
+                  default: false
+                  description: Copy files that cannot be hard-linked (another filesystem).
+      responses:
+        "200":
+          $ref: "#/components/responses/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/stores:
+    get:
+      tags: [stores]
+      summary: Archive stores and their gateways' health
+      operationId: stores
+      responses:
+        "200":
+          description: Stores.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stores]
+                properties:
+                  stores:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/StoreStatus"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [stores]
+      summary: Register an archive store
+      operationId: addStore
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, path, gateways]
+              properties:
+                name:
+                  type: string
+                path:
+                  type: string
+                  description: The store's directory, as each gateway sees it.
+                gateways:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Per gateway.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [name, gateways]
+                properties:
+                  name:
+                    type: string
+                  gateways:
+                    type: array
+                    items:
+                      type: object
+                      required: [gateway, ok, error]
+                      properties:
+                        gateway:
+                          type: string
+                        ok:
+                          type: boolean
+                        error:
+                          type: [string, "null"]
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/offload:
+    post:
+      tags: [stores]
+      summary: Move a selection into an archive store
+      operationId: offload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [selector, store]
+              properties:
+                selector:
+                  type: string
+                store:
+                  type: string
+                parallel:
+                  type: integer
+                  default: 8
+      responses:
+        "200":
+          $ref: "#/components/responses/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/plans:
+    post:
+      tags: [plans]
+      summary: Propose a plan for a goal
+      operationId: makePlan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/Goal"
+                - type: object
+                  description: Older free-space form without `goal`.
+                  required: [free]
+                  properties:
+                    free:
+                      $ref: "#/components/schemas/FreeTargets"
+                    archives:
+                      type: array
+                      items:
+                        type: string
+      responses:
+        "200":
+          description: The proposed plan (kept on this node until applied).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/plans/{id}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    get:
+      tags: [plans]
+      summary: A proposed plan, as last edited
+      operationId: getPlan
+      responses:
+        "200":
+          description: The plan.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/plans/{id}/select:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    post:
+      tags: [plans]
+      summary: Skip copies in a plan or take them back
+      operationId: selectPlan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: ["on"]
+              properties:
+                host:
+                  type: [string, "null"]
+                  description: One host's copies; every host's when absent.
+                matches:
+                  type: array
+                  description: Models (org/name, hf:org/name), directories or files; every copy when empty.
+                  items:
+                    type: string
+                "on":
+                  type: boolean
+                  description: true takes copies back, false skips them.
+      responses:
+        "200":
+          description: The plan and how many copies changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [plan, changed]
+                properties:
+                  plan:
+                    $ref: "#/components/schemas/Plan"
+                  changed:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/plans/{id}/apply:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    post:
+      tags: [plans]
+      summary: Execute a proposed plan's selected steps
+      operationId: applyPlan
+      responses:
+        "200":
+          $ref: "#/components/responses/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/groups:
+    get:
+      tags: [cluster]
+      summary: Host groups
+      operationId: groups
+      responses:
+        "200":
+          description: Groups.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groups]
+                properties:
+                  groups:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Group"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/groups/{name}:
+    parameters:
+      - $ref: "#/components/parameters/NamePath"
+    put:
+      tags: [cluster]
+      summary: Create or replace a host group
+      operationId: setGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [members]
+              properties:
+                members:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: The group set.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [group]
+                properties:
+                  group:
+                    type: string
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [cluster]
+      summary: Delete a host group
+      operationId: deleteGroup
+      responses:
+        "200":
+          $ref: "#/components/responses/DeletedName"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/settings:
+    get:
+      tags: [cluster]
+      summary: Cluster-wide settings (ADR-056) with values and defaults
+      operationId: settings
+      responses:
+        "200":
+          description: Every known setting.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [settings]
+                properties:
+                  settings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Setting"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/settings/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        description: A setting name; unknown names are 404.
+        schema:
+          type: string
+          enum: [read-recovery-wait, preferred-leader]
+    put:
+      tags: [cluster]
+      summary: Set a cluster setting
+      operationId: setSetting
+      description: |
+        400 when the value is out of range, a host-valued setting names a
+        non-voter, or a number setting is given a string; 409 unless every
+        host runs this version or later. For `preferred-leader`, 0 clears it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value:
+                  oneOf:
+                    - type: integer
+                      minimum: 0
+                      description: In the setting's unit (a node id for host-valued settings).
+                    - type: string
+                      description: Host-valued settings only (`preferred-leader`) - a host name, `node<id>`, or the id in digits.
+      responses:
+        "200":
+          description: The value stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingValue"
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [cluster]
+      summary: Reset a cluster setting to its default
+      operationId: resetSetting
+      description: 409 unless every host runs this version or later.
+      responses:
+        "200":
+          description: The default now in effect.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingValue"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/backups:
+    get:
+      tags: [stores]
+      summary: Backups in archive stores
+      operationId: backups
+      responses:
+        "200":
+          description: Backups.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [backups]
+                properties:
+                  backups:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Backup"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [stores]
+      summary: Back a selection up into an archive store
+      operationId: backupCreate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [selector, name, store]
+              properties:
+                selector:
+                  type: string
+                name:
+                  type: string
+                store:
+                  type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/backups/{id}/restore:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    post:
+      tags: [stores]
+      summary: Restore a backup into the namespace
+      operationId: backupRestore
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [dst]
+              properties:
+                dst:
+                  type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/backups/{id}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    delete:
+      tags: [stores]
+      summary: Delete a backup and its objects
+      operationId: backupDelete
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted, objects_removed]
+                properties:
+                  deleted:
+                    type: integer
+                  objects_removed:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/backups/meta:
+    post:
+      tags: [stores]
+      summary: Snapshot the metadata into an archive store
+      operationId: metaSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [store]
+              properties:
+                store:
+                  type: string
+      responses:
+        "200":
+          description: Where the snapshot was written.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [snapshot]
+                properties:
+                  snapshot:
+                    type: string
+                    description: "`<store>:<path>`."
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/hf:
+    get:
+      tags: [hf]
+      summary: Every Hugging Face repo in the hub with where it is complete
+      operationId: hfRepos
+      responses:
+        "200":
+          description: Repos.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hub, repos]
+                properties:
+                  hub:
+                    type: string
+                  repos:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/HfRepo"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/hf/detail:
+    get:
+      tags: [hf]
+      summary: One repo's files, revisions, rules and 30-day usage
+      operationId: hfDetail
+      parameters:
+        - $ref: "#/components/parameters/SelectorQuery"
+      responses:
+        "200":
+          description: Detail.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [repo, kind, selector, path, hosts, tree, revisions, rules, usage, file_usage]
+                properties:
+                  repo:
+                    type: string
+                  kind:
+                    type: string
+                    enum: [model, dataset]
+                  selector:
+                    type: string
+                  path:
+                    type: string
+                    description: The repo's namespace directory.
+                  hosts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Readiness"
+                  tree:
+                    $ref: "#/components/schemas/TreeNode"
+                  revisions:
+                    type: array
+                    items:
+                      type: object
+                      required: [commit, refs]
+                      properties:
+                        commit:
+                          type: string
+                        refs:
+                          type: array
+                          items:
+                            type: string
+                  rules:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, hosts, auto]
+                      properties:
+                        name:
+                          type: string
+                        hosts:
+                          type: array
+                          items:
+                            type: string
+                        auto:
+                          type: boolean
+                  usage:
+                    $ref: "#/components/schemas/UsageByHost"
+                  file_usage:
+                    type: object
+                    description: File id (as a string) to usage by host; files nobody used are empty.
+                    additionalProperties:
+                      $ref: "#/components/schemas/UsageByHost"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/hf/import:
+    post:
+      tags: [hf]
+      summary: Import a Hugging Face cache on this node
+      operationId: hfImport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [src]
+              properties:
+                src:
+                  type: string
+                move:
+                  type: boolean
+                  default: false
+                hf:
+                  type: [string, "null"]
+                  description: The `hf` program to finalize with; absent mirrors snapshots offline.
+                copy:
+                  type: boolean
+                  default: true
+                spread:
+                  type: boolean
+                  default: false
+                  description: Place each blob on the host with the most free space.
+                archive:
+                  type: [string, "null"]
+                  description: Put the blobs in this archive store (this node must be a gateway). Not with `spread`.
+      responses:
+        "200":
+          $ref: "#/components/responses/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/hf/remove:
+    post:
+      tags: [hf]
+      summary: Delete repos with `hf cache rm` through this node's mount
+      operationId: hfRemove
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targets]
+              properties:
+                targets:
+                  type: array
+                  description: "`org/name`, `hf:org/name`, `model/org/name` or `dataset/org/name`."
+                  items:
+                    type: string
+                dry_run:
+                  type: boolean
+                  default: false
+                  description: Only report what would go, synchronously.
+                hf:
+                  type: [string, "null"]
+      responses:
+        "200":
+          description: hf's dry-run summary, or the job.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [dry_run]
+                    properties:
+                      dry_run:
+                        description: hf's JSON summary.
+                  - $ref: "#/components/schemas/JobRef"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/hf/search:
+    get:
+      tags: [hf]
+      summary: Search the Hub through hf (most downloaded first)
+      operationId: hfSearch
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/HfKindQuery"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        "200":
+          description: hf's JSON results.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results]
+                properties:
+                  results: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/hf/size:
+    get:
+      tags: [hf]
+      summary: Files and bytes a download of a repo would fetch (hf's dry run)
+      operationId: hfSize
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/HfKindQuery"
+        - name: revision
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Size.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [files, missing_files, missing_bytes]
+                properties:
+                  files:
+                    type: integer
+                  missing_files:
+                    type: integer
+                    description: Not in the cache anywhere in the cluster.
+                  missing_bytes:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/hf/download:
+    post:
+      tags: [hf]
+      summary: Download a repo's missing files onto hosts or into an archive store
+      operationId: hfDownload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo]
+              properties:
+                repo:
+                  type: string
+                  description: "`org/name`, `hf:org/name` or a huggingface.co URL."
+                kind:
+                  type: string
+                  default: ""
+                  description: "`dataset` for datasets; anything else is a model."
+                host:
+                  type: string
+                  default: ""
+                  description: One host to download everything to.
+                hosts:
+                  type: array
+                  description: Hosts or @groups to spread over; every serving host when empty and no `host`.
+                  items:
+                    type: string
+                revision:
+                  type: [string, "null"]
+                in_flight:
+                  type: [integer, "null"]
+                  description: Files downloading at once across the cluster (default 4, 1..16).
+                archive:
+                  type: [string, "null"]
+                  description: Download into this archive store instead (not with `host`/`hosts`).
+                hf:
+                  type: [string, "null"]
+                  deprecated: true
+                  description: Ignored; kept for older CLIs.
+      responses:
+        "200":
+          $ref: "#/components/responses/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/logs:
+    get:
+      tags: [cluster]
+      summary: Recent log lines from one host or every node
+      operationId: logs
+      parameters:
+        - name: host
+          in: query
+          schema:
+            type: string
+        - name: level
+          in: query
+          description: Least severe level shown (default info).
+          schema:
+            type: string
+            enum: [error, warn, info, debug]
+        - name: q
+          in: query
+          description: Case-insensitive text the message or target must contain.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Lines.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lines, unreachable]
+                properties:
+                  lines:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/LogLine"
+                  unreachable:
+                    type: array
+                    description: Hosts that did not answer.
+                    items:
+                      type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/space/tree:
+    get:
+      tags: [placement]
+      summary: Size-weighted tree of what sparknest holds, and free space in scope
+      operationId: spaceTree
+      parameters:
+        - name: scope
+          in: query
+          description: A host or archive store name; the whole cluster when absent or `all`.
+          schema:
+            type: string
+        - name: weight
+          in: query
+          schema:
+            type: string
+            enum: [logical, copies]
+            default: logical
+        - name: shape
+          in: query
+          schema:
+            type: string
+            enum: [models, path]
+            default: models
+        - name: root
+          in: query
+          schema:
+            type: string
+            default: /
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            default: 6
+            maximum: 32
+        - name: max
+          in: query
+          description: Children per node (2..2000).
+          schema:
+            type: integer
+            default: 150
+      responses:
+        "200":
+          description: Tree and stores.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tree, stores]
+                properties:
+                  tree:
+                    $ref: "#/components/schemas/TreeNode"
+                  stores:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, kind, free, total, held]
+                      properties:
+                        name:
+                          type: string
+                        kind:
+                          type: string
+                          enum: [host, archive]
+                        free:
+                          type: integer
+                        total:
+                          type: integer
+                        held:
+                          type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/download:
+    get:
+      tags: [web]
+      summary: Download a file, or a directory as a tar built on the fly
+      operationId: download
+      security:
+        - bearerToken: []
+        - queryToken: []
+      parameters:
+        - $ref: "#/components/parameters/PathQuery"
+        - $ref: "#/components/parameters/TokenQuery"
+      responses:
+        "200":
+          description: The bytes, streamed, with Content-Disposition. Symlinks are 400.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+            application/x-tar:
+              schema:
+                type: string
+                format: binary
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/upload:
+    put:
+      tags: [web]
+      summary: Stream the request body into a new file
+      operationId: upload
+      description: No body size limit. The parent directory must exist.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          description: The file's full path.
+          schema:
+            type: string
+        - name: overwrite
+          in: query
+          description: Truncate an existing file instead of 409.
+          schema:
+            type: boolean
+            default: false
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Written.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, bytes]
+                properties:
+                  path:
+                    type: string
+                  bytes:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/mkdir:
+    post:
+      tags: [files]
+      summary: Make a directory and any missing parents
+      operationId: mkdir
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+      responses:
+        "200":
+          description: Made (or already there).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path]
+                properties:
+                  path:
+                    type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/drop-caches:
+    post:
+      tags: [cluster]
+      summary: Drop the clean page cache on hosts (benchmarks)
+      operationId: dropCaches
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                hosts:
+                  type: array
+                  description: Hosts or @groups; every node when empty.
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Per host.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hosts]
+                properties:
+                  hosts:
+                    type: array
+                    items:
+                      type: object
+                      required: [host, ok, message]
+                      properties:
+                        host:
+                          type: string
+                        ok:
+                          type: boolean
+                        message:
+                          type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/web:
+    get:
+      tags: [web]
+      summary: Where the web UI listens and its token (for `nest ui`)
+      operationId: webInfo
+      description: Meant for the Unix socket; over TCP it needs the token it returns.
+      responses:
+        "200":
+          description: Address and token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [addr, token]
+                properties:
+                  addr:
+                    type: [string, "null"]
+                    description: "`ip:port` of `node.api_listen`, if any."
+                  token:
+                    type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/ws:
+    get:
+      tags: [web]
+      summary: Live updates and API calls for the web UI over one WebSocket
+      operationId: ws
+      description: |
+        Upgrades to a WebSocket. Text frames are JSON with `type` first.
+        Server to page (`WsServerMessage`): `state` (status, jobs, stores,
+        groups and the UI build id, when changed, checked every second),
+        `changed` (namespace or placement changed, debounced), `lines`
+        (log lines while subscribed), `reply` (answer to a `call`). The
+        server pings every 20 s.
+        Page to server (`WsPageMessage`): `call` runs any `/v1/` request
+        through the same router, concurrently; `logs` follows logs (recent
+        lines first, limit default 500, at most 5000); `logs_off` stops.
+        Frames that do not parse are ignored.
+      security:
+        - bearerToken: []
+        - queryToken: []
+      parameters:
+        - $ref: "#/components/parameters/TokenQuery"
+      responses:
+        "101":
+          description: Switching to the WebSocket protocol.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/cluster:
+    get:
+      tags: [cluster]
+      summary: Raft membership as this node sees it
+      operationId: cluster
+      responses:
+        "200":
+          description: Membership.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [leader, term, nodes]
+                properties:
+                  leader:
+                    type: [integer, "null"]
+                  term:
+                    type: integer
+                  nodes:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name, addr, voter]
+                      properties:
+                        id:
+                          type: integer
+                        name:
+                          type: string
+                        addr:
+                          type: string
+                          description: Control address; empty for an off-grid host.
+                        voter:
+                          type: boolean
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/cluster/raft:
+    get:
+      tags: [cluster]
+      summary: This host's view of each Raft peer (ADR-057)
+      operationId: clusterRaft
+      responses:
+        "200":
+          description: Peers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [me, leader, term, peers]
+                properties:
+                  me:
+                    type: integer
+                  leader:
+                    type: [integer, "null"]
+                  term:
+                    type: integer
+                  peers:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PeerRaftStats"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/cluster/remove:
+    post:
+      tags: [cluster]
+      summary: Remove a host from the membership (ask another node than the one removed)
+      operationId: clusterRemove
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HostRequest"
+      responses:
+        "200":
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed:
+                    type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/cluster/role:
+    post:
+      tags: [cluster]
+      summary: Move a host off the fabric or onto it (ADR-047)
+      operationId: clusterRole
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host, role]
+              properties:
+                host:
+                  type: string
+                role:
+                  type: string
+                  enum: [offgrid, fabric]
+                addr:
+                  type: [string, "null"]
+                  description: Control address `ip:port` on the fabric; required for `fabric`.
+      responses:
+        "200":
+          description: Changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [host, role]
+                properties:
+                  host:
+                    type: string
+                  role:
+                    type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/cluster/add:
+    post:
+      tags: [cluster]
+      summary: Add a node to the membership
+      operationId: clusterAdd
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, addr]
+              properties:
+                id:
+                  type: integer
+                addr:
+                  type: string
+                voter:
+                  type: boolean
+                  default: true
+      responses:
+        "200":
+          description: Added.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [added, voter]
+                properties:
+                  added:
+                    type: integer
+                  voter:
+                    type: boolean
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/rdma/counters:
+    get:
+      tags: [counters]
+      summary: RDMA traffic counters snapshot (ADR-051)
+      operationId: rdmaCounters
+      description: |
+        Served by its own loopback-only listener (`node.counters_listen`),
+        not the management API listeners; unauthenticated. The binary
+        stream on `<state_dir>/run/rdma-counters.sock` is described in
+        docs/RDMA-COUNTERS.md.
+      servers:
+        - url: http://127.0.0.1:7403
+      security: []
+      responses:
+        "200":
+          description: Snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CountersSnapshot"
+
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: |
+        TCP listener only. The token is the first 20 bytes, hex (40
+        characters), of HMAC-SHA256 under the cluster secret of
+        `sparknest-web-v1`; every node accepts the same token. `GET /v1/web`
+        on the Unix socket returns it.
+    queryToken:
+      type: apiKey
+      in: query
+      name: token
+      description: The bearer token in the query; accepted only on `/v1/download` and `/v1/ws`.
+
+  parameters:
+    PathQuery:
+      name: path
+      in: query
+      required: true
+      description: A namespace path or a path under the node's mountpoint.
+      schema:
+        type: string
+    SelectorQuery:
+      name: selector
+      in: query
+      required: true
+      description: A path, `hf:org/name[@revision]` or `hf-dataset:org/name`.
+      schema:
+        type: string
+    TokenQuery:
+      name: token
+      in: query
+      description: The bearer token, for clients that cannot send headers.
+      schema:
+        type: string
+    HfKindQuery:
+      name: kind
+      in: query
+      description: "`dataset` for datasets; anything else is a model."
+      schema:
+        type: string
+        default: ""
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 0
+    NamePath:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    Error:
+      description: An error (see the status mapping above).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Job:
+      description: The job started (follow it with /v1/jobs/{id}).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JobRef"
+    Changed:
+      description: Files changed and per-file errors.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [changed, errors]
+            properties:
+              changed:
+                type: integer
+              errors:
+                type: array
+                items:
+                  type: string
+    DeletedName:
+      description: Deleted.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [deleted]
+            properties:
+              deleted:
+                type: string
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    JobRef:
+      type: object
+      required: [job]
+      properties:
+        job:
+          type: integer
+          description: Job id on the node that answered.
+
+    FileKind:
+      type: string
+      enum: [regular, directory, symlink]
+
+    SealPolicy:
+      type: string
+      enum: [inherit, "off", rename_from_incomplete, on_finalize]
+
+    SealMode:
+      type: string
+      enum: [none, all, blobs, auto]
+
+    Status:
+      type: object
+      required: [me, serving, leader, applied, mountpoint, entries, nodes, rules]
+      properties:
+        me:
+          type: integer
+          description: This node's id.
+        serving:
+          type: boolean
+          description: Caught up, admitted after recovery, lease valid.
+        leader:
+          type: [integer, "null"]
+        applied:
+          type: integer
+          description: Applied metadata log index.
+        mountpoint:
+          type: [string, "null"]
+        entries:
+          type: integer
+          description: Namespace entries.
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/NodeStatus"
+        rules:
+          type: integer
+          description: Number of placement rules.
+
+    NodeStatus:
+      type: object
+      required: [node, name, info, error, offgrid]
+      properties:
+        node:
+          type: integer
+        name:
+          type: string
+        info:
+          oneOf:
+            - $ref: "#/components/schemas/NodeInfo"
+            - type: "null"
+        error:
+          type: [string, "null"]
+        offgrid:
+          type: boolean
+
+    NodeInfo:
+      type: object
+      description: A host's report. Byte counters are cumulative; rates come from differences between polls.
+      required: [node, name, mountpoint, total_bytes, free_bytes, objects, object_bytes, rails, serving, leader, applied, version]
+      properties:
+        node:
+          type: integer
+        name:
+          type: string
+        mountpoint:
+          type: [string, "null"]
+        total_bytes:
+          type: integer
+        free_bytes:
+          type: integer
+        objects:
+          type: integer
+        object_bytes:
+          type: integer
+        rails:
+          type: array
+          items:
+            type: string
+        serving:
+          type: boolean
+        leader:
+          type: [integer, "null"]
+        applied:
+          type: integer
+        version:
+          type: string
+        fabric_read_bytes:
+          type: integer
+        fabric_served_bytes:
+          type: integer
+        fabric_served_fast:
+          type: integer
+        fabric_read_now:
+          type: integer
+        local_read_bytes:
+          type: integer
+        scattered_files:
+          type: integer
+        readahead_dropped_bytes:
+          type: integer
+        readahead_used_bytes:
+          type: integer
+        io_windows:
+          type: array
+          description: Over the last 10 s, 1 min and 10 min.
+          items:
+            $ref: "#/components/schemas/IoWindow"
+        io:
+          type: array
+          description: What this host learned about the sources it reads from (ADR-030).
+          items:
+            $ref: "#/components/schemas/SourceReport"
+        disk_read_bps:
+          type: integer
+        link_bps:
+          type: integer
+        fabric_timing:
+          type: array
+          description: Fabric timing totals (ns) and counts, for diagnosis.
+          minItems: 7
+          maxItems: 7
+          items:
+            type: integer
+
+    IoWindow:
+      type: object
+      required: [ms, classes, readahead_dropped, readahead_used]
+      properties:
+        ms:
+          type: integer
+        classes:
+          type: array
+          items:
+            type: object
+            required: [kind, max_bytes, count, bytes, mean_us, p50_us, p90_us, p99_us]
+            properties:
+              kind:
+                type: [string, "null"]
+                enum: [Disk, Fabric, Served, null]
+              max_bytes:
+                type: integer
+                description: Upper bound of the size class (0 - larger than the others).
+              count:
+                type: integer
+              bytes:
+                type: integer
+              mean_us:
+                type: integer
+              p50_us:
+                type: integer
+              p90_us:
+                type: integer
+              p99_us:
+                type: integer
+        readahead_dropped:
+          type: integer
+        readahead_used:
+          type: integer
+
+    SourceReport:
+      type: object
+      required: [source, latency_us, measured, in_flight, bytes_per_s, bytes_total, reads_total, errors]
+      properties:
+        source:
+          description: "`\"Local\"` or `{\"Peer\": <node id>}`."
+          oneOf:
+            - type: string
+              enum: [Local]
+            - type: object
+              required: [Peer]
+              properties:
+                Peer:
+                  type: integer
+        latency_us:
+          type: integer
+        measured:
+          type: boolean
+        in_flight:
+          type: integer
+        bytes_per_s:
+          type: integer
+        bytes_total:
+          type: integer
+        reads_total:
+          type: integer
+        errors:
+          type: integer
+
+    LsEntry:
+      type: object
+      required: [name, kind, size, sealed, writing_on, hosts, target]
+      properties:
+        name:
+          type: string
+        kind:
+          $ref: "#/components/schemas/FileKind"
+        size:
+          type: integer
+        sealed:
+          type: boolean
+        writing_on:
+          type: [string, "null"]
+          description: The host writing it, while one owns it.
+        hosts:
+          type: array
+          description: Stores holding the current generation.
+          items:
+            type: string
+        target:
+          type: [string, "null"]
+          description: A symlink's target.
+
+    FsckFinding:
+      type: object
+      description: An issue (tag `issue`) and the action taken (tag `action`), flattened into one object.
+      required: [issue, action]
+      properties:
+        issue:
+          type: string
+          enum: [orphan, missing, damaged, corrupt, unfinished]
+        file:
+          type: integer
+        generation:
+          type: integer
+        path:
+          type: string
+        size:
+          type: integer
+        note:
+          type: [string, "null"]
+        other_copies:
+          type: integer
+        expected:
+          type: integer
+        found:
+          type: integer
+        content_lost:
+          type: boolean
+        action:
+          type: string
+          enum: [reported, deleted, quarantined, retired, lost, finalized, failed]
+        to:
+          type: [string, "null"]
+          description: Where kept bytes went (quarantined, lost).
+        error:
+          type: string
+          description: Why the action failed (failed).
+
+    PlaceRequest:
+      type: object
+      required: [selector, hosts]
+      properties:
+        selector:
+          type: string
+        hosts:
+          type: array
+          description: Hosts, @groups or archive stores.
+          items:
+            type: string
+        parallel:
+          type: integer
+          default: 8
+          description: Copies at once (replicate only).
+
+    Readiness:
+      type: object
+      required: [host, files, bytes, missing_files, missing_bytes, ready]
+      properties:
+        host:
+          type: string
+        files:
+          type: integer
+        bytes:
+          type: integer
+        missing_files:
+          type: integer
+        missing_bytes:
+          type: integer
+        ready:
+          type: boolean
+
+    EvictReport:
+      type: object
+      required: [host, removed, refused]
+      properties:
+        host:
+          type: string
+        removed:
+          type: integer
+        refused:
+          type: array
+          description: "`[file id, reason]` pairs."
+          items:
+            $ref: "#/components/schemas/FileError"
+
+    FileError:
+      type: array
+      description: "`[file id, message]`."
+      prefixItems:
+        - type: integer
+        - type: string
+      minItems: 2
+      maxItems: 2
+
+    ClusterJob:
+      type: object
+      required: [id, what, hosts, pending, finished, error, started_ms, finished_ms, cancelled, node]
+      properties:
+        id:
+          type: integer
+        what:
+          type: string
+        hosts:
+          type: object
+          description: Progress per host or store name.
+          additionalProperties:
+            $ref: "#/components/schemas/JobProgress"
+        pending:
+          type: integer
+          description: Files skipped because they are being written.
+        finished:
+          type: boolean
+        error:
+          type: [string, "null"]
+        started_ms:
+          type: integer
+          description: Unix milliseconds.
+        finished_ms:
+          type: [integer, "null"]
+        cancelled:
+          type: boolean
+        notes:
+          type: array
+          description: What happened, for people; omitted when empty.
+          items:
+            type: string
+        node:
+          type: string
+          description: The host that runs it.
+
+    JobProgress:
+      type: object
+      required: [total_files, done_files, total_bytes, done_bytes, failed, finished, cancelled]
+      properties:
+        total_files:
+          type: integer
+        done_files:
+          type: integer
+        total_bytes:
+          type: integer
+        done_bytes:
+          type: integer
+        failed:
+          type: array
+          items:
+            $ref: "#/components/schemas/FileError"
+        finished:
+          type: boolean
+        cancelled:
+          type: boolean
+
+    ImportProgress:
+      type: object
+      required: [files, bytes, adopted, adopted_bytes, dirs, symlinks, skipped, errors, finished, total_files, total_bytes, cancelled, copied_bytes, spread_files, spread_bytes, kept_files]
+      properties:
+        files:
+          type: integer
+        bytes:
+          type: integer
+        adopted:
+          type: integer
+          description: Blobs the namespace already had (linked, nothing copied).
+        adopted_bytes:
+          type: integer
+        dirs:
+          type: integer
+        symlinks:
+          type: integer
+        skipped:
+          type: integer
+        errors:
+          type: array
+          items:
+            type: string
+        finished:
+          type: boolean
+        total_files:
+          type: integer
+        total_bytes:
+          type: integer
+        cancelled:
+          type: boolean
+        copied_bytes:
+          type: integer
+        spread_files:
+          type: integer
+        spread_bytes:
+          type: integer
+        kept_files:
+          type: integer
+
+    StoreStatus:
+      type: object
+      required: [id, name, path, gateways]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        path:
+          type: string
+        gateways:
+          type: array
+          description: "`[gateway host, health]` pairs."
+          items:
+            type: array
+            prefixItems:
+              - type: string
+              - $ref: "#/components/schemas/StoreHealth"
+            minItems: 2
+            maxItems: 2
+
+    StoreHealth:
+      type: object
+      required: [healthy, total_bytes, free_bytes, objects, object_bytes, error]
+      properties:
+        healthy:
+          type: boolean
+        total_bytes:
+          type: integer
+        free_bytes:
+          type: integer
+        objects:
+          type: integer
+        object_bytes:
+          type: integer
+        error:
+          type: [string, "null"]
+
+    FreeTargets:
+      type: array
+      description: "`[host or @group, desired free bytes]` pairs."
+      items:
+        type: array
+        prefixItems:
+          - type: string
+          - type: integer
+        minItems: 2
+        maxItems: 2
+
+    Goal:
+      description: What a plan wants, tagged by `goal`. `hub` is filled in by the API.
+      oneOf:
+        - type: object
+          required: [goal, free]
+          properties:
+            goal:
+              const: free
+            free:
+              $ref: "#/components/schemas/FreeTargets"
+            archives:
+              type: array
+              description: Archive stores sole copies may be offloaded into, in order.
+              items:
+                type: string
+        - type: object
+          required: [goal, days]
+          properties:
+            goal:
+              const: tidy
+            days:
+              type: integer
+              description: Not opened within this many days.
+            hosts:
+              type: array
+              items:
+                type: string
+            archives:
+              type: array
+              items:
+                type: string
+        - type: object
+          required: [goal, days]
+          properties:
+            goal:
+              const: speedup
+            days:
+              type: integer
+            hosts:
+              type: array
+              items:
+                type: string
+            min_remote_bytes:
+              type: integer
+              default: 1073741824
+              description: Least network bytes read within the window that earns a copy.
+            keep_free:
+              type: [integer, "null"]
+              description: Free space each host keeps; default a tenth of its disk.
+        - type: object
+          required: [goal, selector]
+          properties:
+            goal:
+              const: consolidate
+            selector:
+              type: string
+            host:
+              type: [string, "null"]
+              description: Where to; by default the host that used it most.
+            hub:
+              type: string
+        - type: object
+          required: [goal, selector]
+          properties:
+            goal:
+              const: place
+            selector:
+              type: string
+            hosts:
+              type: array
+              description: Every fabric host when empty.
+              items:
+                type: string
+            factor:
+              type: number
+              default: 1.0
+              description: Share of the hosts each file is on, 1/hosts (spread) to 1 (everywhere).
+            hub:
+              type: string
+        - type: object
+          required: [goal, selector]
+          properties:
+            goal:
+              const: offgrid
+            selector:
+              type: string
+            hosts:
+              type: array
+              description: Off-grid hosts that should hold a full copy.
+              items:
+                type: string
+            hub:
+              type: string
+
+    Plan:
+      type: object
+      required: [id, goal, hosts, archives, steps, blocked, notes, feasible]
+      properties:
+        id:
+          type: integer
+        goal:
+          $ref: "#/components/schemas/Goal"
+        hosts:
+          type: array
+          items:
+            type: object
+            required: [host, free_now, target, projected_free, total]
+            properties:
+              host:
+                type: string
+              free_now:
+                type: integer
+              target:
+                type: integer
+                description: Desired free bytes (free goal), else 0.
+              projected_free:
+                type: integer
+              total:
+                type: integer
+        archives:
+          type: array
+          items:
+            type: object
+            required: [store, reachable, free_now, total, adds, projected_free]
+            properties:
+              store:
+                type: string
+              reachable:
+                type: boolean
+              free_now:
+                type: integer
+              total:
+                type: integer
+              adds:
+                type: integer
+              projected_free:
+                type: integer
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlanStep"
+        blocked:
+          type: array
+          description: What keeps the goal from being met.
+          items:
+            type: string
+        notes:
+          type: array
+          items:
+            type: string
+        feasible:
+          type: boolean
+
+    PlanStep:
+      type: object
+      description: Tagged by `kind`. `store` for offload; `requires` (optional) for evict.
+      required: [kind, host, node, bytes, copies]
+      properties:
+        kind:
+          type: string
+          enum: [evict, offload, replicate]
+        host:
+          type: string
+        node:
+          type: integer
+        store:
+          type: string
+        bytes:
+          type: integer
+        copies:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlanCopy"
+        requires:
+          type: integer
+          description: Remove a copy only if this node then holds the file.
+
+    PlanCopy:
+      type: object
+      required: [file, generation, size, path, why]
+      properties:
+        file:
+          type: integer
+        generation:
+          type: integer
+        size:
+          type: integer
+        path:
+          type: string
+        why:
+          type: string
+        keeper:
+          type: integer
+          description: Remove this copy only once this node holds the file; omitted when none.
+        skip:
+          type: boolean
+          description: Left out by the person editing the plan; omitted when false.
+        group:
+          type: string
+          description: Model or directory, omitted when empty.
+        name:
+          type: string
+          description: Name within `group`, omitted when empty.
+
+    Group:
+      type: object
+      required: [name, members]
+      properties:
+        name:
+          type: string
+        members:
+          type: array
+          items:
+            type: string
+
+    Setting:
+      type: object
+      required: [name, value, host, default, set, unit, min, max, about]
+      properties:
+        name:
+          type: string
+          enum: [read-recovery-wait, preferred-leader]
+        value:
+          type: integer
+          description: In `unit`; for a host-valued setting a node id (0 - none).
+        host:
+          type: [string, "null"]
+          description: A host-valued setting's host name.
+        default:
+          type: integer
+        set:
+          type: boolean
+          description: Set explicitly (not the default).
+        unit:
+          type: string
+          examples: [ms, node]
+        min:
+          type: integer
+        max:
+          type: integer
+        about:
+          type: string
+
+    SettingValue:
+      type: object
+      required: [name, value]
+      properties:
+        name:
+          type: string
+        value:
+          type: integer
+
+    Backup:
+      type: object
+      required: [id, name, store, created, selector, files, bytes]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        store:
+          type: [string, "null"]
+          description: Archive store name.
+        created:
+          type: integer
+          description: Unix seconds.
+        selector:
+          type: string
+        files:
+          type: integer
+        bytes:
+          type: integer
+
+    HostUsage:
+      type: object
+      required: [opens, last_open_ms, local_bytes, net_bytes]
+      properties:
+        opens:
+          type: integer
+        last_open_ms:
+          type: integer
+        local_bytes:
+          type: integer
+        net_bytes:
+          type: integer
+          description: Read from other hosts or archives.
+
+    UsageByHost:
+      type: object
+      description: Usage over the last 30 days, per host name.
+      additionalProperties:
+        $ref: "#/components/schemas/HostUsage"
+
+    HfRepo:
+      type: object
+      description: A repo; when its readiness cannot be computed, only `repo`, `kind` and `error`.
+      required: [repo, kind]
+      properties:
+        repo:
+          type: string
+        kind:
+          type: string
+          enum: [model, dataset]
+        selector:
+          type: string
+        files:
+          type: integer
+        bytes:
+          type: integer
+        writing:
+          type: integer
+        revisions:
+          type: integer
+        hosts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Readiness"
+        usage:
+          $ref: "#/components/schemas/UsageByHost"
+        last_open_ms:
+          type: integer
+        error:
+          type: string
+
+    TreeNode:
+      type: object
+      required: [name, kind, bytes, files]
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+          description: Namespace path; omitted when none.
+        kind:
+          type: string
+          enum: [dir, file, repo, revision, group, more]
+        selector:
+          type: string
+          description: Selector for actions on the whole node; omitted when none.
+        bytes:
+          type: integer
+        files:
+          type: integer
+        hosts:
+          type: array
+          description: Stores holding a leaf; omitted when empty.
+          items:
+            type: string
+        file:
+          type: integer
+          description: A leaf's file id; omitted when none.
+        children:
+          type: array
+          description: Omitted when empty.
+          items:
+            $ref: "#/components/schemas/TreeNode"
+        truncated:
+          type: boolean
+          description: Children exist below the depth asked for; omitted when false.
+
+    LogLine:
+      type: object
+      required: [host, ts_ms, level, target, message]
+      properties:
+        host:
+          type: string
+        seq:
+          type: integer
+          description: Per node, restarts with it (WebSocket `lines` only).
+        ts_ms:
+          type: integer
+        level:
+          type: string
+          enum: [ERROR, WARN, INFO, DEBUG, TRACE]
+        target:
+          type: string
+        message:
+          type: string
+          description: The message followed by its fields as `key=value`.
+
+    HostRequest:
+      type: object
+      required: [host]
+      properties:
+        host:
+          type: string
+
+    RttStats:
+      type: object
+      description: Round trips of one kind of Raft request to one peer (microseconds).
+      required: [ok, ewma_us, last_us, max_10s_us, timeouts, unreachable, errors]
+      properties:
+        ok:
+          type: integer
+        ewma_us:
+          type: integer
+        last_us:
+          type: integer
+        max_10s_us:
+          type: integer
+          description: Slowest answer in the last 10 to 20 seconds.
+        timeouts:
+          type: integer
+        unreachable:
+          type: integer
+        errors:
+          type: integer
+
+    PeerRaftStats:
+      type: object
+      required: [peer, voter, heartbeat, append, vote, snapshot, transfer, matched, lag, last_ack_ms]
+      properties:
+        peer:
+          type: integer
+        voter:
+          type: boolean
+        heartbeat:
+          $ref: "#/components/schemas/RttStats"
+        append:
+          $ref: "#/components/schemas/RttStats"
+        vote:
+          $ref: "#/components/schemas/RttStats"
+        snapshot:
+          $ref: "#/components/schemas/RttStats"
+        transfer:
+          $ref: "#/components/schemas/RttStats"
+        matched:
+          type: [integer, "null"]
+          description: Leader only - last log index known to be on the peer.
+        lag:
+          type: [integer, "null"]
+          description: Leader only - entries the peer is behind.
+        last_ack_ms:
+          type: [integer, "null"]
+          description: Leader only - milliseconds since the peer last acknowledged.
+
+    CountersSnapshot:
+      type: object
+      required: [schema, start_id, start_epoch_ns, boot_id, generation, mono_ns, wall_ns, ports]
+      properties:
+        schema:
+          type: integer
+          const: 1
+        start_id:
+          type: integer
+          description: Random per daemon start; a change means the counters reset.
+        start_epoch_ns:
+          type: integer
+        boot_id:
+          type: string
+        generation:
+          type: integer
+          description: 0 without a fabric, 1 with.
+        mono_ns:
+          type: integer
+        wall_ns:
+          type: integer
+        ports:
+          type: array
+          items:
+            type: object
+            required: [device, port, netdev, addrs, path_mtu, bytes_sent, bytes_received, ops_sent, ops_received, packets_sent, packets_received]
+            properties:
+              device:
+                type: string
+              port:
+                type: integer
+              netdev:
+                type: string
+              addrs:
+                type: array
+                items:
+                  type: string
+              path_mtu:
+                type: integer
+              bytes_sent:
+                type: integer
+              bytes_received:
+                type: integer
+              ops_sent:
+                type: integer
+              ops_received:
+                type: integer
+              packets_sent:
+                type: integer
+                description: Estimated, ceil(bytes / path_mtu) per operation.
+              packets_received:
+                type: integer
+
+    WsPageMessage:
+      description: Page-to-server WebSocket frames (`/v1/ws`).
+      oneOf:
+        - type: object
+          required: [type, id, method, path]
+          properties:
+            type:
+              const: call
+            id:
+              type: integer
+            method:
+              type: string
+            path:
+              type: string
+              description: Must start with `/v1/`.
+            body:
+              description: JSON request body, if any.
+        - type: object
+          required: [type]
+          properties:
+            type:
+              const: logs
+            host:
+              type: [string, "null"]
+            level:
+              type: [string, "null"]
+            q:
+              type: [string, "null"]
+            limit:
+              type: [integer, "null"]
+        - type: object
+          required: [type]
+          properties:
+            type:
+              const: logs_off
+
+    WsServerMessage:
+      description: Server-to-page WebSocket frames (`/v1/ws`).
+      oneOf:
+        - type: object
+          required: [type, data]
+          properties:
+            type:
+              const: state
+            data:
+              type: object
+              required: [status, jobs, stores, groups, ui]
+              properties:
+                status:
+                  $ref: "#/components/schemas/Status"
+                jobs:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/ClusterJob"
+                stores:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/StoreStatus"
+                groups:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/Group"
+                ui:
+                  type: string
+                  description: Build id of the web UI this daemon serves; a page that differs reloads.
+        - type: object
+          required: [type]
+          properties:
+            type:
+              const: changed
+        - type: object
+          required: [type, lines]
+          properties:
+            type:
+              const: lines
+            lines:
+              type: array
+              items:
+                $ref: "#/components/schemas/LogLine"
+        - type: object
+          required: [type, id, status, body]
+          properties:
+            type:
+              const: reply
+            id:
+              type: integer
+            status:
+              type: integer
+              description: HTTP status.
+            body:
+              description: JSON response body.

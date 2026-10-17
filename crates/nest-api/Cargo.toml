@@ -28,3 +28,4 @@ sha2.workspace = true
 [dev-dependencies]
 nest-rpc.workspace = true
 tempfile.workspace = true
+serde_yaml.workspace = true
