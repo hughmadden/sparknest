@@ -2,7 +2,7 @@
 //! as exclusive `Slot`s and returned on drop. Bounded by construction:
 //! acquiring waits when every slot is in use (PROPOSAL invariant 9).
 
-use crate::verbs::{Context, Region};
+use crate::verbs::{Access, Context, Region};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -25,7 +25,22 @@ impl Pool {
         remote_write: bool,
         base: u32,
     ) -> std::io::Result<Arc<Pool>> {
-        let region = Region::new(ctx, slots as usize * slot_size, remote_write)?;
+        let access = if remote_write {
+            Access::RemoteWrite
+        } else {
+            Access::Local
+        };
+        Self::with_access(ctx, slots, slot_size, access, base)
+    }
+
+    pub fn with_access(
+        ctx: &Arc<Context>,
+        slots: u32,
+        slot_size: usize,
+        access: Access,
+        base: u32,
+    ) -> std::io::Result<Arc<Pool>> {
+        let region = Region::with_access(ctx, slots as usize * slot_size, access)?;
         Ok(Arc::new(Pool {
             region,
             slot_size,
@@ -144,12 +159,25 @@ impl Tiers {
         tiers: &[(usize, u32)],
         remote_write: bool,
     ) -> std::io::Result<Tiers> {
+        let access = if remote_write {
+            Access::RemoteWrite
+        } else {
+            Access::Local
+        };
+        Self::with_access(ctx, tiers, access)
+    }
+
+    pub fn with_access(
+        ctx: &Arc<Context>,
+        tiers: &[(usize, u32)],
+        access: Access,
+    ) -> std::io::Result<Tiers> {
         let mut t: Vec<(usize, u32)> = tiers.iter().copied().filter(|(_, n)| *n > 0).collect();
         t.sort_by_key(|(size, _)| *size);
         let mut pools = Vec::new();
         let mut base = 0u32;
         for (size, n) in t {
-            pools.push(Pool::new(ctx, n, size, remote_write, base)?);
+            pools.push(Pool::with_access(ctx, n, size, access, base)?);
             base += n;
         }
         Ok(Tiers { pools })
@@ -176,6 +204,11 @@ impl Tiers {
             .expect("the largest tier fits every read")
             .acquire()
             .await
+    }
+
+    /// The largest slot any tier holds (0: no tiers).
+    pub fn max_size(&self) -> usize {
+        self.pools.last().map_or(0, |p| p.slot_size)
     }
 
     /// The largest tier (bulk reads).

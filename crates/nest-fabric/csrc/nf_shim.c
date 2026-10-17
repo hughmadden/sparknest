@@ -44,7 +44,16 @@ typedef struct {
 	uint32_t qp_num;
 } nf_wc;
 
-enum { NF_OP_OTHER = 0, NF_OP_SEND = 1, NF_OP_RECV = 2, NF_OP_WRITE = 3, NF_OP_RECV_IMM = 4 };
+enum { NF_OP_OTHER = 0, NF_OP_SEND = 1, NF_OP_RECV = 2, NF_OP_WRITE = 3, NF_OP_RECV_IMM = 4,
+       NF_OP_READ = 5 };
+
+/* nf_reg access bits. */
+enum { NF_REMOTE_WRITE = 1, NF_REMOTE_READ = 2 };
+
+/* Outstanding RDMA READs per QP, both as initiator and as responder. Capped
+ * so two hosts with different devices still agree (the initiator must never
+ * exceed the responder's resources); every ConnectX we run reports 16. */
+#define NF_RD_ATOMIC_MAX 16
 
 struct nf_ctx *nf_open(const char *ibdev)
 {
@@ -106,14 +115,16 @@ int nf_max_qp_wr(struct nf_ctx *c)
 	return a.max_qp_wr;
 }
 
-struct nf_mr *nf_reg(struct nf_ctx *c, void *addr, size_t len, int remote_write)
+struct nf_mr *nf_reg(struct nf_ctx *c, void *addr, size_t len, int remote)
 {
 	struct nf_mr *m = calloc(1, sizeof *m);
 	int access = IBV_ACCESS_LOCAL_WRITE;
 	if (!m)
 		return NULL;
-	if (remote_write)
+	if (remote & NF_REMOTE_WRITE)
 		access |= IBV_ACCESS_REMOTE_WRITE;
+	if (remote & NF_REMOTE_READ)
+		access |= IBV_ACCESS_REMOTE_READ;
 	m->mr = ibv_reg_mr(c->pd, addr, len, access);
 	if (!m->mr) {
 		free(m);
@@ -199,6 +210,7 @@ int nf_poll(struct nf_cq *q, nf_wc *out, int max)
 		case IBV_WC_RECV: out[i].opcode = NF_OP_RECV; break;
 		case IBV_WC_RDMA_WRITE: out[i].opcode = NF_OP_WRITE; break;
 		case IBV_WC_RECV_RDMA_WITH_IMM: out[i].opcode = NF_OP_RECV_IMM; break;
+		case IBV_WC_RDMA_READ: out[i].opcode = NF_OP_READ; break;
 		default: out[i].opcode = NF_OP_OTHER; break;
 		}
 	}
@@ -231,7 +243,8 @@ struct nf_qp *nf_qp_create(struct nf_ctx *c, struct nf_cq *scq, struct nf_cq *rc
 	a.qp_state = IBV_QPS_INIT;
 	a.pkey_index = 0;
 	a.port_num = port;
-	a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+	a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
+			    | IBV_ACCESS_REMOTE_READ;
 	if (ibv_modify_qp(q->qp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT
 			  | IBV_QP_ACCESS_FLAGS)) {
 		int e = errno;
@@ -245,17 +258,36 @@ struct nf_qp *nf_qp_create(struct nf_ctx *c, struct nf_cq *scq, struct nf_cq *rc
 
 uint32_t nf_qp_num(const struct nf_qp *q) { return q->qp->qp_num; }
 
+/* RDMA READs this QP may have outstanding: the device's limits, capped. */
+static void nf_rd_atomic(struct ibv_context *ctx, uint8_t *init, uint8_t *dest)
+{
+	struct ibv_device_attr d;
+	int i = 1, r = 1;
+	if (!ibv_query_device(ctx, &d)) {
+		i = d.max_qp_init_rd_atom;
+		r = d.max_qp_rd_atom;
+	}
+	if (i > NF_RD_ATOMIC_MAX)
+		i = NF_RD_ATOMIC_MAX;
+	if (r > NF_RD_ATOMIC_MAX)
+		r = NF_RD_ATOMIC_MAX;
+	*init = (uint8_t)(i < 1 ? 1 : i);
+	*dest = (uint8_t)(r < 1 ? 1 : r);
+}
+
 int nf_qp_connect(struct nf_qp *q, uint8_t port, int sgid_index, uint32_t local_psn,
 		  const uint8_t remote_gid[16], uint32_t remote_qpn, uint32_t remote_psn,
 		  uint32_t mtu)
 {
 	struct ibv_qp_attr a;
+	uint8_t rd_init, rd_dest;
+	nf_rd_atomic(q->qp->context, &rd_init, &rd_dest);
 	memset(&a, 0, sizeof a);
 	a.qp_state = IBV_QPS_RTR;
 	a.path_mtu = (enum ibv_mtu)mtu;
 	a.dest_qp_num = remote_qpn;
 	a.rq_psn = remote_psn;
-	a.max_dest_rd_atomic = 1;
+	a.max_dest_rd_atomic = rd_dest;
 	a.min_rnr_timer = 12;
 	a.ah_attr.is_global = 1;
 	a.ah_attr.port_num = port;
@@ -274,7 +306,7 @@ int nf_qp_connect(struct nf_qp *q, uint8_t port, int sgid_index, uint32_t local_
 	a.retry_cnt = 7;
 	a.rnr_retry = 7;
 	a.sq_psn = local_psn;
-	a.max_rd_atomic = 1;
+	a.max_rd_atomic = rd_init;
 	return ibv_modify_qp(q->qp, &a, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT
 			     | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
 }
@@ -330,6 +362,24 @@ int nf_post_write_imm(struct nf_qp *q, uint64_t wr_id, void *addr, uint32_t len,
 	wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
 	wr.send_flags = IBV_SEND_SIGNALED;
 	wr.imm_data = htonl(imm);
+	wr.wr.rdma.remote_addr = raddr;
+	wr.wr.rdma.rkey = rkey;
+	return ibv_post_send(q->qp, &wr, &bad);
+}
+
+/* Read len bytes from the peer's registered (remote-readable) raddr into
+ * the local buffer. */
+int nf_post_read(struct nf_qp *q, uint64_t wr_id, void *addr, uint32_t len, uint32_t lkey,
+		 uint64_t raddr, uint32_t rkey)
+{
+	struct ibv_sge sge = { .addr = (uintptr_t)addr, .length = len, .lkey = lkey };
+	struct ibv_send_wr wr, *bad;
+	memset(&wr, 0, sizeof wr);
+	wr.wr_id = wr_id;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+	wr.opcode = IBV_WR_RDMA_READ;
+	wr.send_flags = IBV_SEND_SIGNALED;
 	wr.wr.rdma.remote_addr = raddr;
 	wr.wr.rdma.rkey = rkey;
 	return ibv_post_send(q->qp, &wr, &bad);

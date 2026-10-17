@@ -38,14 +38,18 @@ pub const NF_OP_SEND: u32 = 1;
 pub const NF_OP_RECV: u32 = 2;
 pub const NF_OP_WRITE: u32 = 3;
 pub const NF_OP_RECV_IMM: u32 = 4;
+pub const NF_OP_READ: u32 = 5;
+
+/// `nf_reg` access bits.
+pub const NF_REMOTE_WRITE: c_int = 1;
+pub const NF_REMOTE_READ: c_int = 2;
 
 unsafe extern "C" {
     pub fn nf_open(ibdev: *const c_char) -> *mut nf_ctx;
     pub fn nf_close(c: *mut nf_ctx);
     pub fn nf_query_port(c: *mut nf_ctx, port: u8, state: *mut u32, active_mtu: *mut u32) -> c_int;
     pub fn nf_max_qp_wr(c: *mut nf_ctx) -> c_int;
-    pub fn nf_reg(c: *mut nf_ctx, addr: *mut c_void, len: usize, remote_write: c_int)
-    -> *mut nf_mr;
+    pub fn nf_reg(c: *mut nf_ctx, addr: *mut c_void, len: usize, remote: c_int) -> *mut nf_mr;
     pub fn nf_lkey(m: *const nf_mr) -> u32;
     pub fn nf_rkey(m: *const nf_mr) -> u32;
     pub fn nf_dereg(m: *mut nf_mr);
@@ -95,5 +99,14 @@ unsafe extern "C" {
         raddr: u64,
         rkey: u32,
         imm: u32,
+    ) -> c_int;
+    pub fn nf_post_read(
+        q: *mut nf_qp,
+        wr_id: u64,
+        addr: *mut c_void,
+        len: u32,
+        lkey: u32,
+        raddr: u64,
+        rkey: u32,
     ) -> c_int;
 }

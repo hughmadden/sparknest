@@ -235,3 +235,144 @@ async fn a_wrong_secret_gets_no_lane() {
     assert_eq!(other.connected(NodeId(1)), 0);
     assert_eq!(core.connected(NodeId(8)), 0);
 }
+
+/// Applies writes to one file, checking the epoch as an owner does, and
+/// choosing append offsets itself.
+struct Sink {
+    file: std::fs::File,
+    epoch: nest_types::Epoch,
+    end: std::sync::Mutex<()>,
+}
+
+impl nest_fabric::WriteSink for Sink {
+    fn write(
+        &self,
+        op: nest_fabric::WriteOp,
+        data: bytes::Bytes,
+    ) -> BoxFuture<'static, Result<u32, NestError>> {
+        use std::os::unix::fs::FileExt;
+        let r = if op.file != FileId(5) {
+            Err(NestError::NotFound)
+        } else if op.epoch != self.epoch {
+            Err(NestError::Stale)
+        } else {
+            let _end = self.end.lock().unwrap();
+            let off = if op.append {
+                self.file.metadata().unwrap().len()
+            } else {
+                op.offset
+            };
+            self.file.write_all_at(&data, off).unwrap();
+            Ok(data.len() as u32)
+        };
+        async move { r }.boxed()
+    }
+}
+
+/// ADR-057: writes over lanes land with the right bytes, appends at the
+/// end the owner chooses, and the owner's errors come back as such.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn lanes_carry_writes_to_the_owner() {
+    use nest_fabric::{WriteError, WriteOp, WriteSink};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LanesConfig {
+        per_peer: 3,
+        chunk: 1 << 20,
+        ..LanesConfig::default()
+    };
+    let (core, offgrid) = pair(cfg).await;
+    let path = dir.path().join("owned");
+    let sink: Arc<dyn WriteSink> = Arc::new(Sink {
+        file: std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap(),
+        epoch: nest_types::Epoch(4),
+        end: Default::default(),
+    });
+    core.set_sink(Arc::downgrade(&sink));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !offgrid.writable(NodeId(1)) || !core.writable(NodeId(8)) {
+        assert!(std::time::Instant::now() < deadline, "no lane takes writes");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let op = |offset, append| WriteOp {
+        file: FileId(5),
+        epoch: nest_types::Epoch(4),
+        writer: (NodeId(8), 1),
+        offset,
+        append,
+    };
+    // Positioned writes, one a full chunk.
+    let a = pattern(4, 1 << 20);
+    assert_eq!(
+        offgrid
+            .write(NodeId(1), op(0, false), a.clone().into())
+            .await,
+        Ok(1 << 20)
+    );
+    assert_eq!(
+        offgrid
+            .write(NodeId(1), op(10, false), b"0123".to_vec().into())
+            .await,
+        Ok(4)
+    );
+    // Concurrent appends from many tasks: none overlap.
+    let rec = 4096usize;
+    let appends: Vec<_> = (0..48u8)
+        .map(|i| {
+            let o = offgrid.clone();
+            async move {
+                o.write(NodeId(1), op(0, true), vec![i; rec].into())
+                    .await
+                    .unwrap()
+            }
+        })
+        .collect();
+    for n in futures::future::join_all(appends).await {
+        assert_eq!(n as usize, rec);
+    }
+    let got = std::fs::read(&path).unwrap();
+    assert_eq!(got.len(), (1 << 20) + 48 * rec);
+    let mut want = a.clone();
+    want[10..14].copy_from_slice(b"0123");
+    assert_eq!(&got[..1 << 20], &want[..]);
+    let mut seen: Vec<u8> = got[1 << 20..]
+        .chunks(rec)
+        .map(|c| {
+            assert!(c.iter().all(|b| *b == c[0]), "appends interleaved");
+            c[0]
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(seen, (0..48).collect::<Vec<u8>>());
+    // The owner's refusals are final, not "unsent".
+    let stale = WriteOp {
+        epoch: nest_types::Epoch(3),
+        ..op(0, false)
+    };
+    assert_eq!(
+        offgrid.write(NodeId(1), stale, b"x".to_vec().into()).await,
+        Err(WriteError::Failed(NestError::Stale))
+    );
+    // Reads still work on the same lanes.
+    let src = files(&dir.path().join("r"), &[(9, 1, pattern(9, 100))]);
+    core.set_source(Arc::downgrade(&src));
+    assert_eq!(
+        offgrid
+            .read(NodeId(1), FileId(9), Generation(1), 0, 100)
+            .await
+            .unwrap(),
+        pattern(9, 100)
+    );
+    // No lane to a peer: unsent, safe to send another way.
+    assert!(matches!(
+        offgrid
+            .write(NodeId(2), op(0, false), b"x".to_vec().into())
+            .await,
+        Err(WriteError::Unsent(_))
+    ));
+}

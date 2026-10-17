@@ -68,6 +68,17 @@ impl Drop for Context {
     }
 }
 
+/// What a peer may do with a registered region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// Only this host's NIC touches it (staging, receive rings).
+    Local,
+    /// Peers RDMA-WRITE into it (landing slots for reads).
+    RemoteWrite,
+    /// Peers RDMA-READ from it (outgoing write buffers, ADR-057).
+    RemoteRead,
+}
+
 /// Page-aligned memory registered with a context.
 pub struct Region {
     ctx: Arc<Context>,
@@ -84,6 +95,25 @@ unsafe impl Sync for Region {}
 
 impl Region {
     pub fn new(ctx: &Arc<Context>, len: usize, remote_write: bool) -> io::Result<Region> {
+        Self::with_access(
+            ctx,
+            len,
+            if remote_write {
+                Access::RemoteWrite
+            } else {
+                Access::Local
+            },
+        )
+    }
+
+    /// Memory the peer may access as `access` says (RDMA WRITE into it, or
+    /// RDMA READ from it).
+    pub fn with_access(ctx: &Arc<Context>, len: usize, access: Access) -> io::Result<Region> {
+        let remote = match access {
+            Access::Local => 0,
+            Access::RemoteWrite => sys::NF_REMOTE_WRITE,
+            Access::RemoteRead => sys::NF_REMOTE_READ,
+        };
         let layout = std::alloc::Layout::from_size_align(len.max(4096), 4096)
             .map_err(|_| io::Error::other("bad region size"))?;
         // SAFETY: non-zero size layout.
@@ -92,7 +122,7 @@ impl Region {
             return Err(io::Error::other("allocating registered region"));
         }
         // SAFETY: ptr..ptr+len is owned by us and outlives the MR.
-        let mr = unsafe { sys::nf_reg(ctx.raw, ptr as *mut c_void, len, remote_write as i32) };
+        let mr = unsafe { sys::nf_reg(ctx.raw, ptr as *mut c_void, len, remote) };
         if mr.is_null() {
             let e = last_err("ibv_reg_mr (check `ulimit -l`)");
             // SAFETY: allocated above with this layout.
@@ -396,6 +426,32 @@ impl Qp {
         } != 0
         {
             return Err(last_err("ibv_post_send (write with imm)"));
+        }
+        Ok(())
+    }
+}
+
+impl Qp {
+    /// # Safety
+    /// Local range as for `post_recv` (the NIC writes into it until the
+    /// completion); the remote range must be a region the peer registered
+    /// for remote read and keeps untouched until it hears back.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn post_read(
+        &self,
+        wr_id: u64,
+        addr: *mut u8,
+        len: u32,
+        lkey: u32,
+        raddr: u64,
+        rkey: u32,
+    ) -> io::Result<()> {
+        // SAFETY: forwarded caller contract.
+        if unsafe {
+            sys::nf_post_read(self.raw, wr_id, addr as *mut c_void, len, lkey, raddr, rkey)
+        } != 0
+        {
+            return Err(last_err("ibv_post_send (read)"));
         }
         Ok(())
     }

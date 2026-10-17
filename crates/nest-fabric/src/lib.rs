@@ -13,13 +13,14 @@ pub(crate) mod sys;
 pub mod tcp;
 pub use sys::nf_wc as Completion;
 pub use sys::{
-    NF_OP_RECV as OP_RECV, NF_OP_RECV_IMM as OP_RECV_IMM, NF_OP_SEND as OP_SEND,
-    NF_OP_WRITE as OP_WRITE,
+    NF_OP_READ as OP_READ, NF_OP_RECV as OP_RECV, NF_OP_RECV_IMM as OP_RECV_IMM,
+    NF_OP_SEND as OP_SEND, NF_OP_WRITE as OP_WRITE,
 };
 pub mod verbs;
 
 pub use engine::{
-    Fabric, FabricConfig, ReadBuf, ReadDone, ReadSource, Reservation, ServeFile, Stats, Tier,
+    Fabric, FabricConfig, PROTOCOL, ReadBuf, ReadDone, ReadSource, Reservation, ServeFile, Stats,
+    Tier, WriteError, WriteOp, WriteSink,
 };
 pub use pool::{Pool, Slot, Tiers};
 pub use rail::{Rail, discover};

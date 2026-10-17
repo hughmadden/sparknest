@@ -16,17 +16,39 @@
 //!                 <- or SEND ReadErr{slot, code}
 //!   complete the waiter for (device, slot)
 //! ```
+//! Write protocol (3, ADR-057): the owner pulls the bytes.
+//! ```text
+//! writer                                            owner
+//!   take an outgoing slot (registered remote-readable), copy the bytes in
+//!   SEND WriteReq{req, file, epoch, writer, off|append, len, addr, rkey} ->
+//!                                        queue until a write staging slot
+//!                                        is free (never reserved per writer)
+//!                 <- RDMA READ(addr, rkey -> staging slot)
+//!                                        WriteSink::write: the data layer's
+//!                                        owner checks, append offset, pwrite
+//!                 <- SEND WriteDone{req, n | code}
+//!   complete the waiter for (device, req); the slot is free again
+//! ```
+//! A write is applied at most once and never resent: when its answer is
+//! lost (the lane failed, or `write_timeout` passed after the request went
+//! out) the writer reports an error with the outcome unknown, and its
+//! outgoing slot is never reused (the owner may still read it until the
+//! lane's QP is in the error state). Only failures before the request was
+//! posted, or the owner's "not accepting", are `WriteError::Unsent` (safe
+//! to send another way).
+//!
 //! Each lane's receive ring absorbs requests, error replies and
 //! write-with-imm notifications; a per-lane window keeps a node's requests
-//! plus its responses within the peer's ring. Links are made only between
-//! hosts speaking the same `PROTOCOL` (ADR-032); otherwise reads use TCP.
+//! plus its responses within the peer's ring. A link speaks the lower of
+//! the two hosts' protocols, at least `MIN_PROTOCOL` (ADR-032): hosts on 2
+//! pair for reads, and writes to them go over TCP. Otherwise reads use TCP.
 
 use crate::pool::{Slot, Tiers};
 use crate::rail::Rail;
 use crate::sys::{self, nf_wc};
 use crate::verbs::{Context, Cq, Qp, QpInfo, Region};
 use futures::future::BoxFuture;
-use nest_types::{FileId, Generation, NestError, NodeId};
+use nest_types::{Epoch, FileId, Generation, NestError, NodeId};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -66,6 +88,18 @@ pub struct FabricConfig {
     /// reads to that peer fail at once (callers fall back to TCP).
     pub link_retry: Duration,
     pub link_retry_max: Duration,
+    /// Remote writes (ADR-057), any order: per tier, `landing` is the
+    /// writer's outgoing slots (registered remote-readable) and `staging`
+    /// the owner's slots it pulls into. The largest size is the largest
+    /// write sent over RDMA; larger ones go over TCP.
+    pub write_tiers: Vec<Tier>,
+    /// A remote write still unanswered after this fails with its outcome
+    /// unknown, and its lane is retired.
+    pub write_timeout: Duration,
+    /// The protocol this host offers; tests set 2 to stand in for an
+    /// older host.
+    #[doc(hidden)]
+    pub protocol: u32,
 }
 
 /// A slot tier: its size, and landing and staging slots per device.
@@ -100,13 +134,32 @@ impl Default for FabricConfig {
             lane_grace: Duration::from_secs(10),
             link_retry: Duration::from_secs(1),
             link_retry_max: Duration::from_secs(30),
+            write_tiers: vec![
+                Tier {
+                    size: 64 << 10,
+                    landing: 128,
+                    staging: 64,
+                },
+                Tier {
+                    size: 1 << 20,
+                    landing: 32,
+                    staging: 32,
+                },
+            ],
+            write_timeout: WRITE_TIMEOUT,
+            protocol: PROTOCOL,
         }
     }
 }
 
-/// The read protocol links speak; hosts pair only with the same one.
+/// The protocol links speak: the lower of the two hosts'.
 /// 2: imm carries the whole slot id, the length is the completion's count.
-const PROTOCOL: u32 = 2;
+/// 3: remote writes pulled by the owner (`WriteReq`/`WriteDone`).
+pub const PROTOCOL: u32 = 3;
+/// The oldest protocol a link is made with.
+const MIN_PROTOCOL: u32 = 2;
+/// The first protocol with remote writes.
+const WRITE_PROTOCOL: u32 = 3;
 
 /// An object opened for serving, and what must stay held while a read of
 /// it is in flight (the data layer's in-flight count, which fencing and
@@ -155,12 +208,83 @@ impl ReadBuf {
     }
 }
 
+/// A write to apply as owner: where, in which ownership epoch, by which
+/// writer handle. The fabric carries it; what an epoch means is the data
+/// layer's business.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteOp {
+    pub file: FileId,
+    pub epoch: Epoch,
+    pub writer: (NodeId, u64),
+    /// Ignored when `append`: the owner writes at the end.
+    pub offset: u64,
+    pub append: bool,
+}
+
+/// Applies writes other hosts send (over RDMA or TCP lanes), with exactly
+/// the checks a write over the control connection gets. Implemented by the
+/// data service.
+pub trait WriteSink: Send + Sync + 'static {
+    /// Apply `data` as `op` says; the bytes written. Pulled bytes stay in
+    /// the fabric's staging slot (no copy) until `data` is dropped.
+    fn write(&self, op: WriteOp, data: bytes::Bytes) -> BoxFuture<'static, Result<u32, NestError>>;
+}
+
+/// A write staging slot holding pulled bytes, owned by the `Bytes` handed
+/// to the sink; dropping it frees the slot for the next queued write.
+struct WriteBuf {
+    slot: Option<Slot>,
+    len: usize,
+    dev: Arc<Device>,
+}
+
+impl AsRef<[u8]> for WriteBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.slot.as_ref().map_or(&[], |s| s.as_slice(self.len))
+    }
+}
+
+impl Drop for WriteBuf {
+    fn drop(&mut self) {
+        drop(self.slot.take());
+        // The poller starts queued pulls when a slot frees.
+        self.dev.wake();
+    }
+}
+
+/// Why a remote write failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// Nothing was applied and nothing will be: it never left this host,
+    /// or the owner did not take it (no link, an older peer, not
+    /// accepting writes). Safe to send another way.
+    Unsent(NestError),
+    /// The owner answered with this error, or the outcome is unknown (the
+    /// answer was lost): never resend it.
+    Failed(NestError),
+}
+
+impl WriteError {
+    pub fn into_inner(self) -> NestError {
+        match self {
+            WriteError::Unsent(e) | WriteError::Failed(e) => e,
+        }
+    }
+}
+
 // ---------------------------------------------------------------- wire
 
 const MSG_SIZE: usize = 64;
 const RING_SLOT: usize = 128;
 const KIND_READ: u8 = 1;
 const KIND_ERR: u8 = 2;
+/// Protocol 3: a write for the owner to pull, and its answer.
+const KIND_WRITE: u8 = 3;
+const KIND_WRITE_DONE: u8 = 4;
+const WRITE_DONE_SIZE: usize = 16;
+/// `WriteDone` code: the owner did not take the write (no sink yet, too
+/// large for its slots); nothing was applied.
+const NOT_ACCEPTING: u8 = 255;
 
 /// The largest read a `Reservation` makes (a FUSE request is at most
 /// 128 KiB); larger reads use `read`.
@@ -170,16 +294,25 @@ const SERVE_DEPTH: usize = 256;
 /// A read the reader still waits for after this is failed (and its lane
 /// retired), as `read` does.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// A write whose answer has not come after this is failed with its outcome
+/// unknown (and its lane retired).
+const WRITE_TIMEOUT: Duration = READ_TIMEOUT;
 /// A completion thread keeps spinning this long after its last work.
 const HOT: Duration = Duration::from_millis(10);
 /// Unit of the in-flight byte budget.
 const BUDGET_UNIT: usize = 4 << 10;
 
+/// Error codes on the wire (append only: older peers read unknown codes
+/// as I/O errors).
 fn err_code(e: &NestError) -> u8 {
     match e {
         NestError::Stale => 1,
         NestError::Unavailable(_) => 2,
         NestError::NotFound => 3,
+        NestError::NoSpace => 5,
+        NestError::NoQuorum => 6,
+        NestError::Busy(_) => 7,
+        NestError::Invalid(_) => 8,
         _ => 4,
     }
 }
@@ -189,7 +322,11 @@ fn err_from(code: u8) -> NestError {
         1 => NestError::Stale,
         2 => NestError::Unavailable("peer cannot serve that range".into()),
         3 => NestError::NotFound,
-        _ => NestError::Io("remote read failed".into()),
+        5 => NestError::NoSpace,
+        6 => NestError::NoQuorum,
+        7 => NestError::Busy("owner busy".into()),
+        8 => NestError::Invalid("owner refused the write".into()),
+        _ => NestError::Io("remote operation failed".into()),
     }
 }
 
@@ -230,11 +367,82 @@ impl ReadReq {
     }
 }
 
+/// A write for the owner to pull (64 bytes, sent inline).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WriteReq {
+    /// The writer's outgoing slot id: names the request in `WriteDone`.
+    req: u32,
+    file: u64,
+    epoch: u64,
+    offset: u64,
+    len: u32,
+    rkey: u32,
+    addr: u64,
+    writer: u64,
+    handle: u64,
+    append: bool,
+}
+
+impl WriteReq {
+    fn encode(&self, out: &mut [u8; MSG_SIZE]) {
+        out[0] = KIND_WRITE;
+        out[1] = self.append as u8;
+        out[4..8].copy_from_slice(&self.req.to_le_bytes());
+        out[8..16].copy_from_slice(&self.file.to_le_bytes());
+        out[16..24].copy_from_slice(&self.epoch.to_le_bytes());
+        out[24..32].copy_from_slice(&self.offset.to_le_bytes());
+        out[32..36].copy_from_slice(&self.len.to_le_bytes());
+        out[36..40].copy_from_slice(&self.rkey.to_le_bytes());
+        out[40..48].copy_from_slice(&self.addr.to_le_bytes());
+        out[48..56].copy_from_slice(&self.writer.to_le_bytes());
+        out[56..64].copy_from_slice(&self.handle.to_le_bytes());
+    }
+    fn decode(b: &[u8]) -> WriteReq {
+        let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        WriteReq {
+            append: b[1] & 1 != 0,
+            req: u32_at(4),
+            file: u64_at(8),
+            epoch: u64_at(16),
+            offset: u64_at(24),
+            len: u32_at(32),
+            rkey: u32_at(36),
+            addr: u64_at(40),
+            writer: u64_at(48),
+            handle: u64_at(56),
+        }
+    }
+    fn op(&self) -> WriteOp {
+        WriteOp {
+            file: FileId(self.file),
+            epoch: Epoch(self.epoch),
+            writer: (NodeId(self.writer), self.handle),
+            offset: self.offset,
+            append: self.append,
+        }
+    }
+}
+
+/// `WriteDone`: code 0 and the bytes written, or an error code.
+fn write_done(req: u32, r: Result<u32, u8>) -> [u8; WRITE_DONE_SIZE] {
+    let mut m = [0u8; WRITE_DONE_SIZE];
+    m[0] = KIND_WRITE_DONE;
+    m[4..8].copy_from_slice(&req.to_le_bytes());
+    match r {
+        Ok(n) => m[8..12].copy_from_slice(&n.to_le_bytes()),
+        Err(code) => m[1] = code,
+    }
+    m
+}
+
 // ---------------------------------------------------------------- wr ids
 
 const WR_RING: u64 = 1;
 const WR_SEND: u64 = 2;
 const WR_WRITE: u64 = 3;
+/// The owner's RDMA READ of a writer's buffer.
+const WR_PULL: u64 = 4;
 
 fn wr(kind: u64, lane: u32, idx: u32) -> u64 {
     (kind << 56) | ((lane as u64) << 32) | idx as u64
@@ -255,6 +463,13 @@ struct Device {
     cq: Arc<Cq>,
     landing: Tiers,
     staging: Tiers,
+    /// Writes we send: peers RDMA-READ these.
+    outgoing: Tiers,
+    /// Writes we receive are pulled into these.
+    write_staging: Tiers,
+    /// Writes waiting for a write staging slot, oldest first (and whether
+    /// each has been counted as waiting).
+    write_waiting: Mutex<std::collections::VecDeque<(Arc<Lane>, WriteReq, bool)>>,
     mtu: u32,
     /// Serving: the io_uring reads go through, and requests waiting for a
     /// slot or ring room. Only the device's poller thread submits.
@@ -448,6 +663,31 @@ impl Waiter {
 struct Link {
     lanes: Vec<Arc<Lane>>,
     next: AtomicU32,
+    /// The protocol both ends speak.
+    protocol: u32,
+}
+
+/// A write of ours awaiting its `WriteDone`. Owns the outgoing slot, which
+/// the owner may read until it answers.
+struct WriteWaiter {
+    lane: u32,
+    slot: Slot,
+    len: usize,
+    since: std::time::Instant,
+    tx: oneshot::Sender<Result<u32, WriteError>>,
+}
+
+/// A pull in flight: the staging slot the writer's bytes land in.
+struct Pull {
+    lane: Arc<Lane>,
+    req: WriteReq,
+    slot: Slot,
+}
+
+fn unknown_outcome(peer: NodeId, why: &str) -> WriteError {
+    WriteError::Failed(NestError::Io(format!(
+        "remote write to {peer}: {why}; outcome unknown"
+    )))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -498,6 +738,11 @@ pub struct Fabric {
     /// With the bytes written, counted when the write completes.
     in_flight: Mutex<HashMap<u64, (Slot, u32)>>,
     source: Mutex<Option<Weak<dyn ReadSource>>>,
+    /// Our writes awaiting answers, by (device, outgoing slot).
+    writes: Mutex<HashMap<(u32, u32), WriteWaiter>>,
+    /// Pulls in flight, by work request id.
+    pulls: Mutex<HashMap<u64, Pull>>,
+    sink: Mutex<Option<Weak<dyn WriteSink>>>,
     /// Where read latencies are recorded (set by the host's data layer).
     io: std::sync::OnceLock<Arc<crate::iostats::IoStats>>,
     rt: tokio::runtime::Handle,
@@ -528,6 +773,14 @@ pub struct Stats {
     pub served_fast: AtomicU64,
     /// Reads made through a `Reservation` (answered by callback).
     pub read_now: AtomicU64,
+    /// Remote writes this host made (answered, applied), and their bytes.
+    pub writes: AtomicU64,
+    pub write_bytes: AtomicU64,
+    /// Writes other hosts sent here, pulled and applied by the sink.
+    pub pulled: AtomicU64,
+    pub pulled_bytes: AtomicU64,
+    /// Pulled writes that had to wait for a staging slot.
+    pub pull_waits: AtomicU64,
 }
 
 impl Fabric {
@@ -570,6 +823,22 @@ impl Fabric {
                     .collect::<Vec<_>>(),
                 false,
             )?;
+            let outgoing = Tiers::with_access(
+                &ctx,
+                &cfg.write_tiers
+                    .iter()
+                    .map(|t| (t.size, t.landing))
+                    .collect::<Vec<_>>(),
+                crate::verbs::Access::RemoteRead,
+            )?;
+            let write_staging = Tiers::with_access(
+                &ctx,
+                &cfg.write_tiers
+                    .iter()
+                    .map(|t| (t.size, t.staging))
+                    .collect::<Vec<_>>(),
+                crate::verbs::Access::Local,
+            )?;
             // SAFETY: eventfd returns a new descriptor or -1.
             let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
             if efd < 0 {
@@ -599,6 +868,9 @@ impl Fabric {
                 cq,
                 landing,
                 staging,
+                outgoing,
+                write_staging,
+                write_waiting: Mutex::new(Default::default()),
                 mtu,
                 serve,
                 resolved: Mutex::new(Vec::new()),
@@ -630,6 +902,9 @@ impl Fabric {
             pending: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             source: Mutex::new(None),
+            writes: Mutex::new(HashMap::new()),
+            pulls: Mutex::new(HashMap::new()),
+            sink: Mutex::new(None),
             rt: tokio::runtime::Handle::current(),
             stop: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(Semaphore::new((budget / BUDGET_UNIT as u64) as usize)),
@@ -678,6 +953,35 @@ impl Fabric {
 
     pub fn set_source(&self, source: Weak<dyn ReadSource>) {
         *self.source.lock() = Some(source);
+    }
+
+    /// Apply writes other hosts send here through `sink`.
+    pub fn set_sink(&self, sink: Weak<dyn WriteSink>) {
+        *self.sink.lock() = Some(sink);
+    }
+
+    /// The largest write `write` sends (0: none).
+    pub fn max_write(&self) -> usize {
+        if self.cfg.protocol < WRITE_PROTOCOL {
+            return 0;
+        }
+        self.devices
+            .iter()
+            .map(|d| d.outgoing.max_size().min(d.write_staging.max_size()))
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// The protocol the live link to `peer` speaks (`None`: no live link).
+    pub fn link_protocol(&self, peer: NodeId) -> Option<u32> {
+        self.live_link(peer).map(|l| l.protocol)
+    }
+
+    /// Whether writes to `peer` can go over RDMA now: a live link on which
+    /// both ends speak the write protocol.
+    pub fn can_write(&self, peer: NodeId) -> bool {
+        self.link_protocol(peer)
+            .is_some_and(|p| p >= WRITE_PROTOCOL)
     }
 
     /// Record read latencies into `io` (reads made and served).
@@ -798,17 +1102,24 @@ impl Fabric {
 
     /// Server side of link setup: pair offered rails with ours by subnet.
     fn accept(&self, peer: NodeId, req: FabricReq) -> FabricResp {
-        let lanes = match req {
-            FabricReq::ConnectV { lanes, protocol } if protocol == PROTOCOL => lanes,
+        let mine = self.cfg.protocol;
+        // A dialler offers its own protocol. One newer than ours is
+        // refused with "read protocol …" before anything is made, so it
+        // offers `MIN_PROTOCOL` next (hosts on 2 refuse every other
+        // protocol in exactly that way).
+        let (lanes, protocol) = match req {
+            FabricReq::ConnectV { lanes, protocol }
+                if (MIN_PROTOCOL..=mine).contains(&protocol) =>
+            {
+                (lanes, protocol)
+            }
             FabricReq::ConnectV { protocol, .. } => {
                 return FabricResp::Refused(format!(
-                    "read protocol {protocol} (this host speaks {PROTOCOL})"
+                    "read protocol {protocol} (this host speaks {mine})"
                 ));
             }
             FabricReq::Connect { .. } => {
-                return FabricResp::Refused(format!(
-                    "read protocol 1 (this host speaks {PROTOCOL})"
-                ));
+                return FabricResp::Refused(format!("read protocol 1 (this host speaks {mine})"));
             }
         };
         let mut pairs = Vec::new();
@@ -845,11 +1156,12 @@ impl Fabric {
         let link = Arc::new(Link {
             lanes: made.into_iter().map(|(_, l)| l).collect(),
             next: AtomicU32::new(0),
+            protocol,
         });
         if let Some(old) = self.links.lock().insert(peer, link) {
             self.retire(&old);
         }
-        tracing::info!(%peer, lanes = pairs.len(), "RDMA link accepted");
+        tracing::info!(%peer, lanes = pairs.len(), protocol, "RDMA link accepted");
         FabricResp::Accepted { pairs }
     }
 
@@ -981,41 +1293,54 @@ impl Fabric {
             lanes.push(lane);
             psns.push(psn);
         }
-        let body = nest_rpc::encode(&FabricReq::ConnectV {
-            lanes: offers,
-            protocol: PROTOCOL,
-        })
-        .map_err(|e| NestError::Io(e.to_string()))?;
-        let resp = match self
-            .rpc
-            .call(
-                peer,
-                nest_rpc::service::FABRIC,
-                body.into(),
-                Duration::from_secs(5),
-            )
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                // The peer may have connected its side: let the sweep release ours.
-                self.retire_lanes(&lanes);
-                return Err(NestError::Unavailable(e.to_string()));
-            }
-        };
-        let pairs = match nest_rpc::decode(&resp) {
-            Ok(FabricResp::Accepted { pairs }) => pairs,
-            Ok(FabricResp::Refused(why)) => {
-                for l in &lanes {
-                    self.lanes.lock().remove(&l.id);
+        let mut protocol = self.cfg.protocol;
+        let pairs = loop {
+            let body = nest_rpc::encode(&FabricReq::ConnectV {
+                lanes: offers.clone(),
+                protocol,
+            })
+            .map_err(|e| NestError::Io(e.to_string()))?;
+            let resp = match self
+                .rpc
+                .call(
+                    peer,
+                    nest_rpc::service::FABRIC,
+                    body.into(),
+                    Duration::from_secs(5),
+                )
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // The peer may have connected its side: let the sweep release ours.
+                    self.retire_lanes(&lanes);
+                    return Err(NestError::Unavailable(e.to_string()));
                 }
-                return Err(NestError::Unavailable(format!(
-                    "peer refused RDMA link: {why}"
-                )));
-            }
-            Err(e) => {
-                self.retire_lanes(&lanes);
-                return Err(NestError::Io(e.to_string()));
+            };
+            match nest_rpc::decode(&resp) {
+                Ok(FabricResp::Accepted { pairs }) => break pairs,
+                // An older peer refuses before making anything and our QPs
+                // are still unconnected: offer them again on its terms.
+                Ok(FabricResp::Refused(why))
+                    if protocol > MIN_PROTOCOL && why.starts_with("read protocol") =>
+                {
+                    tracing::info!(%peer, why, "peer speaks an older fabric protocol");
+                    protocol = peer_protocol(&why)
+                        .filter(|p| (MIN_PROTOCOL..protocol).contains(p))
+                        .unwrap_or(MIN_PROTOCOL);
+                }
+                Ok(FabricResp::Refused(why)) => {
+                    for l in &lanes {
+                        self.lanes.lock().remove(&l.id);
+                    }
+                    return Err(NestError::Unavailable(format!(
+                        "peer refused RDMA link: {why}"
+                    )));
+                }
+                Err(e) => {
+                    self.retire_lanes(&lanes);
+                    return Err(NestError::Io(e.to_string()));
+                }
             }
         };
         let mut used = Vec::new();
@@ -1038,10 +1363,11 @@ impl Fabric {
                 self.lanes.lock().remove(&l.id);
             }
         }
-        tracing::info!(%peer, lanes = used.len(), "RDMA link established");
+        tracing::info!(%peer, lanes = used.len(), protocol, "RDMA link established");
         let link = Arc::new(Link {
             lanes: used,
             next: AtomicU32::new(0),
+            protocol,
         });
         if let Some(old) = self.links.lock().insert(peer, link.clone()) {
             self.retire(&old);
@@ -1157,6 +1483,110 @@ impl Fabric {
         }
     }
 
+    /// Send `data` (at most `max_write` bytes) to `peer`, the file's owner,
+    /// to be written as `op` says: the owner pulls the bytes from our
+    /// outgoing slot with an RDMA READ and answers with the count written.
+    /// `WriteError::Failed` means the owner's answer (an error), or that the
+    /// outcome is unknown: never send such a write again (an append would
+    /// land twice).
+    pub async fn write(&self, peer: NodeId, op: WriteOp, data: &[u8]) -> Result<u32, WriteError> {
+        if data.len() > self.max_write() {
+            return Err(WriteError::Unsent(NestError::Invalid(format!(
+                "{} bytes is larger than an RDMA write",
+                data.len()
+            ))));
+        }
+        let link = self.link(peer).await.map_err(WriteError::Unsent)?;
+        if link.protocol < WRITE_PROTOCOL {
+            return Err(WriteError::Unsent(NestError::Unavailable(format!(
+                "{peer} speaks fabric protocol {}, without writes",
+                link.protocol
+            ))));
+        }
+        let lane = link.lanes
+            [link.next.fetch_add(1, Ordering::Relaxed) as usize % link.lanes.len()]
+        .clone();
+        let t0 = std::time::Instant::now();
+        let mut slot = lane.dev.outgoing.acquire(data.len()).await;
+        slot.as_mut_slice(data.len()).copy_from_slice(data);
+        let _permit = lane
+            .window
+            .acquire()
+            .await
+            .map_err(|_| WriteError::Unsent(NestError::Unavailable("lane closed".into())))?;
+        if lane.dead.load(Ordering::SeqCst) {
+            return Err(WriteError::Unsent(NestError::Unavailable(
+                "RDMA link failed".into(),
+            )));
+        }
+        let key = (lane.dev.id, slot.id());
+        let mut msg = [0u8; MSG_SIZE];
+        WriteReq {
+            req: slot.id(),
+            file: op.file.0,
+            epoch: op.epoch.0,
+            offset: op.offset,
+            len: data.len() as u32,
+            rkey: slot.rkey(),
+            addr: slot.addr(),
+            writer: op.writer.0.0,
+            handle: op.writer.1,
+            append: op.append,
+        }
+        .encode(&mut msg);
+        let (tx, rx) = oneshot::channel();
+        // From here the slot belongs to the table until the answer: the
+        // owner may read it until then.
+        self.writes.lock().insert(
+            key,
+            WriteWaiter {
+                lane: lane.id,
+                slot,
+                len: data.len(),
+                since: t0,
+                tx,
+            },
+        );
+        // SAFETY: inline send copies the message at post time.
+        let posted = unsafe {
+            lane.qp.post_send(
+                wr(WR_SEND, lane.id, 0),
+                msg.as_mut_ptr(),
+                MSG_SIZE as u32,
+                0,
+                true,
+            )
+        };
+        if let Err(e) = posted {
+            // Never sent: nothing will read the slot.
+            drop(self.writes.lock().remove(&key));
+            self.fail_lane(&lane);
+            return Err(WriteError::Unsent(NestError::Unavailable(e.to_string())));
+        }
+        lane.dev.counters.sent(MSG_SIZE as u64, 0);
+        match tokio::time::timeout(self.cfg.write_timeout, rx).await {
+            Ok(Ok(r)) => {
+                if let Ok(n) = &r {
+                    self.stats.writes.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .write_bytes
+                        .fetch_add(*n as u64, Ordering::Relaxed);
+                }
+                r
+            }
+            Ok(Err(_)) => Err(unknown_outcome(peer, "the RDMA link failed")),
+            Err(_) => {
+                // The owner may still read the slot: never reuse it, and
+                // retire the lane so the NIC stops.
+                if let Some(w) = self.writes.lock().remove(&key) {
+                    std::mem::forget(w.slot);
+                }
+                self.fail_lane(&lane);
+                Err(unknown_outcome(peer, "no answer"))
+            }
+        }
+    }
+
     /// Take what a small read needs without waiting (see `Reservation`);
     /// `None` when any of it is not free right now, or no link is up yet:
     /// use `read`.
@@ -1191,10 +1621,31 @@ impl Fabric {
     }
 
     /// Fail reads made with `Reservation::send` that have waited past
-    /// `READ_TIMEOUT` (their lane is retired, as `read` does on a timeout).
+    /// `READ_TIMEOUT` (their lane is retired, as `read` does on a timeout),
+    /// and release writes whose writer gave up waiting past `write_timeout`
+    /// the same way.
     fn expire(&self) {
         self.reap_lanes();
         let now = std::time::Instant::now();
+        let old: Vec<WriteWaiter> = {
+            let mut w = self.writes.lock();
+            let keys: Vec<_> = w
+                .iter()
+                .filter(|(_, x)| now.duration_since(x.since) > self.cfg.write_timeout)
+                .map(|(k, _)| *k)
+                .collect();
+            keys.into_iter().filter_map(|k| w.remove(&k)).collect()
+        };
+        for w in old {
+            let lane = self.lanes.lock().get(&w.lane).cloned();
+            let WriteWaiter { slot, tx, .. } = w;
+            std::mem::forget(slot);
+            if let Some(l) = &lane {
+                self.fail_lane(l);
+            }
+            let peer = lane.map_or(NodeId(0), |l| l.peer);
+            let _ = tx.send(Err(unknown_outcome(peer, "no answer")));
+        }
         let old: Vec<(u32, u32)> = self
             .pending
             .lock()
@@ -1241,6 +1692,23 @@ impl Fabric {
                 std::mem::forget(slot);
                 tx.send(Err(NestError::Unavailable("RDMA link failed".into())));
             }
+            let writes: Vec<WriteWaiter> = {
+                let mut p = self.writes.lock();
+                let keys: Vec<_> = p
+                    .iter()
+                    .filter(|(_, w)| w.lane == lane.id)
+                    .map(|(k, _)| *k)
+                    .collect();
+                keys.into_iter().filter_map(|k| p.remove(&k)).collect()
+            };
+            for w in writes {
+                // The owner may have read and applied it, or may still be
+                // reading the slot until its QP errors: unknown, and the
+                // slot is never reused.
+                let WriteWaiter { slot, tx, .. } = w;
+                std::mem::forget(slot);
+                let _ = tx.send(Err(unknown_outcome(lane.peer, "the RDMA link failed")));
+            }
         }
     }
 
@@ -1258,6 +1726,10 @@ impl Fabric {
             }
             if kind == WR_WRITE {
                 self.in_flight.lock().remove(&wc.wr_id);
+            }
+            if kind == WR_PULL {
+                // The NIC is done with the slot (a failed or flushed read).
+                drop(self.pulls.lock().remove(&wc.wr_id));
             }
             return;
         }
@@ -1294,6 +1766,28 @@ impl Fabric {
                             w.fail(err_from(msg[1]));
                         }
                     }
+                    Some(KIND_WRITE) if msg.len() >= MSG_SIZE => {
+                        self.accept_write(l, WriteReq::decode(&msg))
+                    }
+                    Some(KIND_WRITE_DONE) if msg.len() >= WRITE_DONE_SIZE => {
+                        let req = u32::from_le_bytes(msg[4..8].try_into().unwrap());
+                        let n = u32::from_le_bytes(msg[8..12].try_into().unwrap());
+                        let w = self.writes.lock().remove(&(dev.id, req));
+                        if let Some(w) = w {
+                            // The owner's read of our slot left this port.
+                            dev.counters.sent(w.len as u64, mtu);
+                            let WriteWaiter { slot, tx, .. } = w;
+                            drop(slot);
+                            let r = match msg[1] {
+                                0 => Ok(n),
+                                NOT_ACCEPTING => Err(WriteError::Unsent(NestError::Unavailable(
+                                    format!("{} does not take RDMA writes", l.peer),
+                                ))),
+                                code => Err(WriteError::Failed(err_from(code))),
+                            };
+                            let _ = tx.send(r);
+                        }
+                    }
                     _ => tracing::warn!(peer = %l.peer, "unrecognized fabric message"),
                 }
             }
@@ -1302,7 +1796,135 @@ impl Fabric {
                     dev.counters.sent(n as u64, mtu);
                 }
             }
+            (WR_PULL, _) => {
+                let p = self.pulls.lock().remove(&wc.wr_id);
+                if let Some(p) = p {
+                    let len = p.req.len as usize;
+                    dev.counters.received(len as u64, mtu);
+                    let buf = WriteBuf {
+                        slot: Some(p.slot),
+                        len,
+                        dev: dev.clone(),
+                    };
+                    self.apply_write(p.lane, p.req, bytes::Bytes::from_owner(buf));
+                }
+            }
             _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------ owner
+
+    fn sink(&self) -> Option<Arc<dyn WriteSink>> {
+        self.sink.lock().as_ref().and_then(|w| w.upgrade())
+    }
+
+    /// A write request arrived (on the poller thread): queue it for a
+    /// staging slot to pull into, or refuse it untouched.
+    fn accept_write(self: &Arc<Self>, lane: Arc<Lane>, req: WriteReq) {
+        if self.sink().is_none() || req.len as usize > lane.dev.write_staging.max_size() {
+            return self.send_write_done(&lane, req.req, Err(NOT_ACCEPTING));
+        }
+        if req.len == 0 {
+            return self.apply_write(lane, req, bytes::Bytes::new());
+        }
+        let dev = lane.dev.clone();
+        dev.write_waiting.lock().push_back((lane, req, false));
+        self.pump_writes(&dev);
+    }
+
+    /// Start pulls for queued writes that can get a staging slot. Writes
+    /// wait here when every slot is taken (nothing is reserved per writer);
+    /// a freed slot wakes the poller, which calls this again.
+    fn pump_writes(&self, dev: &Arc<Device>) -> bool {
+        let mut start = Vec::new();
+        {
+            let mut q = dev.write_waiting.lock();
+            let mut i = 0;
+            while i < q.len() {
+                if q[i].0.dead.load(Ordering::SeqCst) {
+                    // Its writer learns from its own side of the lane.
+                    q.remove(i);
+                    continue;
+                }
+                match dev.write_staging.try_acquire(q[i].1.len as usize) {
+                    Some(slot) => {
+                        let (lane, req, _) = q.remove(i).expect("in range");
+                        start.push((lane, req, slot));
+                    }
+                    None => {
+                        if !q[i].2 {
+                            q[i].2 = true;
+                            self.stats.pull_waits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+        let started = !start.is_empty();
+        for (lane, req, slot) in start {
+            let id = wr(WR_PULL, lane.id, slot.id());
+            let (ptr, lkey) = (slot.ptr(), slot.lkey());
+            self.pulls.lock().insert(
+                id,
+                Pull {
+                    lane: lane.clone(),
+                    req,
+                    slot,
+                },
+            );
+            // SAFETY: the staging slot stays in `pulls` until this read's
+            // completion (success or flush); the remote range is the
+            // outgoing slot the writer named, which it keeps until it hears
+            // back or its lane is retired.
+            let r = unsafe {
+                lane.qp
+                    .post_read(id, ptr, req.len, lkey, req.addr, req.rkey)
+            };
+            if r.is_err() {
+                // Never posted: the NIC will not touch the slot.
+                drop(self.pulls.lock().remove(&id));
+                self.fail_lane(&lane);
+            }
+        }
+        started
+    }
+
+    /// Hand pulled bytes to the sink off the poller thread, and answer.
+    fn apply_write(self: &Arc<Self>, lane: Arc<Lane>, req: WriteReq, data: bytes::Bytes) {
+        let Some(sink) = self.sink() else {
+            return self.send_write_done(&lane, req.req, Err(NOT_ACCEPTING));
+        };
+        let fut = sink.write(req.op(), data);
+        let f = self.clone();
+        self.rt.spawn(async move {
+            let r = fut.await;
+            if let Ok(n) = &r {
+                f.stats.pulled.fetch_add(1, Ordering::Relaxed);
+                f.stats.pulled_bytes.fetch_add(*n as u64, Ordering::Relaxed);
+            }
+            f.send_write_done(&lane, req.req, r.map_err(|e| err_code(&e)));
+        });
+    }
+
+    fn send_write_done(&self, lane: &Arc<Lane>, req: u32, r: Result<u32, u8>) {
+        let mut msg = write_done(req, r);
+        // SAFETY: inline send copies the message at post time.
+        if unsafe {
+            lane.qp.post_send(
+                wr(WR_SEND, lane.id, 0),
+                msg.as_mut_ptr(),
+                WRITE_DONE_SIZE as u32,
+                0,
+                true,
+            )
+        }
+        .is_err()
+        {
+            self.fail_lane(lane);
+        } else {
+            lane.dev.counters.sent(WRITE_DONE_SIZE as u64, 0);
         }
     }
 
@@ -1369,6 +1991,7 @@ impl Fabric {
         }
         busy |= self.reap(dev);
         self.pump(dev);
+        busy |= self.pump_writes(dev);
         busy
     }
 
@@ -1381,7 +2004,11 @@ impl Fabric {
                 return true;
             }
         }
-        !dev.resolved.lock().is_empty() || self.pending.lock().keys().any(|(d, _)| *d == dev.id)
+        !dev.resolved.lock().is_empty()
+            || !dev.write_waiting.lock().is_empty()
+            || self.pending.lock().keys().any(|(d, _)| *d == dev.id)
+            || self.writes.lock().keys().any(|(d, _)| *d == dev.id)
+            || self.pulls.lock().values().any(|p| p.lane.dev.id == dev.id)
     }
 
     /// Start waiting reads that have a staging slot and ring room.
@@ -1690,7 +2317,83 @@ fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
     }
 }
 
+/// The protocol a refusal says the peer speaks ("… (this host speaks N)",
+/// as every host since protocol 2 words it).
+fn peer_protocol(why: &str) -> Option<u32> {
+    let rest = &why[why.find("speaks ")? + "speaks ".len()..];
+    rest[..rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len())]
+        .parse()
+        .ok()
+}
+
 /// The rails' links in bytes per second: each physical port once.
 fn link_bytes_per_s(rails: &[Rail]) -> u64 {
     crate::rail::link_gbps(rails) * 1_000_000_000 / 8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_requests_fill_64_bytes_and_round_trip() {
+        let r = WriteReq {
+            req: 0x0102_0304,
+            file: u64::MAX - 1,
+            epoch: 77,
+            offset: 1 << 40,
+            len: 1 << 20,
+            rkey: 0xdead_beef,
+            addr: 0x7fff_0000_1000,
+            writer: 6,
+            handle: 0x1234_5678_9abc,
+            append: true,
+        };
+        let mut b = [0u8; MSG_SIZE];
+        r.encode(&mut b);
+        assert_eq!(b[0], KIND_WRITE);
+        assert_eq!(WriteReq::decode(&b), r);
+        let plain = WriteReq { append: false, ..r };
+        plain.encode(&mut b);
+        assert_eq!(WriteReq::decode(&b), plain);
+        let d = write_done(9, Ok(4096));
+        assert_eq!((d[0], d[1]), (KIND_WRITE_DONE, 0));
+        assert_eq!(u32::from_le_bytes(d[8..12].try_into().unwrap()), 4096);
+        assert_eq!(write_done(9, Err(5))[1], 5);
+    }
+
+    #[test]
+    fn error_codes_round_trip() {
+        for e in [
+            NestError::Stale,
+            NestError::NotFound,
+            NestError::NoSpace,
+            NestError::NoQuorum,
+        ] {
+            assert_eq!(err_from(err_code(&e)), e);
+        }
+        assert!(matches!(
+            err_from(err_code(&NestError::Busy("x".into()))),
+            NestError::Busy(_)
+        ));
+        assert!(matches!(
+            err_from(err_code(&NestError::Exists)),
+            NestError::Io(_)
+        ));
+    }
+
+    #[test]
+    fn refusals_name_the_peers_protocol() {
+        assert_eq!(
+            peer_protocol("read protocol 3 (this host speaks 2)"),
+            Some(2)
+        );
+        assert_eq!(
+            peer_protocol("read protocol 1 (this host speaks 17)"),
+            Some(17)
+        );
+        assert_eq!(peer_protocol("no rail shares a subnet"), None);
+    }
 }
