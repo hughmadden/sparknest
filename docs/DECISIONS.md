@@ -1596,3 +1596,29 @@ under `rnr_retry = 7`); preferred leader in `node.toml` (could differ
 between hosts; settings are set once and persist); rslave bind
 propagation in containers instead of keeping the mount (needs every
 container changed and still breaks open files).
+
+## ADR-058 — Remote writes as built: mixed versions, lane probe, append lock (2026-10-17)
+
+**Context.** ADR-057 item 4 as implemented needed three choices it left
+open, and turned up one existing bug.
+
+**Decision.**
+1. **Protocol negotiation, not refusal.** A 0.5 host offers fabric
+   protocol 3; a host that refuses with "read protocol …" gets a second
+   offer of the version it names (at least 2). An accepting 0.5 host takes
+   2 or 3. Each link records the protocol both speak; writes use RDMA only
+   on protocol-3 links, so 0.4.4 hosts keep RDMA reads during a rolling
+   upgrade. `FabricReq`/`FabricResp` are unchanged.
+2. **Lane probe.** A 0.4.4 host closes a TCP lane on an unknown frame kind,
+   so each lane opens with a read of `FileId(u64::MAX)`: a 0.5 host answers
+   with its lane protocol, an older one with NotFound. Write frames (kind
+   4) go only on lanes that answered 2.
+3. **Unknown outcome is EIO.** A write sent but not answered (timeout, lane
+   lost after the send) fails; it is never resent another way, since a
+   resent append would be applied twice. Only a write known not to have
+   been sent moves on to the next path.
+4. **Appends hold a per-file lock** from choosing the end of file until the
+   bytes are written. Before, concurrent appends from several writers on
+   the owner could each read the same length and overwrite each other.
+5. **A write that races another host's ownership grant is routed again**
+   instead of failing "no reachable node holds this file".
