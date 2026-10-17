@@ -1,6 +1,7 @@
 //! Transports for remote reads in whole chunks: the RDMA fabric between
-//! fabric hosts, TCP lanes when either end is off the fabric (ADR-048).
-//! Readahead works over either.
+//! fabric hosts, TCP lanes when either end is off the fabric (ADR-048),
+//! and between fabric hosts RDMA with the standby lanes on the LAN behind
+//! it (ADR-057). Readahead works over any of them.
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -47,6 +48,57 @@ impl Bulk for nest_fabric::Fabric {
             let b = self.read(peer, file, generation, offset, len).await?;
             // Copied out at once: the landing slot is free again.
             Ok(b.as_slice().to_vec())
+        }
+        .boxed()
+    }
+}
+
+/// RDMA between fabric hosts, with the peer's standby lane on the LAN
+/// behind it (ADR-057): a read goes over the lane only while the RDMA link
+/// to that peer is down (setup failed or the link died, within the
+/// fabric's retry backoff) and a lane to it is open; RDMA is tried again
+/// when the backoff passes. A read that fails because the link died is
+/// retried once on the lane. Slowness never moves a read.
+pub(crate) struct Standby {
+    pub(crate) fabric: Arc<nest_fabric::Fabric>,
+    pub(crate) lanes: Arc<nest_fabric::tcp::Lanes>,
+}
+
+impl Standby {
+    /// Use the lane to `peer` instead of RDMA right now.
+    pub(crate) fn on_lane(&self, peer: NodeId) -> bool {
+        self.fabric.link_failed(peer) && self.lanes.connected(peer) > 0
+    }
+}
+
+impl Bulk for Standby {
+    fn chunk(&self) -> usize {
+        // Both transports read the same chunks (4 MiB).
+        nest_fabric::Fabric::chunk(&self.fabric).min(self.lanes.chunk())
+    }
+
+    fn speculate(&self) -> bool {
+        self.fabric.speculate()
+    }
+
+    fn fetch(
+        self: Arc<Self>,
+        peer: NodeId,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        len: usize,
+    ) -> BoxFuture<'static, NestResult<Vec<u8>>> {
+        async move {
+            if !self.on_lane(peer) {
+                match self.fabric.clone().fetch(peer, file, generation, offset, len).await {
+                    Err(nest_types::NestError::Unavailable(why)) if self.on_lane(peer) => {
+                        tracing::debug!(%peer, %why, "RDMA link down; reading over the standby lane");
+                    }
+                    r => return r,
+                }
+            }
+            self.lanes.read(peer, file, generation, offset, len).await
         }
         .boxed()
     }

@@ -6,7 +6,9 @@
 //! and spreads requests over them. A lane is a plain TCP connection,
 //! authenticated with the cluster secret, that carries requests both ways:
 //! the off-grid host dials every lane (it may sit behind NAT) and either end
-//! asks the other for byte ranges on it.
+//! asks the other for byte ranges on it. Fabric hosts also keep standby
+//! lanes to each other on the LAN, dialled by the lower id of each pair,
+//! for when the RDMA link fails (ADR-057).
 //!
 //! ```text
 //! request   kind=1 | id u64 | file u64 | generation u64 | offset u64 | len u32
@@ -88,8 +90,8 @@ pub struct Lanes {
     secret: Vec<u8>,
     cfg: LanesConfig,
     peers: Mutex<HashMap<NodeId, Vec<Arc<Lane>>>>,
-    /// Peers this host dials, and where.
-    dial: Mutex<HashMap<NodeId, SocketAddr>>,
+    /// Peers this host dials, where, and how many lanes it keeps to each.
+    dial: Mutex<HashMap<NodeId, (SocketAddr, usize)>>,
     source: Mutex<Option<Weak<dyn ReadSource>>>,
     budget: Arc<tokio::sync::Semaphore>,
     rt: tokio::runtime::Handle,
@@ -193,7 +195,17 @@ impl Lanes {
     /// Keep `per_peer` lanes open to `peer` at `addr` (an off-grid host
     /// dials every host it knows; the others only accept).
     pub fn dial(&self, peer: NodeId, addr: SocketAddr) {
-        self.dial.lock().insert(peer, addr);
+        self.dial_n(peer, addr, self.cfg.per_peer);
+    }
+
+    /// Keep `n` lanes open to `peer` at `addr` (standby lanes between
+    /// fabric hosts, ADR-057). 0 stops dialling it.
+    pub fn dial_n(&self, peer: NodeId, addr: SocketAddr, n: usize) {
+        if n == 0 {
+            self.dial.lock().remove(&peer);
+        } else {
+            self.dial.lock().insert(peer, (addr, n));
+        }
     }
 
     /// Live lanes to `peer`.
@@ -347,11 +359,15 @@ impl Lanes {
             let connecting: Arc<Mutex<HashMap<NodeId, usize>>> = Arc::default();
             loop {
                 let Some(me) = weak.upgrade() else { return };
-                let dial: Vec<(NodeId, SocketAddr)> =
-                    me.dial.lock().iter().map(|(p, a)| (*p, *a)).collect();
-                for (peer, addr) in dial {
+                let dial: Vec<(NodeId, SocketAddr, usize)> = me
+                    .dial
+                    .lock()
+                    .iter()
+                    .map(|(p, (a, n))| (*p, *a, *n))
+                    .collect();
+                for (peer, addr, want) in dial {
                     let busy = connecting.lock().get(&peer).copied().unwrap_or(0);
-                    let missing = me.cfg.per_peer.saturating_sub(me.connected(peer) + busy);
+                    let missing = want.saturating_sub(me.connected(peer) + busy);
                     for _ in 0..missing {
                         *connecting.lock().entry(peer).or_default() += 1;
                         let (me, connecting) = (me.clone(), connecting.clone());

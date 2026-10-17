@@ -733,6 +733,39 @@ impl Fabric {
         self.cfg.client_slots as usize
     }
 
+    /// Whether link setup to `peer` failed, or a link to it died, within
+    /// the current retry backoff: reads to it fail at once until then
+    /// (ADR-057: callers use the standby lane meanwhile).
+    pub fn link_failed(&self, peer: NodeId) -> bool {
+        self.live_link(peer).is_none()
+            && self
+                .retry
+                .lock()
+                .get(&peer)
+                .is_some_and(|(at, _)| std::time::Instant::now() < *at)
+    }
+
+    /// Start (or lengthen) the retry backoff for `peer`; returns the wait.
+    /// The wait doubles while failures follow each other (a link that pairs
+    /// and dies again counts), and starts afresh after a long quiet spell.
+    fn back_off(&self, peer: NodeId) -> Duration {
+        let mut retry = self.retry.lock();
+        let now = std::time::Instant::now();
+        let wait = match retry.get(&peer) {
+            Some((at, w)) if now.saturating_duration_since(*at) < 2 * self.cfg.link_retry_max => *w,
+            _ => self.cfg.link_retry,
+        }
+        .min(self.cfg.link_retry_max);
+        retry.insert(
+            peer,
+            (
+                std::time::Instant::now() + wait,
+                (wait * 2).min(self.cfg.link_retry_max),
+            ),
+        );
+        wait
+    }
+
     /// Whether a working link to `peer` exists or can be tried.
     pub fn has_link(&self, peer: NodeId) -> bool {
         self.links
@@ -935,22 +968,16 @@ impl Fabric {
         self.attempts.fetch_add(1, Ordering::Relaxed);
         match self.connect(peer).await {
             Ok(link) => {
-                self.retry.lock().remove(&peer);
+                // Keep the next wait: a link that dies soon after pairing
+                // (a dead switch: pairing rides the control connection)
+                // backs off longer each time.
+                if let Some((at, _)) = self.retry.lock().get_mut(&peer) {
+                    *at = std::time::Instant::now();
+                }
                 Ok(link)
             }
             Err(e) => {
-                let mut retry = self.retry.lock();
-                let wait = retry
-                    .get(&peer)
-                    .map_or(self.cfg.link_retry, |(_, w)| *w)
-                    .min(self.cfg.link_retry_max);
-                retry.insert(
-                    peer,
-                    (
-                        std::time::Instant::now() + wait,
-                        (wait * 2).min(self.cfg.link_retry_max),
-                    ),
-                );
+                let wait = self.back_off(peer);
                 tracing::warn!(%peer, error = %e, retry_in = ?wait, "RDMA link setup failed");
                 Err(e)
             }
@@ -1222,7 +1249,17 @@ impl Fabric {
     /// NIC stops touching its buffers) and requests sent on it fail.
     fn fail_lane(&self, lane: &Lane) {
         if lane.kill() {
-            tracing::warn!(peer = %lane.peer, rail = %lane.local.addr, "RDMA lane failed");
+            // A link that died is retried after the backoff, like one that
+            // failed to set up: re-pairing at once over a dead switch would
+            // succeed (setup rides the control connection, which may be on
+            // its LAN standby) and fail every read again (ADR-057).
+            // The other lanes of the link die with it: one backoff for all.
+            let wait = if self.link_failed(lane.peer) {
+                None
+            } else {
+                Some(self.back_off(lane.peer))
+            };
+            tracing::warn!(peer = %lane.peer, rail = %lane.local.addr, retry_in = ?wait, "RDMA lane failed");
             self.stats.errors.fetch_add(1, Ordering::Relaxed);
             lane.qp.set_error();
             let failed: Vec<Waiter> = {

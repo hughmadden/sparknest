@@ -204,8 +204,11 @@ pub struct Vfs {
     inflight_done: tokio::sync::Notify,
     fence_hooks: Mutex<Vec<FenceHook>>,
     fabric: Mutex<Option<Arc<nest_fabric::Fabric>>>,
-    /// TCP lanes to and from off-grid hosts (ADR-048).
+    /// TCP lanes to and from off-grid hosts (ADR-048), and the standby
+    /// lanes between fabric hosts (ADR-057).
     lanes: Mutex<Option<Arc<nest_fabric::tcp::Lanes>>>,
+    /// The fabric and lanes as one transport (built on first use).
+    standby_bulk: Mutex<Option<Arc<crate::bulk::Standby>>>,
     /// Cluster-wide settings as last read from the metadata (ADR-056).
     settings: Mutex<(std::time::Instant, HashMap<String, u64>)>,
 }
@@ -329,6 +332,7 @@ impl Vfs {
             fence_hooks: Mutex::new(Vec::new()),
             fabric: Mutex::new(None),
             lanes: Mutex::new(None),
+            standby_bulk: Mutex::new(None),
             settings: Mutex::new((std::time::Instant::now() - SETTINGS_TTL, HashMap::new())),
         });
         d.meta().rpc().register(
@@ -594,17 +598,38 @@ impl Vfs {
     }
 
     /// How to fetch whole chunks from `peer`: TCP lanes when either end is
-    /// off the fabric, else RDMA. `None`: one request at a time over the
-    /// control connection.
+    /// off the fabric, else RDMA with the standby lane behind it (ADR-057).
+    /// `None`: one request at a time over the control connection.
     fn bulk_to(&self, peer: NodeId) -> Option<Arc<dyn crate::bulk::Bulk>> {
         let fabric = self.fabric();
+        let lanes = self.lanes();
         if (fabric.is_none() || self.offgrid_hosts().contains(&peer))
-            && let Some(l) = self.lanes()
+            && let Some(l) = &lanes
             && l.connected(peer) > 0
         {
-            return Some(l);
+            return Some(l.clone());
         }
-        fabric.map(|f| f as Arc<dyn crate::bulk::Bulk>)
+        let fabric = fabric?;
+        Some(match self.standby() {
+            Some(s) => s,
+            None => fabric,
+        })
+    }
+
+    /// RDMA with every peer's standby lane behind it, between fabric hosts
+    /// (ADR-057); `None` without both.
+    fn standby(&self) -> Option<Arc<crate::bulk::Standby>> {
+        let (fabric, lanes) = (self.fabric()?, self.lanes()?);
+        let mut cached = self.standby_bulk.lock();
+        if let Some(s) = cached.as_ref()
+            && Arc::ptr_eq(&s.fabric, &fabric)
+            && Arc::ptr_eq(&s.lanes, &lanes)
+        {
+            return Some(s.clone());
+        }
+        let s = Arc::new(crate::bulk::Standby { fabric, lanes });
+        *cached = Some(s.clone());
+        Some(s)
     }
 
     /// Register a blocking page-cache invalidation run during fencing.
@@ -2037,8 +2062,12 @@ impl Vfs {
                 let _t = self.track(h.file);
                 let mut ra = h.readahead.lock().await;
                 if !ra.as_ref().is_some_and(|r| r.matches(h.file, a.generation)) {
+                    let bulk: Arc<dyn crate::bulk::Bulk> = match self.standby() {
+                        Some(s) => s,
+                        None => fab.clone(),
+                    };
                     *ra = Some(crate::readahead::Readahead::new(
-                        fab.clone(),
+                        bulk,
                         self.balancer.clone(),
                         self.patterns.clone(),
                         self.io.clone(),
@@ -2823,11 +2852,14 @@ impl Vfs {
             .await
             .expect("blocking task")
             .map_err(io)?;
-        // Off the fabric (either end): TCP lanes, which need no slots.
-        let lanes = self
-            .lanes()
-            .filter(|l| l.connected(src) > 0)
-            .filter(|_| self.fabric().is_none() || self.offgrid_hosts().contains(&src));
+        // Off the fabric (either end): TCP lanes, which need no slots. On
+        // it: RDMA, or the standby lane while the RDMA link to `src` is
+        // down (ADR-057).
+        let lanes = self.lanes().filter(|l| l.connected(src) > 0).filter(|_| {
+            self.fabric().is_none()
+                || self.offgrid_hosts().contains(&src)
+                || self.standby().is_some_and(|s| s.on_lane(src))
+        });
         let fab = if lanes.is_some() { None } else { self.fabric() };
         let chunk: u64 = match (&fab, &lanes) {
             (Some(f), _) => f.chunk() as u64,
@@ -2862,11 +2894,18 @@ impl Vfs {
                     (Some(f), None) => match f.read(src, file, generation, off, len).await {
                         Ok(b) => nest_store::uring::AlignedBuf::copy_of(b.as_slice()),
                         Err(NestError::Stale) => return Err(NestError::Stale),
-                        Err(_) => nest_store::uring::AlignedBuf::copy_of(
-                            &self
-                                .tcp_read(src, file, generation, off, len as u32)
-                                .await?,
-                        ),
+                        // The link died: the standby lane if there is one,
+                        // else one request on the control connection.
+                        Err(_) => match self.standby().filter(|s| s.on_lane(src)) {
+                            Some(s) => nest_store::uring::AlignedBuf::copy_of(
+                                &s.lanes.read(src, file, generation, off, len).await?,
+                            ),
+                            None => nest_store::uring::AlignedBuf::copy_of(
+                                &self
+                                    .tcp_read(src, file, generation, off, len as u32)
+                                    .await?,
+                            ),
+                        },
                     },
                     (None, None) => nest_store::uring::AlignedBuf::copy_of(
                         &self
