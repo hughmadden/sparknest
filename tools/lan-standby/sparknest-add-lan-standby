@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Give each fabric member of node.toml its LAN address as `lan`, turning on
+# the 10G standby for control and data (ADR-057). Run on each fabric host
+# AFTER upgrading to sparknestd 0.5.0 and BEFORE restarting it: 0.4.x
+# rejects the `lan` key. Off-grid hosts are left alone (they already reach
+# everyone over the LAN).
+#
+#   sparknest-add-lan-standby [--config /srv/sparknest/node.toml] [--dry-run]
+#
+# The LAN addresses come from a name=ip list (default: this cluster's);
+# the port is the member's own. Keeps node.toml.pre-lan as a backup, and
+# validates the result with `sparknestd --check` before replacing the file.
+set -euo pipefail
+cfg=/srv/sparknest/node.toml dry=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --config) cfg=$2; shift 2 ;;
+    --dry-run) dry=1; shift ;;
+    *) echo "unknown option $1" >&2; exit 2 ;;
+  esac
+done
+daemon=${SPARKNESTD:-sparknestd}
+LAN=${SPARKNEST_LAN_MAP:-"raptor=172.22.2.12 ostrich=172.22.2.1 dodo=172.22.2.2 emu=172.22.2.3 kiwi=172.22.2.4 rhea=172.22.2.5 moa=172.22.2.6"}
+
+if grep -q '^role *= *"offgrid"' "$cfg"; then
+  echo "off-grid host: nothing to do"; exit 0
+fi
+ver=$("$daemon" --version | awk '{print $2}')
+case "$ver" in
+  0.[0-4].*) echo "sparknestd $ver rejects 'lan': upgrade to 0.5.0 first" >&2; exit 1 ;;
+esac
+if grep -q 'lan = ' "$cfg"; then
+  echo "already has lan addresses: nothing to do"; exit 0
+fi
+
+tmp=$(mktemp "$cfg.XXXX")
+trap 'rm -f "$tmp"' EXIT
+awk -v map="$LAN" '
+  BEGIN { n = split(map, kv, " "); for (i = 1; i <= n; i++) { split(kv[i], p, "="); ip[p[1]] = p[2] } }
+  /^ *\{ *id *= *[0-9]+, *name *= *"[^"]+", *addr *= *"[^"]+" *\},? *$/ {
+    match($0, /name *= *"[^"]+"/); name = substr($0, RSTART, RLENGTH); sub(/name *= *"/, "", name); sub(/"$/, "", name)
+    match($0, /addr *= *"[^"]+"/); addr = substr($0, RSTART, RLENGTH); sub(/addr *= *"/, "", addr); sub(/"$/, "", addr)
+    port = addr; sub(/.*:/, "", port)
+    if (name in ip) { sub(/ *\},?/, ", lan = \"" ip[name] ":" port "\" },", $0); added++ }
+  }
+  { print }
+  END { if (!added) exit 3 }
+' "$cfg" > "$tmp" || { echo "no member lines matched; edit by hand (see docs/ENVIRONMENT.md)" >&2; exit 1; }
+# A member line that ended without a comma keeps none (TOML allows either).
+diff -u "$cfg" "$tmp" || true
+"$daemon" --config "$tmp" --check >/dev/null
+if [ "$dry" = 1 ]; then echo "dry run: $cfg unchanged"; exit 0; fi
+cp -p "$cfg" "$cfg.pre-lan"
+cat "$tmp" > "$cfg"
+echo "updated $cfg (backup: $cfg.pre-lan); restart sparknestd to use it"

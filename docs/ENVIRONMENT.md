@@ -91,8 +91,13 @@ members = [
 ]
 ```
 
-`sparknestd --config /srv/sparknest/node.toml --check` validates the
-edit. A 0.4.4 daemon rejects the unknown `lan` key, so do not add it
+`tools/lan-standby/sparknest-add-lan-standby` makes this edit on one host
+(installed with the formula; `--dry-run` shows the diff): it refuses
+while the installed sparknestd is older than 0.5.0, keeps
+`node.toml.pre-lan`, and validates the result with `sparknestd --check`
+before replacing the file. It leaves off-grid hosts alone and does nothing
+twice. `sparknestd --config /srv/sparknest/node.toml --check` validates a
+hand edit. A 0.4.4 daemon rejects the unknown `lan` key, so do not add it
 before the upgrade. Mixed versions are fine: a 0.5.0 host keeps using the
 fabric connection to a 0.4.4 peer and retries the standby once a minute.
 Off-grid hosts (kakapo, oliver) are unchanged: their members are already
