@@ -12,7 +12,22 @@
 //! request   kind=1 | id u64 | file u64 | generation u64 | offset u64 | len u32
 //! answer    kind=2 | id u64 | len u32 | <len bytes of the file>
 //! failure   kind=3 | id u64 | len u32 | <postcard NestError>
+//! write     kind=4 | id u64 | file u64 | epoch u64 | writer u64 | handle u64
+//!                  | offset u64 | append u8 | len u32 | <len bytes>
+//!           answered with kind=2 and a 4-byte body (u32 bytes written), or
+//!           kind=3
 //! ```
+//!
+//! Writes (ADR-057) are for fabric pairs whose RDMA link is down, and for
+//! off-grid hosts: the receiving host applies them as their owner through
+//! a `WriteSink`, with the same checks as every other remote write. Like
+//! RDMA writes they are never resent; a write whose answer does not come is
+//! reported as failed with its outcome unknown.
+//!
+//! A host before writes (0.4) closes a lane on a frame kind it does not
+//! know, so each end first asks the other with a read of `PROBE_FILE`
+//! (which an older host fails as not found) and sends writes only on lanes
+//! whose peer answered with `LANE_WRITES` or later.
 //!
 //! Each lane has a reader and a writer thread on a blocking socket. The
 //! answer's header goes out with MSG_MORE and its body with `sendfile`
@@ -22,7 +37,7 @@
 //! so serving checks and fencing are shared: the object's guard is held
 //! until its bytes are on the wire.
 
-use crate::{ReadSource, ServeFile};
+use crate::{ReadSource, ServeFile, WriteError, WriteOp, WriteSink};
 use nest_types::{FileId, Generation, NestError, NodeId};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -37,8 +52,15 @@ use tokio::sync::oneshot;
 const REQ: u8 = 1;
 const ANSWER: u8 = 2;
 const FAILURE: u8 = 3;
+const WRITE: u8 = 4;
 /// Bytes after the kind byte.
 const REQ_LEN: usize = 8 + 8 + 8 + 8 + 4;
+const WRITE_LEN: usize = 8 * 6 + 1 + 4;
+/// A read of this file asks the lane's peer what it takes (`ANSWER` with a
+/// u32 lane protocol); no real file has this id.
+const PROBE_FILE: u64 = u64::MAX;
+/// Lane protocol: 1 reads only, 2 writes too.
+const LANE_WRITES: u32 = 2;
 const ANSWER_LEN: usize = 8 + 4;
 /// Longest failure message accepted.
 const MAX_FAILURE: usize = 64 << 10;
@@ -77,6 +99,12 @@ pub struct LaneStats {
     /// Bytes this host sent to others.
     pub served_bytes: AtomicU64,
     pub served: AtomicU64,
+    /// Writes this host sent (answered and applied), and their bytes.
+    pub writes: AtomicU64,
+    pub write_bytes: AtomicU64,
+    /// Writes other hosts sent here, applied by the sink.
+    pub written: AtomicU64,
+    pub written_bytes: AtomicU64,
 }
 
 /// Unit the in-flight budget counts in.
@@ -91,6 +119,7 @@ pub struct Lanes {
     /// Peers this host dials, and where.
     dial: Mutex<HashMap<NodeId, SocketAddr>>,
     source: Mutex<Option<Weak<dyn ReadSource>>>,
+    sink: Mutex<Option<Weak<dyn WriteSink>>>,
     budget: Arc<tokio::sync::Semaphore>,
     rt: tokio::runtime::Handle,
     stop: tokio::sync::watch::Sender<bool>,
@@ -104,9 +133,14 @@ struct Lane {
     peer: NodeId,
     out: mpsc::Sender<Out>,
     pending: Mutex<HashMap<u64, Waiter>>,
+    /// Our writes awaiting answers (ids from the same counter as reads).
+    /// A lane that dies drops them: their outcome is unknown.
+    writes: Mutex<HashMap<u64, oneshot::Sender<Result<u32, NestError>>>>,
     next_id: AtomicU64,
     /// Our requests waiting for an answer on this lane.
     outstanding: AtomicUsize,
+    /// The peer applies writes sent on this lane (learned by the probe).
+    writable: AtomicBool,
     dead: AtomicBool,
     sock: std::net::TcpStream,
 }
@@ -122,6 +156,15 @@ enum Out {
     Answer {
         id: u64,
         r: Result<(ServeFile, u64, u32), NestError>,
+    },
+    Write {
+        id: u64,
+        op: WriteOp,
+        data: bytes::Bytes,
+    },
+    Written {
+        id: u64,
+        r: Result<u32, NestError>,
     },
 }
 
@@ -150,6 +193,7 @@ impl Lanes {
             peers: Mutex::new(HashMap::new()),
             dial: Mutex::new(HashMap::new()),
             source: Mutex::new(None),
+            sink: Mutex::new(None),
             budget: Arc::new(tokio::sync::Semaphore::new(units)),
             rt: tokio::runtime::Handle::current(),
             stop,
@@ -190,6 +234,11 @@ impl Lanes {
         *self.source.lock() = Some(source);
     }
 
+    /// Apply writes peers send over lanes through `sink`.
+    pub fn set_sink(&self, sink: Weak<dyn WriteSink>) {
+        *self.sink.lock() = Some(sink);
+    }
+
     /// Keep `per_peer` lanes open to `peer` at `addr` (an off-grid host
     /// dials every host it knows; the others only accept).
     pub fn dial(&self, peer: NodeId, addr: SocketAddr) {
@@ -201,6 +250,21 @@ impl Lanes {
         self.peers.lock().get(&peer).map_or(0, |v| {
             v.iter().filter(|l| !l.dead.load(Ordering::SeqCst)).count()
         })
+    }
+
+    /// Whether a live lane to `peer` takes writes.
+    pub fn writable(&self, peer: NodeId) -> bool {
+        self.pick_writable(peer).is_some()
+    }
+
+    fn pick_writable(&self, peer: NodeId) -> Option<Arc<Lane>> {
+        self.peers
+            .lock()
+            .get(&peer)?
+            .iter()
+            .filter(|l| !l.dead.load(Ordering::SeqCst) && l.writable.load(Ordering::SeqCst))
+            .min_by_key(|l| l.outstanding.load(Ordering::Relaxed))
+            .cloned()
     }
 
     /// Read `len` bytes (≤ chunk) of exactly `generation` of `file` from
@@ -250,6 +314,65 @@ impl Lanes {
             self.stats
                 .read_bytes
                 .fetch_add(b.len() as u64, Ordering::Relaxed);
+        }
+        r
+    }
+
+    /// Send `data` to `peer`, the file's owner, to be written as `op` says;
+    /// the bytes written. As for RDMA writes, `WriteError::Failed` is the
+    /// owner's answer or an unknown outcome: never send it again.
+    pub async fn write(
+        &self,
+        peer: NodeId,
+        op: WriteOp,
+        data: bytes::Bytes,
+    ) -> Result<u32, WriteError> {
+        let lane = self.pick_writable(peer).ok_or_else(|| {
+            WriteError::Unsent(NestError::Unavailable(format!(
+                "no TCP lane to {peer} takes writes"
+            )))
+        })?;
+        let len = data.len();
+        let _budget = self
+            .budget
+            .acquire_many(len.div_ceil(BUDGET_UNIT).max(1) as u32)
+            .await
+            .map_err(|_| WriteError::Unsent(NestError::Unavailable("lanes stopped".into())))?;
+        let id = lane.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        lane.writes.lock().insert(id, tx);
+        if lane.dead.load(Ordering::SeqCst) {
+            lane.writes.lock().remove(&id);
+            return Err(WriteError::Unsent(NestError::Unavailable(format!(
+                "TCP lane to {peer} closed"
+            ))));
+        }
+        lane.outstanding.fetch_add(1, Ordering::Relaxed);
+        let unknown = |why: &str| {
+            WriteError::Failed(NestError::Io(format!(
+                "write over TCP lane to {peer}: {why}; outcome unknown"
+            )))
+        };
+        let r = match lane.out.send(Out::Write { id, op, data }) {
+            // The writer thread is gone: nothing of it was sent.
+            Err(_) => Err(WriteError::Unsent(NestError::Unavailable(format!(
+                "TCP lane to {peer} closed"
+            )))),
+            Ok(()) => match tokio::time::timeout(self.cfg.read_timeout, rx).await {
+                Ok(Ok(Ok(n))) => Ok(n),
+                Ok(Ok(Err(e))) => Err(WriteError::Failed(e)),
+                Ok(Err(_)) => Err(unknown("lane lost")),
+                // A late answer finds no waiter (ids are never reused).
+                Err(_) => Err(unknown("no answer")),
+            },
+        };
+        lane.writes.lock().remove(&id);
+        lane.outstanding.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(n) = &r {
+            self.stats.writes.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .write_bytes
+                .fetch_add(*n as u64, Ordering::Relaxed);
         }
         r
     }
@@ -318,8 +441,10 @@ impl Lanes {
             peer,
             out,
             pending: Mutex::new(HashMap::new()),
+            writes: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             outstanding: AtomicUsize::new(0),
+            writable: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             sock: s.try_clone()?,
         });
@@ -332,11 +457,39 @@ impl Lanes {
         std::thread::Builder::new()
             .name(format!("lane-tx-{peer}"))
             .spawn(move || writer(l2, me2, w, rx))?;
-        let mut peers = self.peers.lock();
-        let v = peers.entry(peer).or_default();
-        v.retain(|l| !l.dead.load(Ordering::SeqCst));
-        v.push(lane);
+        {
+            let mut peers = self.peers.lock();
+            let v = peers.entry(peer).or_default();
+            v.retain(|l| !l.dead.load(Ordering::SeqCst));
+            v.push(lane.clone());
+        }
+        self.probe(lane);
         Ok(())
+    }
+
+    /// Ask the lane's peer whether it takes writes (see `PROBE_FILE`).
+    fn probe(&self, lane: Arc<Lane>) {
+        let wait = self.cfg.connect_timeout.max(Duration::from_secs(5));
+        self.rt.spawn(async move {
+            let id = lane.next_id.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = oneshot::channel();
+            lane.pending.lock().insert(id, tx);
+            let sent = lane.out.send(Out::Req {
+                id,
+                file: FileId(PROBE_FILE),
+                generation: Generation(LANE_WRITES as u64),
+                offset: 0,
+                len: 0,
+            });
+            if sent.is_ok()
+                && let Ok(Ok(Ok(b))) = tokio::time::timeout(wait, rx).await
+                && b.len() == 4
+                && u32::from_le_bytes(b[..4].try_into().unwrap()) >= LANE_WRITES
+            {
+                lane.writable.store(true, Ordering::SeqCst);
+            }
+            lane.pending.lock().remove(&id);
+        });
     }
 
     /// Top up dialled peers to `per_peer` live lanes every half second.
@@ -385,6 +538,8 @@ impl Lane {
                 self.peer
             ))));
         }
+        // Dropped unanswered: the writers report an unknown outcome.
+        self.writes.lock().clear();
     }
 }
 
@@ -407,6 +562,15 @@ fn reader(lane: Arc<Lane>, lanes: Weak<Lanes>, mut s: std::net::TcpStream) {
                     let Some(l) = lanes.upgrade() else {
                         return Ok(());
                     };
+                    if file.0 == PROBE_FILE {
+                        // What this build understands (a write arriving
+                        // before the sink is attached fails, unapplied).
+                        let _ = lane.out.send(Out::Written {
+                            id,
+                            r: Ok(LANE_WRITES),
+                        });
+                        continue;
+                    }
                     let source = l.source.lock().as_ref().and_then(|w| w.upgrade());
                     let out = lane.out.clone();
                     let answer = move |r: Result<ServeFile, NestError>| {
@@ -426,6 +590,52 @@ fn reader(lane: Arc<Lane>, lanes: Weak<Lanes>, mut s: std::net::TcpStream) {
                         },
                     }
                 }
+                WRITE => {
+                    let mut b = [0u8; WRITE_LEN];
+                    s.read_exact(&mut b)?;
+                    let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+                    let id = u64_at(0);
+                    let op = WriteOp {
+                        file: FileId(u64_at(8)),
+                        epoch: nest_types::Epoch(u64_at(16)),
+                        writer: (NodeId(u64_at(24)), u64_at(32)),
+                        offset: u64_at(40),
+                        append: b[48] & 1 != 0,
+                    };
+                    let len = u32::from_le_bytes(b[49..53].try_into().unwrap()) as usize;
+                    let Some(l) = lanes.upgrade() else {
+                        return Ok(());
+                    };
+                    if len > l.cfg.chunk {
+                        return Err(std::io::Error::other("oversized write"));
+                    }
+                    let mut data = vec![0u8; len];
+                    s.read_exact(&mut data)?;
+                    let sink = l.sink.lock().as_ref().and_then(|w| w.upgrade());
+                    let out = lane.out.clone();
+                    match sink {
+                        None => {
+                            let _ = out.send(Out::Written {
+                                id,
+                                r: Err(NestError::Unavailable("not taking writes yet".into())),
+                            });
+                        }
+                        Some(sink) => {
+                            let fut = sink.write(op, data.into());
+                            let weak = lanes.clone();
+                            l.rt.spawn(async move {
+                                let r = fut.await;
+                                if let (Ok(n), Some(l)) = (&r, weak.upgrade()) {
+                                    l.stats.written.fetch_add(1, Ordering::Relaxed);
+                                    l.stats
+                                        .written_bytes
+                                        .fetch_add(*n as u64, Ordering::Relaxed);
+                                }
+                                let _ = out.send(Out::Written { id, r });
+                            });
+                        }
+                    }
+                }
                 ANSWER | FAILURE => {
                     let mut b = [0u8; ANSWER_LEN];
                     s.read_exact(&mut b)?;
@@ -443,8 +653,16 @@ fn reader(lane: Arc<Lane>, lanes: Weak<Lanes>, mut s: std::net::TcpStream) {
                             .unwrap_or_else(|e| NestError::Io(e.to_string())))
                     };
                     // A read that gave up meanwhile has no waiter: dropped.
-                    if let Some(tx) = lane.pending.lock().remove(&id) {
+                    let read = lane.pending.lock().remove(&id);
+                    if let Some(tx) = read {
                         let _ = tx.send(r);
+                    } else if let Some(tx) = lane.writes.lock().remove(&id) {
+                        let _ = tx.send(r.and_then(|b| {
+                            b.get(..4)
+                                .filter(|_| b.len() == 4)
+                                .map(|n| u32::from_le_bytes(n.try_into().unwrap()))
+                                .ok_or_else(|| NestError::Io("malformed write answer".into()))
+                        }));
                     }
                 }
                 k => return Err(std::io::Error::other(format!("bad lane frame kind {k}"))),
@@ -502,10 +720,30 @@ fn writer(
                         l.stats.served_bytes.fetch_add(n as u64, Ordering::Relaxed);
                     }
                 }
-                Out::Answer { id, r: Err(e) } => {
+                Out::Answer { id, r: Err(e) } | Out::Written { id, r: Err(e) } => {
                     let body = nest_rpc::encode(&e).unwrap_or_default();
                     s.write_all(&answer_header(FAILURE, id, body.len() as u32))?;
                     s.write_all(&body)?;
+                }
+                Out::Written { id, r: Ok(n) } => {
+                    let mut b = [0u8; 1 + ANSWER_LEN + 4];
+                    b[..1 + ANSWER_LEN].copy_from_slice(&answer_header(ANSWER, id, 4));
+                    b[1 + ANSWER_LEN..].copy_from_slice(&n.to_le_bytes());
+                    s.write_all(&b)?;
+                }
+                Out::Write { id, op, data } => {
+                    let mut b = [0u8; 1 + WRITE_LEN];
+                    b[0] = WRITE;
+                    b[1..9].copy_from_slice(&id.to_le_bytes());
+                    b[9..17].copy_from_slice(&op.file.0.to_le_bytes());
+                    b[17..25].copy_from_slice(&op.epoch.0.to_le_bytes());
+                    b[25..33].copy_from_slice(&op.writer.0.0.to_le_bytes());
+                    b[33..41].copy_from_slice(&op.writer.1.to_le_bytes());
+                    b[41..49].copy_from_slice(&op.offset.to_le_bytes());
+                    b[49] = op.append as u8;
+                    b[50..54].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                    send_more(&s, &b)?;
+                    s.write_all(&data)?;
                 }
             }
         }

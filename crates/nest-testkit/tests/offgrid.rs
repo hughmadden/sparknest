@@ -504,3 +504,62 @@ async fn passthrough_gives_way_to_fabric_copies_unless_the_file_is_marked() {
     mark(&c, f, false).await;
     assert!(!passthrough(&c, 1, f).await);
 }
+
+fn lane_writes(c: &TestCluster, id: u64) -> (u64, u64) {
+    c.node(id).vfs.lanes().map_or((0, 0), |l| {
+        (
+            l.stats
+                .write_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            l.stats
+                .written_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    })
+}
+
+/// Writes between an off-grid host and a fabric owner travel over the TCP
+/// lanes (ADR-057), not the control connection, and land intact both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn offgrid_writes_go_over_tcp_lanes_both_ways() {
+    let c = with_offgrid(3, 4).await;
+    c.eventually("lanes take writes", Duration::from_secs(5), |c| {
+        let l4 = c.node(4).vfs.lanes().unwrap();
+        let l1 = c.node(1).vfs.lanes().unwrap();
+        l4.writable(NodeId(1)) && l1.writable(NodeId(4))
+    })
+    .await;
+    // The off-grid host rewrites a file a fabric host owns.
+    let base: Vec<u8> = (0..(3 << 20) + 5).map(|i| (i % 241) as u8).collect();
+    let f = file(&c, 1, "fabric-owned", &base).await;
+    let v4 = &c.node(4).vfs;
+    let (fh, _) = v4.open(f, oflags::RDWR).await.unwrap();
+    let new: Vec<u8> = (0..2 << 20).map(|i| (i % 239) as u8).collect();
+    let (sent, applied) = (lane_writes(&c, 4).0, lane_writes(&c, 1).1);
+    v4.write(fh, 100, new[..1 << 20].to_vec()).await.unwrap();
+    v4.write(fh, 100 + (1 << 20), new[1 << 20..].to_vec())
+        .await
+        .unwrap();
+    assert_eq!(c.attr(4, f).unwrap().owner, Some(NodeId(1)));
+    assert_eq!(lane_writes(&c, 4).0 - sent, 2 << 20, "not sent over lanes");
+    assert_eq!(lane_writes(&c, 1).1 - applied, 2 << 20);
+    v4.release(fh, None).await;
+    c.converge().await;
+    let mut want = base.clone();
+    want[100..100 + (2 << 20)].copy_from_slice(&new);
+    assert_eq!(read_all(&c, 2, f).await, want);
+
+    // A fabric host appends to a file the off-grid host owns.
+    let g = file(&c, 4, "offgrid-owned", b"log:").await;
+    let v2 = &c.node(2).vfs;
+    let (fh, _) = v2.open(g, oflags::WRONLY | oflags::APPEND).await.unwrap();
+    let sent = lane_writes(&c, 2).0;
+    for _ in 0..3 {
+        v2.write(fh, 0, b"abc".to_vec()).await.unwrap();
+    }
+    assert_eq!(c.attr(2, g).unwrap().owner, Some(NodeId(4)));
+    assert_eq!(lane_writes(&c, 2).0 - sent, 9, "not sent over lanes");
+    v2.release(fh, None).await;
+    c.converge().await;
+    assert_eq!(read_all(&c, 3, g).await, b"log:abcabcabc");
+}

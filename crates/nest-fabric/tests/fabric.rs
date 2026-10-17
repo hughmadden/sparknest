@@ -3,9 +3,9 @@
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use nest_fabric::{Fabric, FabricConfig, ReadSource, ServeFile};
+use nest_fabric::{Fabric, FabricConfig, ReadSource, ServeFile, WriteError, WriteOp, WriteSink};
 use nest_rpc::{Rpc, RpcConfig};
-use nest_types::{FileId, Generation, NestError, NodeId};
+use nest_types::{Epoch, FileId, Generation, NestError, NodeId};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -650,5 +650,376 @@ async fn port_counters_match_the_bytes_moved() {
         r1.bytes_sent - r0.bytes_sent,
         s1.bytes_received - s0.bytes_received,
         "request bytes sent and received differ"
+    );
+}
+
+// ------------------------------------------------------------ writes (ADR-057)
+
+/// Owns "file" 5 in epoch 4: applies writes the way the data layer's owner
+/// does (epoch check, append offset chosen here), optionally slowly, and
+/// records what it was handed.
+struct Owner {
+    file: std::fs::File,
+    path: PathBuf,
+    end: std::sync::Mutex<()>,
+    delay: Duration,
+    applied: std::sync::atomic::AtomicU64,
+    /// Most writes being applied at once.
+    busy: std::sync::atomic::AtomicU64,
+    peak: std::sync::atomic::AtomicU64,
+}
+
+impl Owner {
+    fn new(dir: &std::path::Path, delay: Duration) -> Arc<Owner> {
+        let path = dir.join("owned");
+        Arc::new(Owner {
+            file: std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+            path,
+            end: Default::default(),
+            delay,
+            applied: Default::default(),
+            busy: Default::default(),
+            peak: Default::default(),
+        })
+    }
+}
+
+struct Shared(Arc<Owner>);
+
+impl WriteSink for Shared {
+    fn write(&self, op: WriteOp, data: bytes::Bytes) -> BoxFuture<'static, Result<u32, NestError>> {
+        let me = self.0.clone();
+        async move {
+            use std::os::unix::fs::FileExt;
+            use std::sync::atomic::Ordering::SeqCst;
+            if op.file != FileId(5) {
+                return Err(NestError::NotFound);
+            }
+            if op.epoch != Epoch(4) {
+                return Err(NestError::Stale);
+            }
+            let now = me.busy.fetch_add(1, SeqCst) + 1;
+            me.peak.fetch_max(now, SeqCst);
+            if !me.delay.is_zero() {
+                // Holds the staging slot (in `data`) meanwhile.
+                tokio::time::sleep(me.delay).await;
+            }
+            {
+                let _end = me.end.lock().unwrap();
+                let off = if op.append {
+                    me.file.metadata().unwrap().len()
+                } else {
+                    op.offset
+                };
+                me.file.write_all_at(&data, off).unwrap();
+            }
+            me.busy.fetch_sub(1, SeqCst);
+            me.applied.fetch_add(1, SeqCst);
+            Ok(data.len() as u32)
+        }
+        .boxed()
+    }
+}
+
+fn wop(writer: u64, offset: u64, append: bool) -> WriteOp {
+    WriteOp {
+        file: FileId(5),
+        epoch: Epoch(4),
+        writer: (NodeId(writer), 1),
+        offset,
+        append,
+    }
+}
+
+async fn linked(cfg: FabricConfig, ids: &[u64]) -> Option<Vec<(Rpc, Arc<Fabric>)>> {
+    let mut v = Vec::new();
+    for id in ids {
+        v.push(node(*id, cfg.clone()).await?);
+    }
+    for (rpc, _) in &v {
+        for (other, _) in &v {
+            if rpc.local_addr() != other.local_addr() {
+                rpc.set_peer(other.node(), other.local_addr());
+            }
+        }
+    }
+    Some(v)
+}
+
+/// A remote write lands with exactly its bytes, at its offset, across the
+/// write tiers (a page, 1 MiB, an odd size); the owner's errors come back
+/// as final; nothing is applied twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn writes_land_with_the_right_bytes() {
+    let Some(n) = linked(FabricConfig::default(), &[1, 2]).await else {
+        return;
+    };
+    let (f1, f2) = (n[0].1.clone(), n[1].1.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Owner::new(dir.path(), Duration::ZERO);
+    let sink: Arc<dyn WriteSink> = Arc::new(Shared(owner.clone()));
+    f1.set_sink(Arc::downgrade(&sink));
+    assert_eq!(f2.max_write(), 1 << 20);
+    let mut want = vec![0u8; 3 << 20];
+    let mut writes = 0u64;
+    for (off, len) in [
+        (0u64, 1usize << 20),
+        (1 << 20, 4096),
+        ((1 << 20) + 4096, 100_000),
+        (2 << 20, 1 << 20),
+        (5, 1),
+    ] {
+        let data: Vec<u8> = (0..len as u64).map(|i| byte(i + off * 7)).collect();
+        let r = f2.write(NodeId(1), wop(2, off, false), &data).await;
+        assert_eq!(r, Ok(len as u32), "write at {off}");
+        want[off as usize..off as usize + len].copy_from_slice(&data);
+        writes += 1;
+    }
+    assert!(f2.can_write(NodeId(1)));
+    assert_eq!(f2.link_protocol(NodeId(1)), Some(nest_fabric::PROTOCOL));
+    assert_eq!(std::fs::read(&owner.path).unwrap(), want);
+    // The owner's refusals are final.
+    let stale = WriteOp {
+        epoch: Epoch(3),
+        ..wop(2, 0, false)
+    };
+    assert_eq!(
+        f2.write(NodeId(1), stale, b"x").await,
+        Err(WriteError::Failed(NestError::Stale))
+    );
+    let other = WriteOp {
+        file: FileId(6),
+        ..wop(2, 0, false)
+    };
+    assert_eq!(
+        f2.write(NodeId(1), other, b"x").await,
+        Err(WriteError::Failed(NestError::NotFound))
+    );
+    // Too large for RDMA: unsent (the caller uses TCP).
+    assert!(matches!(
+        f2.write(NodeId(1), wop(2, 0, false), &vec![0u8; (1 << 20) + 1])
+            .await,
+        Err(WriteError::Unsent(_))
+    ));
+    use std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(owner.applied.load(Relaxed), writes);
+    assert_eq!(f2.stats.writes.load(Relaxed), writes);
+    assert_eq!(f1.stats.pulled.load(Relaxed), writes);
+    // Reads still work on the same link.
+    let src: Arc<dyn ReadSource> = Arc::new(Pattern);
+    f1.set_source(Arc::downgrade(&src));
+    let b = f2
+        .read(NodeId(1), FileId(7), Generation(3), 100, 4096)
+        .await
+        .unwrap();
+    assert_eq!(b.as_slice()[0], byte(100));
+}
+
+/// Appends from two writers at once: the owner picks each offset, so every
+/// record lands whole, once, and none overlap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_appends_from_two_writers() {
+    let Some(n) = linked(FabricConfig::default(), &[1, 2, 3]).await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Owner::new(dir.path(), Duration::ZERO);
+    let sink: Arc<dyn WriteSink> = Arc::new(Shared(owner.clone()));
+    n[0].1.set_sink(Arc::downgrade(&sink));
+    let rec = 10_000usize;
+    let per = 100usize;
+    let mut tasks = Vec::new();
+    for w in [1usize, 2] {
+        for t in 0..4 {
+            let f = n[w].1.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..per / 4 {
+                    // Record: writer, then its sequence number, repeated.
+                    let tag = [w as u8, (t * (per / 4) + i) as u8];
+                    let data: Vec<u8> = tag.iter().copied().cycle().take(rec).collect();
+                    let r = f.write(NodeId(1), wop(w as u64 + 1, 0, true), &data).await;
+                    assert_eq!(r, Ok(rec as u32));
+                }
+            }));
+        }
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let got = std::fs::read(&owner.path).unwrap();
+    assert_eq!(got.len(), 2 * per * rec, "lost or duplicated appends");
+    let mut seen: Vec<(u8, u8)> = got
+        .chunks(rec)
+        .map(|c| {
+            assert!(
+                c.chunks(2).all(|p| p == &c[..2]),
+                "an append was split or overlapped"
+            );
+            (c[0], c[1])
+        })
+        .collect();
+    seen.sort();
+    let mut want: Vec<(u8, u8)> = [1u8, 2]
+        .iter()
+        .flat_map(|w| (0..per as u8).map(move |i| (*w, i)))
+        .collect();
+    want.sort();
+    assert_eq!(seen, want);
+}
+
+/// An owner with every write staging slot busy makes further writers wait
+/// for one (no per-writer reservation, no failure).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn writers_wait_for_the_owners_staging_slots() {
+    let cfg = FabricConfig {
+        write_tiers: vec![nest_fabric::Tier {
+            size: 1 << 20,
+            landing: 32,
+            staging: 2,
+        }],
+        ..FabricConfig::default()
+    };
+    let Some(n) = linked(cfg, &[1, 2, 3]).await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Owner::new(dir.path(), Duration::from_millis(40));
+    let sink: Arc<dyn WriteSink> = Arc::new(Shared(owner.clone()));
+    n[0].1.set_sink(Arc::downgrade(&sink));
+    let writes = 24u64;
+    let t0 = Instant::now();
+    let mut tasks = Vec::new();
+    for i in 0..writes {
+        let f = n[1 + (i % 2) as usize].1.clone();
+        tasks.push(tokio::spawn(async move {
+            let data = vec![i as u8; 256 << 10];
+            f.write(NodeId(1), wop(2, i * (256 << 10), false), &data)
+                .await
+        }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), Ok(256 << 10));
+    }
+    use std::sync::atomic::Ordering::SeqCst;
+    // Two slots: never more than two applied at once, so it took at least
+    // writes / 2 delays.
+    assert!(owner.peak.load(SeqCst) <= 2, "{}", owner.peak.load(SeqCst));
+    assert!(t0.elapsed() >= Duration::from_millis(40) * (writes as u32 / 2));
+    assert!(n[0].1.stats.pull_waits.load(SeqCst) > 0, "nothing waited");
+    let got = std::fs::read(&owner.path).unwrap();
+    assert_eq!(got.len(), (writes as usize) << 18);
+    for (i, c) in got.chunks(256 << 10).enumerate() {
+        assert!(c.iter().all(|b| *b == i as u8), "write {i}");
+    }
+}
+
+/// A host on protocol 2 (before writes) still pairs for reads; writes to
+/// it are refused as unsent (the caller uses TCP), in both directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn protocol_2_peers_pair_for_reads_but_not_writes() {
+    let Some((rpc1, old)) = node(
+        1,
+        FabricConfig {
+            protocol: 2,
+            ..FabricConfig::default()
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let (rpc2, new) = node(2, FabricConfig::default()).await.unwrap();
+    rpc2.set_peer(NodeId(1), rpc1.local_addr());
+    rpc1.set_peer(NodeId(2), rpc2.local_addr());
+    let src: Arc<dyn ReadSource> = Arc::new(Pattern);
+    old.set_source(Arc::downgrade(&src));
+    new.set_source(Arc::downgrade(&src));
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Owner::new(dir.path(), Duration::ZERO);
+    let sink: Arc<dyn WriteSink> = Arc::new(Shared(owner.clone()));
+    old.set_sink(Arc::downgrade(&sink));
+    new.set_sink(Arc::downgrade(&sink));
+    // The new host dials the old: it falls back to 2 and reads.
+    let b = new
+        .read(NodeId(1), FileId(7), Generation(3), 0, 4096)
+        .await
+        .unwrap();
+    assert_eq!(b.as_slice()[4095], byte(4095));
+    assert_eq!(new.link_protocol(NodeId(1)), Some(2));
+    assert!(!new.can_write(NodeId(1)));
+    assert!(matches!(
+        new.write(NodeId(1), wop(2, 0, false), b"x").await,
+        Err(WriteError::Unsent(_))
+    ));
+    assert_eq!(old.max_write(), 0);
+    // The old host dials the new (a fresh link): protocol 2 both ways.
+    old.drop_link(NodeId(2));
+    new.drop_link(NodeId(1));
+    let b = old
+        .read(NodeId(2), FileId(7), Generation(3), 4096, 4096)
+        .await
+        .unwrap();
+    assert_eq!(b.as_slice()[0], byte(4096));
+    assert_eq!(new.link_protocol(NodeId(1)), Some(2));
+    assert!(matches!(
+        new.write(NodeId(1), wop(2, 0, false), b"x").await,
+        Err(WriteError::Unsent(_))
+    ));
+    assert_eq!(
+        owner.applied.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a write went over a protocol-2 link"
+    );
+}
+
+/// A write whose owner never answers fails as an unknown outcome (never
+/// resent), and its link is retired; the outgoing slot is not reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn unanswered_writes_fail_as_unknown() {
+    let cfg = FabricConfig {
+        write_timeout: Duration::from_millis(500),
+        ..FabricConfig::default()
+    };
+    let Some(n) = linked(cfg, &[1, 2]).await else {
+        return;
+    };
+    struct Never;
+    impl WriteSink for Never {
+        fn write(&self, _: WriteOp, _: bytes::Bytes) -> BoxFuture<'static, Result<u32, NestError>> {
+            futures::future::pending().boxed()
+        }
+    }
+    let sink: Arc<dyn WriteSink> = Arc::new(Never);
+    n[0].1.set_sink(Arc::downgrade(&sink));
+    let f2 = n[1].1.clone();
+    let unknown = |r: Result<u32, WriteError>| match r {
+        Err(WriteError::Failed(NestError::Io(why))) => {
+            assert!(why.contains("outcome unknown"), "{why}")
+        }
+        other => panic!("{other:?}"),
+    };
+    // No answer within the timeout.
+    let t0 = Instant::now();
+    unknown(f2.write(NodeId(1), wop(2, 0, true), b"once").await);
+    assert!(t0.elapsed() >= Duration::from_millis(500));
+    assert!(!f2.can_write(NodeId(1)), "the lane was not retired");
+    // A fresh link; then the owner's side goes away mid-write (a restart).
+    let w = tokio::spawn({
+        let f2 = f2.clone();
+        async move { f2.write(NodeId(1), wop(2, 0, true), b"twice").await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    n[0].1.shutdown();
+    unknown(
+        tokio::time::timeout(Duration::from_secs(10), w)
+            .await
+            .expect("the writer waited for ever")
+            .unwrap(),
     );
 }
