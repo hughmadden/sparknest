@@ -11,14 +11,20 @@
 //!
 //! This carries Raft traffic, write forwarding and data-service control
 //! messages. Bulk file data uses `nest-fabric`.
+//!
+//! A peer may also have a standby address (its 10G LAN address): a second,
+//! idle connection is kept there and the peer's requests move to it when
+//! the primary connection fails (ADR-057, see `path`).
 
 pub mod auth;
 mod conn;
 mod filter;
+mod path;
 mod sockopt;
 
 pub use conn::{Handler, Rpc, RpcConfig};
 pub use filter::Filter;
+pub use path::{PathState, StandbyConfig};
 
 use nest_types::NodeId;
 use serde::{Serialize, de::DeserializeOwned};
@@ -38,6 +44,11 @@ pub mod service {
 pub enum RpcError {
     #[error("peer {0} unreachable: {1}")]
     Unreachable(NodeId, String),
+    /// The connection closed with the request in flight (the peer went
+    /// away, or its requests moved to another path, ADR-057). It may or may
+    /// not have run there; nothing resends it here.
+    #[error("request to {0} lost in flight: {1}")]
+    Lost(NodeId, String),
     #[error("request to {0} timed out")]
     Timeout(NodeId),
     #[error("remote error: {0}")]
