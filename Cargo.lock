@@ -1203,6 +1203,7 @@ name = "nest-testkit"
 version = "0.4.4"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures",
  "libc",
  "nest-data",
@@ -1210,6 +1211,7 @@ dependencies = [
  "nest-meta",
  "nest-place",
  "nest-raft",
+ "nest-rpc",
  "nest-store",
  "nest-types",
  "openraft",

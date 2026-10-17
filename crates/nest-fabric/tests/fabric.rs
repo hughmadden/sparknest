@@ -984,6 +984,8 @@ async fn protocol_2_peers_pair_for_reads_but_not_writes() {
 async fn unanswered_writes_fail_as_unknown() {
     let cfg = FabricConfig {
         write_timeout: Duration::from_millis(500),
+        // A retired lane backs the link off (ADR-057): keep that short.
+        link_retry: Duration::from_millis(100),
         ..FabricConfig::default()
     };
     let Some(n) = linked(cfg, &[1, 2]).await else {
@@ -1009,6 +1011,12 @@ async fn unanswered_writes_fail_as_unknown() {
     unknown(f2.write(NodeId(1), wop(2, 0, true), b"once").await);
     assert!(t0.elapsed() >= Duration::from_millis(500));
     assert!(!f2.can_write(NodeId(1)), "the lane was not retired");
+    // Meanwhile writes are refused unsent: safe to send another way.
+    assert!(matches!(
+        f2.write(NodeId(1), wop(2, 0, true), b"later").await,
+        Err(WriteError::Unsent(_))
+    ));
+    tokio::time::sleep(Duration::from_millis(250)).await;
     // A fresh link; then the owner's side goes away mid-write (a restart).
     let w = tokio::spawn({
         let f2 = f2.clone();

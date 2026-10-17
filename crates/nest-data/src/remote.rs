@@ -108,6 +108,7 @@ pub(crate) fn rpc_err(e: RpcError) -> NestError {
             NestError::Unavailable(format!("node {n} unreachable: {why}"))
         }
         RpcError::Timeout(n) => NestError::Unavailable(format!("node {n} timed out")),
+        RpcError::Lost(n, why) => NestError::Unavailable(format!("node {n}: {why}")),
         other => NestError::Io(other.to_string()),
     }
 }

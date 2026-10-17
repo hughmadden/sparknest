@@ -6,7 +6,7 @@ id = 1
 name = "raptor"
 state_dir = "/srv/sparknest-test"
 mountpoint = "/mnt/sparknest-test"
-listen = "10.55.0.22:7410"
+listen = "0.0.0.0:7410"
 api_listen = "10.55.0.22:7411"
 # Free space object data must leave on the state_dir filesystem for the
 # metadata database and Raft log; writes past it fail with ENOSPC.
@@ -16,15 +16,18 @@ data_reserve_gib = 4
 name = "trial"
 secret_file = "/srv/sparknest-test/cluster.secret"
 # Bootstrap membership. Control traffic uses rail-0 addresses; the fabric
-# discovers both RoCE rails on its own.
+# discovers both RoCE rails on its own. `lan` is each host's 10G LAN
+# address: a standby control connection and data lane are kept there and
+# used when the fabric fails (ADR-057), so `listen` must accept on the LAN
+# too (0.0.0.0).
 members = [
-  { id = 1, name = "raptor",  addr = "10.55.0.22:7410" },
-  { id = 2, name = "ostrich", addr = "10.55.0.1:7410" },
-  { id = 3, name = "dodo",    addr = "10.55.0.2:7410" },
-  { id = 4, name = "emu",     addr = "10.55.0.3:7410" },
-  { id = 5, name = "kiwi",    addr = "10.55.0.4:7410" },
-  { id = 6, name = "rhea",    addr = "10.55.0.5:7410" },
-  { id = 7, name = "moa",     addr = "10.55.0.6:7410" },
+  { id = 1, name = "raptor",  addr = "10.55.0.22:7410", lan = "172.22.2.12:7410" },
+  { id = 2, name = "ostrich", addr = "10.55.0.1:7410",  lan = "172.22.2.1:7410" },
+  { id = 3, name = "dodo",    addr = "10.55.0.2:7410",  lan = "172.22.2.2:7410" },
+  { id = 4, name = "emu",     addr = "10.55.0.3:7410",  lan = "172.22.2.3:7410" },
+  { id = 5, name = "kiwi",    addr = "10.55.0.4:7410",  lan = "172.22.2.4:7410" },
+  { id = 6, name = "rhea",    addr = "10.55.0.5:7410",  lan = "172.22.2.5:7410" },
+  { id = 7, name = "moa",     addr = "10.55.0.6:7410",  lan = "172.22.2.6:7410" },
 ]
 
 [fabric]

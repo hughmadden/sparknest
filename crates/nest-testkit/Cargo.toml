@@ -15,6 +15,7 @@ nest-meta.workspace = true
 nest-store.workspace = true
 nest-data.workspace = true
 nest-raft.workspace = true
+nest-rpc.workspace = true
 sparknestd = { path = "../sparknestd" }
 nest-fabric.workspace = true
 nest-place.workspace = true
@@ -27,3 +28,4 @@ rusqlite.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
+bytes.workspace = true
