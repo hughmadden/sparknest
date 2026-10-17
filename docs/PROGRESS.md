@@ -3,33 +3,61 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-## 2026-10-17 — 0.5.0 in progress: remote writes over RDMA (ADR-057 item 4)
+## 2026-10-17 — 0.5.0: a 10G standby, remote writes over RDMA, leader handoff (ADR-057–059)
 
-- A write to a file another host owns is pulled by the owner: the writer
-  SENDs a 64-byte `WriteReq` naming a remote-readable outgoing slot, the
-  owner RDMA-READs it into a staging slot of its own (queued when none is
-  free, never reserved per writer), applies it through the same
-  `owner_mutate` as every remote write and SENDs `WriteDone`. Fabric
-  protocol 3; links record the lower protocol, so 0.4 hosts (2) still pair
-  for reads and take writes over TCP. QPs now allow 16 outstanding READs.
-- Without a link, writes use a TCP lane to the owner that takes them (lane
-  frame kind 4, after a probe: a 0.4 host closes a lane on unknown
-  frames), then the control connection. A write whose answer is lost is
-  EIO, never resent.
-- Appends at the owner are serialised per object: two concurrent appends
-  could read the same end and overwrite each other.
-- raptor loopback, 1 MiB writes at 8 in flight: 52 GB/s over RDMA against
-  13 GB/s over loopback TCP, and a control call behind them waits p99
-  115 us instead of 1.2–3.4 ms ([M12-REMOTE-WRITES](../benchmarks/M12-REMOTE-WRITES.md)).
-  Through the VFS both stop near 2 GB/s per file (the apply path).
-- Found, not fixed (predates this work): concurrent first writes from
-  several hosts to a STABLE file can fail `Unavailable("no reachable node
-  holds this file")` while ownership is being granted.
-- The management API's OpenAPI document (ADR-006) is checked in at last:
-  `crates/nest-api/openapi.yaml`, handwritten from the handlers, every
-  route including `/v1/ws` frames and the loopback RDMA counters. A test
-  fails when a `.route(...)` in `nest-api` is not documented, or the
-  document names one that is gone.
+- **10G standby for the control plane** (ADR-057 1–2). Each fabric pair
+  keeps an idle, pinged control connection on the LAN (`Member.lan`; the
+  lower id dials). Requests move there only when the fabric connection
+  breaks, or nothing arrives on it for 1 s while the standby answers (a
+  slow handler never counts: the connection reader answers a probe), and
+  move back after 10 s healthy. In-process, cutting every fabric
+  connection kept quorum with no election. Requests in flight at a move
+  fail `RpcError::Lost` (maybe executed) and Raft resends them.
+- **A standby data lane** (ADR-057 3): one TCP lane per fabric pair on the
+  LAN (`node.lanes_fabric`); reads use it while an RDMA link is down or
+  backing off, never because RDMA is slow.
+- **Remote writes over RDMA, pulled by the owner** (ADR-057 4, ADR-058):
+  the writer SENDs a 64-byte request naming a remote-readable slot, the
+  owner RDMA-READs it into a staging slot (queued when none is free, never
+  reserved per writer), applies it and answers. Fabric protocol 3, lane
+  frame kind 4 after a probe; 0.4 hosts keep RDMA reads and get writes
+  over the control connection. A write whose answer is lost is EIO, never
+  resent. raptor loopback, 1 MiB at 8 in flight: 52 GB/s against 13 GB/s
+  over TCP; a control call behind them waits p99 115 us instead of
+  1.2–3.4 ms ([M12-REMOTE-WRITES](../benchmarks/M12-REMOTE-WRITES.md)).
+- **Two data bugs fixed.** Concurrent appends from several hosts could
+  overwrite each other at the owner: on the trial cluster a 0.4.4 owner
+  kept 563–597 of 600 records, a 0.5.0 owner all 600 (append lock).
+  Concurrent first writes to a stable file from two hosts failed with "no
+  reachable node holds this file" (EIO); they route again now.
+- **Leader handoff** (ADR-057 5–6): a stopping leader hands off to the
+  most caught-up voter that can take it (`RaftReq::TransferLeader`, after
+  a `Features` probe 0.4.4 refuses). Cluster setting `preferred-leader`
+  (`nest config set preferred-leader raptor`): the leader moves there after
+  2 min settled, not within 10 min of the last move, and never while that
+  host's control requests are on the LAN. Trial cluster: handoff on stop
+  23 ms, back to raptor after the settle in 31 ms, term +1 each, no
+  election.
+- **Served objects close on invalidation** (ADR-057 7): deletion, eviction
+  from any host or a new owner's generation closes the cached open file at
+  once; idle 2 s (sliding) or open 30 s closes it otherwise.
+- **`nest net`** (`GET /v1/net`): per host and peer the control path and
+  why it moved, the RDMA link and protocol, TCP lanes, Raft heartbeat
+  round trips and lag; each RDMA port's NIC loss counters (out-of-sequence,
+  sequence NAKs, RNR NAKs, CNPs). A new admin request rather than new
+  `NodeInfo` fields: postcard cannot decode a struct missing trailing
+  fields, so a 0.5 host asking a 0.4.4 one would have seen an error.
+- **Control path benchmark** ([M12-CONTROL-PATH](../benchmarks/M12-CONTROL-PATH.md)):
+  raptor to kiwi, 30 min side by side, fabric p50 246 us, LAN 372 us,
+  neither near a heartbeat's 150 ms. The fabric stays primary.
+- **Not done:** keeping the mount across a restart (ADR-059: requests on
+  the FUSE io_uring ring are lost when the server exits); a live fabric
+  link drop on real hardware (needs a quiet window).
+- **The OpenAPI document** (ADR-006) is checked in at last:
+  `crates/nest-api/openapi.yaml`, with a test that fails when a route is
+  not documented.
+- `sparknest-add-lan-standby` turns the standby on in `node.toml` after
+  the upgrade (0.4.4 refuses to start with `lan`).
 
 ## 2026-10-17 — 0.4.4: reads ride out elections, EIO logged, archive snapshots on SMB (ADR-056)
 

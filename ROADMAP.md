@@ -103,3 +103,9 @@ raw CSV).
   (deferred: off-grid hosts hold archival copies on slow disks).
 - Soak test on the live cluster: reboot Sparks during model loads, pull a
   cable, fill a disk (deferred by the user; not part of 0.5.0).
+- Keep the mount across a daemon restart (ADR-059): not safe with FUSE
+  over io_uring (requests handed to a ring entry are lost when the server
+  exits); an opt-in mode without io_uring is possible.
+- Watch a live fabric link drop fail over to the LAN standby on real
+  hardware (0.5.0 tested it in-process and on the trial cluster's
+  start-up paths only; needs a quiet window).
