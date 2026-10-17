@@ -63,6 +63,8 @@ state_dir = "$state"
 mountpoint = "$mnt"
 listen = "0.0.0.0:$SPARKNEST_PORT"
 api_listen = "0.0.0.0:$SPARKNEST_API_PORT"
+# Beside a production daemon on 7403 (ADR-051).
+counters_listen = "127.0.0.1:$((SPARKNEST_PORT + 3))"
 
 [cluster]
 name = "$SPARKNEST_CLUSTER"
