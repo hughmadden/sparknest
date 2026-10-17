@@ -103,3 +103,74 @@ mod tests {
         assert_eq!(mtu_bytes(1), 256);
     }
 }
+
+/// What the NIC says about loss and congestion on one port, from
+/// `/sys/class/infiniband/<dev>/ports/<n>/hw_counters` (ADR-057). Cumulative
+/// since the driver loaded; a missing counter reads as `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct HwCounters {
+    pub device: String,
+    pub port: u8,
+    /// Packets that arrived out of order (a drop upstream; go-back-N).
+    pub out_of_sequence: Option<u64>,
+    /// NAKs received for a sequence error: the peer saw our drop.
+    pub packet_seq_err: Option<u64>,
+    /// Our requests that timed out waiting for an ACK (17 ms each).
+    pub local_ack_timeout_err: Option<u64>,
+    /// "Receiver not ready" NAKs received: a peer had no receive posted.
+    pub rnr_nak_retry_err: Option<u64>,
+    /// Congestion notifications this port sent / acted on (ECN).
+    pub np_cnp_sent: Option<u64>,
+    pub rp_cnp_handled: Option<u64>,
+    /// Adaptive retransmissions.
+    pub roce_adp_retrans: Option<u64>,
+}
+
+/// The NIC's own loss counters for every port sparknest uses.
+pub fn hw_counters(ports: &[PortInfo]) -> Vec<HwCounters> {
+    ports
+        .iter()
+        .map(|p| {
+            let dir = std::path::Path::new("/sys/class/infiniband")
+                .join(&p.device)
+                .join("ports")
+                .join(p.port.to_string())
+                .join("hw_counters");
+            let read = |name: &str| {
+                std::fs::read_to_string(dir.join(name))
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+            };
+            HwCounters {
+                device: p.device.clone(),
+                port: p.port,
+                out_of_sequence: read("out_of_sequence"),
+                packet_seq_err: read("packet_seq_err"),
+                local_ack_timeout_err: read("local_ack_timeout_err"),
+                rnr_nak_retry_err: read("rnr_nak_retry_err"),
+                np_cnp_sent: read("np_cnp_sent"),
+                rp_cnp_handled: read("rp_cnp_handled"),
+                roce_adp_retrans: read("roce_adp_retrans"),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod hw_tests {
+    use super::*;
+
+    #[test]
+    fn missing_counters_read_as_none() {
+        let c = hw_counters(&[PortInfo {
+            device: "no-such-device".into(),
+            port: 1,
+            netdev: String::new(),
+            addrs: vec![],
+            path_mtu: 4096,
+        }]);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].out_of_sequence, None);
+        assert_eq!(c[0].device, "no-such-device");
+    }
+}
