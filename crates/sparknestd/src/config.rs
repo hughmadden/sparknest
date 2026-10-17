@@ -81,6 +81,11 @@ pub struct NodeSection {
     /// TCP lanes this host keeps to each host it dials (off-grid hosts).
     #[serde(default = "default_lanes")]
     pub lanes: usize,
+    /// Standby TCP lanes between fabric hosts on the LAN (ADR-057), used
+    /// when the RDMA link to the peer is down; dialled by the lower id of
+    /// each pair, to members with a `lan` address. 0: none.
+    #[serde(default = "default_lanes_fabric")]
+    pub lanes_fabric: usize,
     /// RDMA counters as JSON over HTTP (ADR-051); loopback only. The
     /// binary stream is always at `<state_dir>/run/rdma-counters.sock` (ADR-052).
     #[serde(default = "default_counters_listen")]
@@ -93,6 +98,10 @@ fn default_counters_listen() -> Option<SocketAddr> {
 
 fn default_lanes() -> usize {
     4
+}
+
+fn default_lanes_fabric() -> usize {
+    1
 }
 
 impl NodeSection {
@@ -139,11 +148,21 @@ pub struct Member {
     /// Its TCP lanes address, when it is not `addr` with the port plus 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lanes: Option<SocketAddr>,
+    /// Its 10G LAN address (port as `addr`): the standby for the control
+    /// connection and data lanes when the fabric fails (ADR-057). Fabric
+    /// hosts only; an off-grid host's `addr` already is a LAN address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan: Option<SocketAddr>,
 }
 
 impl Member {
     pub fn lanes(&self) -> SocketAddr {
         self.lanes.unwrap_or_else(|| port_plus_2(self.addr))
+    }
+
+    /// Its standby lanes address on the LAN: `lan` with the port plus 2.
+    pub fn lan_lanes(&self) -> Option<SocketAddr> {
+        self.lan.map(port_plus_2)
     }
 }
 
@@ -323,6 +342,34 @@ mod tests {
         );
         let cfg: Config = toml::from_str(&voting).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn members_may_name_a_lan_standby() {
+        let text = include_str!("../../../packaging/config/node.toml.sample");
+        let cfg: Config = toml::from_str(text).unwrap();
+        let ostrich = &cfg.cluster.members[1];
+        assert_eq!(ostrich.lan, Some("172.22.2.1:7410".parse().unwrap()));
+        assert_eq!(
+            ostrich.lan_lanes(),
+            Some("172.22.2.1:7412".parse().unwrap())
+        );
+        assert_eq!(cfg.node.lanes_fabric, 1);
+        // A 0.4 config (no `lan`) still parses, and writes none back.
+        let old = r#"
+            [node]
+            id = 1
+            name = "a"
+            state_dir = "/tmp/x"
+            listen = "10.55.0.22:7400"
+            [cluster]
+            name = "c"
+            secret_file = "/tmp/s"
+            members = [{ id = 1, name = "a", addr = "10.55.0.22:7400" }]
+        "#;
+        let cfg: Config = toml::from_str(old).unwrap();
+        assert_eq!(cfg.cluster.members[0].lan, None);
+        assert!(!toml::to_string(&cfg).unwrap().contains("lan ="));
     }
 
     #[test]

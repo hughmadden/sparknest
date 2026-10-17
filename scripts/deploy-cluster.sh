@@ -34,7 +34,10 @@ fi
 members=""
 for h in "${SPARKNEST_HOSTS[@]}"; do
   IFS=: read -r name id ip _ <<<"$h"
-  members+="  { id = $id, name = \"$name\", addr = \"$ip:$SPARKNEST_PORT\" },"$'\n'
+  # `lan`: the standby control connection and data lane (ADR-057).
+  lan=""
+  for l in "${SPARKNEST_LAN[@]}"; do [ "${l%%:*}" = "$name" ] && lan=${l#*:} || true; done
+  members+="  { id = $id, name = \"$name\", addr = \"$ip:$SPARKNEST_PORT\"${lan:+, lan = \"$lan:$SPARKNEST_PORT\"} },"$'\n'
 done
 
 secret_local="dist/cluster.secret.$SPARKNEST_CLUSTER"
@@ -58,7 +61,7 @@ id = $id
 name = "$name"
 state_dir = "$state"
 mountpoint = "$mnt"
-listen = "$ip:$SPARKNEST_PORT"
+listen = "0.0.0.0:$SPARKNEST_PORT"
 api_listen = "0.0.0.0:$SPARKNEST_API_PORT"
 
 [cluster]

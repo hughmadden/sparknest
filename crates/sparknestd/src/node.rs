@@ -30,6 +30,9 @@ pub struct Tuning {
     /// How long a re-found coordinator waits for more members once a
     /// majority is present (ADR-026).
     pub recovery_grace: Duration,
+    /// When control requests move to a peer's LAN standby and back
+    /// (ADR-057).
+    pub standby: nest_rpc::StandbyConfig,
 }
 
 impl Default for Tuning {
@@ -51,6 +54,27 @@ impl Default for Tuning {
             fabric: Some(nest_fabric::FabricConfig::default()),
             boot_id: None,
             recovery_grace: Duration::from_secs(10),
+            standby: nest_rpc::StandbyConfig::default(),
+        }
+    }
+}
+
+/// A `lan` standby only works if this host accepts on its LAN address:
+/// say so at start when `listen` (or `lanes_listen`) is bound elsewhere.
+fn warn_unreachable_standby(cfg: &Config) {
+    let Some(me) = cfg.cluster.members.iter().find(|m| m.id == cfg.node.id) else {
+        return;
+    };
+    let Some(lan) = me.lan else { return };
+    for (what, l) in [
+        ("listen", cfg.node.listen),
+        ("lanes_listen", cfg.node.lanes_listen()),
+    ] {
+        if !l.ip().is_unspecified() && l.ip() != lan.ip() {
+            tracing::warn!(
+                lan = %lan, %what, addr = %l,
+                "this host's LAN standby address is not listened on: set node.{what} to 0.0.0.0"
+            );
         }
     }
 }
@@ -89,13 +113,16 @@ impl Node {
         let lanes_secret = secret.clone();
         std::fs::create_dir_all(&cfg.node.state_dir)
             .with_context(|| format!("creating {}", cfg.node.state_dir.display()))?;
-        let rpc = Rpc::bind(RpcConfig {
-            node: id,
-            cluster: cfg.cluster.name.clone(),
-            secret,
-            listen: cfg.node.listen,
-            connect_timeout: tuning.connect_timeout,
-        })
+        let rpc = Rpc::bind_with(
+            RpcConfig {
+                node: id,
+                cluster: cfg.cluster.name.clone(),
+                secret,
+                listen: cfg.node.listen,
+                connect_timeout: tuning.connect_timeout,
+            },
+            tuning.standby.clone(),
+        )
         .await
         .with_context(|| format!("binding {}", cfg.node.listen))?;
         let offgrid = cfg.node.role == crate::config::Role::Offgrid;
@@ -108,8 +135,17 @@ impl Node {
                     rpc.pin_peer(m.id, m.addr);
                 } else {
                     rpc.set_peer(m.id, m.addr);
+                    // A standby control connection over the LAN (ADR-057).
+                    // Kept apart from the membership address, so nothing
+                    // learned from Raft replaces it.
+                    if let Some(lan) = m.lan {
+                        rpc.set_standby(m.id, lan);
+                    }
                 }
             }
+        }
+        if !offgrid {
+            warn_unreachable_standby(&cfg);
         }
         let boot = tuning
             .boot_id
@@ -294,6 +330,14 @@ impl Node {
         if offgrid {
             for m in cfg.cluster.members.iter().filter(|m| m.id != id) {
                 lanes.dial(m.id, m.lanes());
+            }
+        } else {
+            // Standby data lanes between fabric hosts on the LAN, for when
+            // the RDMA link fails (ADR-057): the lower id dials.
+            for m in cfg.cluster.members.iter().filter(|m| m.id > id) {
+                if let Some(a) = m.lan_lanes() {
+                    lanes.dial_n(m.id, a, cfg.node.lanes_fabric);
+                }
             }
         }
         let fabric = Arc::new(parking_lot::Mutex::new(fabric));

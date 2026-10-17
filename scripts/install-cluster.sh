@@ -85,11 +85,22 @@ install_all() {
   for p in "${pids[@]}"; do wait "$p"; done
 }
 
+# A host's 10G LAN address (scripts/cluster.env SPARKNEST_LAN), or nothing.
+lan_ip() {
+  local h
+  for h in "${SPARKNEST_LAN[@]}"; do
+    [ "${h%%:*}" = "$1" ] && { echo "${h#*:}"; return; }
+  done
+  return 0
+}
+
 configure() {
-  local members="" secret="dist/cluster.secret.$CLUSTER"
+  local members="" secret="dist/cluster.secret.$CLUSTER" lan
   for h in "${SPARKNEST_HOSTS[@]}"; do
     IFS=: read -r host id ip _ <<<"$h"
-    members+="  { id = $id, name = \"$host\", addr = \"$ip:$PORT\" },"$'\n'
+    # `lan`: the standby control connection and data lane (ADR-057).
+    lan=$(lan_ip "$host")
+    members+="  { id = $id, name = \"$host\", addr = \"$ip:$PORT\"${lan:+, lan = \"$lan:$PORT\"} },"$'\n'
   done
   [ -f "$secret" ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$secret"; chmod 600 "$secret"; }
   for h in "${SPARKNEST_HOSTS[@]}"; do
@@ -103,7 +114,7 @@ id = $id
 name = "$host"
 state_dir = "$STATE"
 mountpoint = "$MOUNT"
-listen = "$ip:$PORT"
+listen = "0.0.0.0:$PORT"
 api_listen = "0.0.0.0:$API_PORT"
 
 [cluster]

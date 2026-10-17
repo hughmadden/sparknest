@@ -66,6 +66,39 @@ switch ports allow jumbo; a host at 9000 talking TCP to it would hang.
 - Management/LAN: 172.22.x.x (raptor 172.22.2.12, ostrich 172.22.2.1). NAS
   `aviary` at 172.22.1.10 over 10G.
 
+### LAN standby for the fabric hosts (ADR-057, 0.5.0)
+
+Every fabric host is also on the 10G LAN: raptor 172.22.2.12, ostrich .1,
+dodo .2, emu .3, kiwi .4, rhea .5, moa .6. Given each member's `lan`,
+sparknest keeps a standby control connection and one TCP data lane there
+and uses them when the fabric fails (switch reboot, pulled cable). Every
+host already listens on `0.0.0.0:7400`/`:7402` and the LAN reaches
+those ports (checked 2026-10-17 from raptor to ostrich), so nothing else is
+needed. To turn it on, once every host runs 0.5.0, add `lan` to each
+fabric member in `cluster.members` of `/srv/sparknest/node.toml` on all
+seven fabric hosts (the same list everywhere), then restart each daemon in
+turn (ask first: the mounts are in use):
+
+```toml
+members = [
+  { id = 1, name = "raptor", addr = "10.55.0.22:7400", lan = "172.22.2.12:7400" },
+  { id = 2, name = "ostrich", addr = "10.55.0.1:7400", lan = "172.22.2.1:7400" },
+  { id = 3, name = "dodo", addr = "10.55.0.2:7400", lan = "172.22.2.2:7400" },
+  { id = 4, name = "emu", addr = "10.55.0.3:7400", lan = "172.22.2.3:7400" },
+  { id = 5, name = "kiwi", addr = "10.55.0.4:7400", lan = "172.22.2.4:7400" },
+  { id = 6, name = "rhea", addr = "10.55.0.5:7400", lan = "172.22.2.5:7400" },
+  { id = 7, name = "moa", addr = "10.55.0.6:7400", lan = "172.22.2.6:7400" },
+]
+```
+
+`sparknestd --config /srv/sparknest/node.toml --check` validates the
+edit. A 0.4.4 daemon rejects the unknown `lan` key, so do not add it
+before the upgrade. Mixed versions are fine: a 0.5.0 host keeps using the
+fabric connection to a 0.4.4 peer and retries the standby once a minute.
+Off-grid hosts (kakapo, oliver) are unchanged: their members are already
+LAN addresses and need no `lan`. `scripts/install-cluster.sh configure`
+and `scripts/deploy-cluster.sh` write `lan` from `SPARKNEST_LAN`.
+
 ## Existing mounts relevant to sparknest
 
 - `/mnt/models`: `//aviary/models` CIFS 3.1.1 on all nodes (6.0T, 1.4T free).

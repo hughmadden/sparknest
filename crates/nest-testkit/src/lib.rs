@@ -44,6 +44,13 @@ pub fn fast_tuning() -> Tuning {
         fabric: None,
         boot_id: None,
         recovery_grace: Duration::from_millis(500),
+        standby: nest_rpc::StandbyConfig {
+            silence: Duration::from_millis(300),
+            ping_every: Duration::from_millis(100),
+            ping_fresh: Duration::from_millis(400),
+            redial_every: Duration::from_millis(250),
+            return_after: Duration::from_secs(1),
+        },
     }
 }
 
@@ -58,6 +65,9 @@ pub struct TestCluster {
     offgrid: std::collections::BTreeSet<u64>,
     /// Each node's TCP lanes address, kept across restarts.
     lanes: BTreeMap<u64, SocketAddr>,
+    /// Fabric hosts also reachable on a "LAN" (ADR-057): nodes listen on
+    /// every address, 127.0.0.1 plays the fabric and 127.0.0.2 the LAN.
+    standby: bool,
 }
 
 impl TestCluster {
@@ -67,6 +77,18 @@ impl TestCluster {
     }
 
     pub async fn start_with(n: u64, tuning: Tuning) -> TestCluster {
+        Self::start_opts(n, tuning, false).await
+    }
+
+    /// Start `n` voting nodes that also have a LAN standby (ADR-057): each
+    /// listens on every address, members name 127.0.0.1 as `addr` and
+    /// 127.0.0.2 as `lan`. [`TestCluster::cut_fabric`] then cuts the
+    /// "fabric" and leaves the "LAN".
+    pub async fn start_with_standby(n: u64, tuning: Tuning) -> TestCluster {
+        Self::start_opts(n, tuning, true).await
+    }
+
+    async fn start_opts(n: u64, tuning: Tuning, standby: bool) -> TestCluster {
         init_tracing();
         let mut c = TestCluster {
             dir: tempfile::tempdir().unwrap(),
@@ -76,9 +98,25 @@ impl TestCluster {
             boots: BTreeMap::new(),
             offgrid: Default::default(),
             lanes: BTreeMap::new(),
+            standby,
         };
-        for id in 1..=n {
-            c.boot(id, "127.0.0.1:0".parse().unwrap()).await;
+        if standby {
+            // Pick every node's ports first, so each config names all the
+            // standby addresses (they are only read at start).
+            for id in 1..=n {
+                let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+                let p = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+                c.addrs.insert(id, loopback(l.local_addr().unwrap()));
+                c.lanes.insert(id, loopback(p.local_addr().unwrap()));
+            }
+            for id in 1..=n {
+                let listen = c.listen_addr(c.addrs[&id]);
+                c.boot(id, listen).await;
+            }
+        } else {
+            for id in 1..=n {
+                c.boot(id, "127.0.0.1:0".parse().unwrap()).await;
+            }
         }
         let members: BTreeMap<u64, BasicNode> = c
             .addrs
@@ -106,6 +144,27 @@ impl TestCluster {
         self.dir.path().join(format!("node{id}"))
     }
 
+    /// Where node `id` listens for an address of it: every address when
+    /// there is a standby.
+    fn listen_addr(&self, a: SocketAddr) -> SocketAddr {
+        if self.standby {
+            SocketAddr::from(([0, 0, 0, 0], a.port()))
+        } else {
+            a
+        }
+    }
+
+    /// Cut every node's fabric (primary) connections to every other node,
+    /// leaving the LAN standby (ADR-057). Dialling the fabric is refused
+    /// until [`TestCluster::heal`].
+    pub fn cut_fabric(&self) {
+        for (a, n) in &self.nodes {
+            for b in self.nodes.keys().filter(|b| *b != a) {
+                n.rpc.filter().cut(NodeId(*b));
+            }
+        }
+    }
+
     fn config(&self, id: u64, listen: SocketAddr) -> Config {
         Config {
             node: NodeSection {
@@ -122,12 +181,15 @@ impl TestCluster {
                     sparknestd::config::Role::Fabric
                 },
                 lanes_listen: Some(
-                    self.lanes
-                        .get(&id)
-                        .copied()
-                        .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
+                    self.listen_addr(
+                        self.lanes
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()),
+                    ),
                 ),
                 lanes: 2,
+                lanes_fabric: 1,
                 counters_listen: None,
             },
             cluster: ClusterSection {
@@ -146,6 +208,11 @@ impl TestCluster {
                         addr: *a,
                         voter: !self.offgrid.contains(i),
                         lanes: self.lanes.get(i).copied(),
+                        // The standby lanes are at `lan` port + 2: only the
+                        // control standby is exercised here.
+                        lan: self
+                            .standby
+                            .then(|| SocketAddr::from(([127, 0, 0, 2], a.port()))),
                     })
                     .collect(),
             },
@@ -168,9 +235,9 @@ impl TestCluster {
         let mut tuning = self.tuning.clone();
         tuning.boot_id = Some(format!("test-boot-{}", self.boots.entry(id).or_insert(0)));
         let node = start_node(cfg, tuning).await;
-        self.addrs.insert(id, node.rpc.local_addr());
+        self.addrs.insert(id, loopback(node.rpc.local_addr()));
         if let Some(a) = node.vfs.lanes().and_then(|l| l.local_addr()) {
-            self.lanes.insert(id, a);
+            self.lanes.insert(id, loopback(a));
         }
         self.nodes.insert(id, node);
     }
@@ -206,16 +273,16 @@ impl TestCluster {
         let starts: Vec<_> = ids
             .iter()
             .map(|&id| {
-                let cfg = self.config(id, self.addrs[&id]);
+                let cfg = self.config(id, self.listen_addr(self.addrs[&id]));
                 let mut tuning = self.tuning.clone();
                 tuning.boot_id = Some(format!("test-boot-{}", self.boots.entry(id).or_insert(0)));
                 async move { (id, start_node(cfg, tuning).await) }
             })
             .collect();
         for (id, n) in futures::future::join_all(starts).await {
-            self.addrs.insert(id, n.rpc.local_addr());
+            self.addrs.insert(id, loopback(n.rpc.local_addr()));
             if let Some(a) = n.vfs.lanes().and_then(|l| l.local_addr()) {
-                self.lanes.insert(id, a);
+                self.lanes.insert(id, loopback(a));
             }
             self.nodes.insert(id, n);
         }
@@ -223,7 +290,7 @@ impl TestCluster {
 
     /// Node `id`'s configuration (as its daemon would load it).
     pub fn node_config(&self, id: u64) -> Config {
-        self.config(id, self.addrs[&id])
+        self.config(id, self.listen_addr(self.addrs[&id]))
     }
 
     /// Start node `id` on a throwaway address without registering it, to
@@ -265,7 +332,7 @@ impl TestCluster {
 
     /// Restart a stopped node on its original address.
     pub async fn restart(&mut self, id: u64) {
-        let addr = self.addrs[&id];
+        let addr = self.listen_addr(self.addrs[&id]);
         self.boot(id, addr).await;
     }
 
@@ -386,6 +453,16 @@ impl TestCluster {
     pub fn attr(&self, id: u64, file: FileId) -> Option<nest_types::FileAttr> {
         let c = self.nodes[&id].meta.open_reader().unwrap();
         nest_meta::query::getattr(&c, file).unwrap()
+    }
+}
+
+/// An address peers can dial: a node bound to every address is reached on
+/// 127.0.0.1 (the "fabric").
+fn loopback(a: SocketAddr) -> SocketAddr {
+    if a.ip().is_unspecified() {
+        SocketAddr::from(([127, 0, 0, 1], a.port()))
+    } else {
+        a
     }
 }
 

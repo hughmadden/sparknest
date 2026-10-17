@@ -1209,6 +1209,7 @@ dependencies = [
  "nest-meta",
  "nest-place",
  "nest-raft",
+ "nest-rpc",
  "nest-store",
  "nest-types",
  "openraft",
