@@ -3,6 +3,16 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-18 — 0.5.4: only named branches split a model
+
+- 0.5.3 listed about 25 ordinary repos as several rows: a `main` row
+  plus one per snapshot an update left behind (no ref names it, and
+  they share most blobs, so the rows repeat sizes). A repo now splits
+  only when two or more of its snapshots are named by a branch or tag;
+  unnamed snapshots stay in the repo's own row. On production no repo
+  splits; on the trial cluster Qwen3-0.6B-exl3 `3.0bpw` and
+  `2.75bpw_H5` are still two rows.
+
 ## 2026-10-18 — 0.5.3: a snapshot no ref names is still a revision
 
 - After the 0.5.2 rollout five wrldsuksgo2mars repos listed with errors:

@@ -1536,8 +1536,10 @@ async fn hf_repos(State(api): State<Api>) -> R<serde_json::Value> {
     }
     drop(c);
     let all_refs = hub_refs(&api).await;
-    // A repo with several revisions cached (quant branches, typically) is
-    // one row per revision, named and selected by its branch.
+    // A repo with several named revisions cached (quant branches,
+    // typically) is one row per branch, named and selected by it. Snapshots
+    // no ref names are what updates left behind: they stay in the repo's
+    // own row, and a repo with fewer than two named ones is not split.
     let mut rows = Vec::new();
     for (kind, repo, dir) in repos {
         let snaps: Vec<String> = {
@@ -1552,22 +1554,24 @@ async fn hf_repos(State(api): State<Api>) -> R<serde_json::Value> {
                 .collect()
         };
         let names = all_refs.get(&dir);
-        if snaps.len() < 2 {
-            let branches = snaps
-                .first()
-                .and_then(|s| names.and_then(|m| m.get(s)))
-                .cloned()
-                .unwrap_or_default();
+        let named: Vec<&Vec<String>> = snaps
+            .iter()
+            .filter_map(|s| names.and_then(|m| m.get(s)))
+            .filter(|b| !b.is_empty())
+            .collect();
+        if named.len() < 2 {
+            let branches = named.first().map(|b| b.to_vec()).unwrap_or_default();
             rows.push((kind, repo, None, branches, snaps.len()));
             continue;
         }
-        for commit in &snaps {
-            let branches = names
-                .and_then(|m| m.get(commit))
-                .cloned()
-                .unwrap_or_default();
-            let at = branches.first().cloned().unwrap_or_else(|| commit.clone());
-            rows.push((kind, repo.clone(), Some(at), branches, snaps.len()));
+        for branches in named {
+            rows.push((
+                kind,
+                repo.clone(),
+                Some(branches[0].clone()),
+                branches.clone(),
+                snaps.len(),
+            ));
         }
     }
     let mut out = Vec::new();

@@ -1803,3 +1803,8 @@ removing it left `3.0bpw` whole.
 and placed like a model, and a single row hides which one a host holds.
 Treating each branch as a separate repo directory: huggingface_hub
 would not find it.
+
+Amended in 0.5.4 (this ADR's item 2): only snapshots a ref names get
+rows, and only when two or more are named. Updates leave the previous
+commit's snapshot behind with no ref, and listing those split about 25
+ordinary repos into near-duplicate rows.
