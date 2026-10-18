@@ -67,7 +67,7 @@
   <div class="stack">
     <div>
       <div class="caps">{d.kind}</div>
-      <h2 class="title"><span class="muted">{splitRepo(d.repo)[0]}</span>{splitRepo(d.repo)[1]}</h2>
+      <h2 class="title"><span class="muted">{splitRepo(d.repo)[0]}</span>{splitRepo(d.repo)[1]}{#if selector.includes("@")}<span class="badge spark mono branch">{selector.slice(selector.indexOf("@") + 1)}</span>{/if}</h2>
       <div class="row small muted mono">
         <span>{human(d.tree.bytes)}</span><span>·</span><span>{d.tree.files} files</span><span>·</span><span class="path">{d.path}</span>
       </div>
@@ -180,4 +180,5 @@
   .hd { width: 9px; height: 9px; border-radius: 3px; background: rgba(90, 140, 220, 0.15); }
   .hd.on { background: var(--spark); box-shadow: 0 0 6px var(--spark); }
   .hd.arch.on { background: var(--violet); box-shadow: 0 0 6px var(--violet); }
+  .branch { margin-left: 10px; vertical-align: middle; font-size: 0.5em; }
 </style>

@@ -191,6 +191,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/hf/detail", get(hf_detail))
         .route("/v1/hf/import", post(hf_import))
         .route("/v1/hf/remove", post(hf_remove))
+        .route("/v1/hf/refs", get(hf_refs))
         .route("/v1/hf/search", get(hf_search))
         .route("/v1/hf/size", get(hf_size))
         .route("/v1/hf/download", post(hf_download))
@@ -913,6 +914,56 @@ fn mount_hub(api: &Api) -> Result<std::path::PathBuf, ApiError> {
         .ok_or_else(|| ApiError(StatusCode::CONFLICT, "this node has no mount".into()))
 }
 
+/// Every hub repo's refs: repo directory → commit → the branch and tag
+/// names (`refs/<name>`, `refs/pr/1`) naming it, read through this node's
+/// mount on a blocking thread. Empty without a mount.
+async fn hub_refs(api: &Api) -> HashMap<String, HashMap<String, Vec<String>>> {
+    let Ok(hub) = mount_hub(api) else {
+        return HashMap::new();
+    };
+    tokio::task::spawn_blocking(move || {
+        let mut out: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        for e in std::fs::read_dir(&hub).into_iter().flatten().flatten() {
+            let dir = e.file_name().to_string_lossy().into_owned();
+            if !(dir.starts_with("models--") || dir.starts_with("datasets--")) {
+                continue;
+            }
+            let root = e.path().join("refs");
+            let mut stack = vec![root.clone()];
+            while let Some(d) = stack.pop() {
+                for f in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                    let p = f.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                        continue;
+                    }
+                    let Ok(body) = std::fs::read_to_string(&p) else {
+                        continue;
+                    };
+                    let commit = body.trim().to_string();
+                    let Ok(name) = p.strip_prefix(&root) else {
+                        continue;
+                    };
+                    out.entry(dir.clone())
+                        .or_default()
+                        .entry(commit)
+                        .or_default()
+                        .push(name.to_string_lossy().into_owned());
+                }
+            }
+        }
+        // main first, then by name: the first names a revision's selector.
+        for m in out.values_mut() {
+            for v in m.values_mut() {
+                v.sort_by(|a, b| (a != "main").cmp(&(b != "main")).then(a.cmp(b)));
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
 fn hf_program(given: Option<String>) -> Result<std::path::PathBuf, ApiError> {
     given
         .map(std::path::PathBuf::from)
@@ -950,18 +1001,93 @@ struct HfSizeQ {
     revision: Option<String>,
 }
 
+/// A repo as given (an id, `repo@branch`, or a huggingface.co link), with
+/// a revision and kind given separately winning over those in the text.
+fn repo_ref(
+    repo: &str,
+    kind: &str,
+    revision: Option<String>,
+) -> Result<(String, String, Option<String>), ApiError> {
+    let r = nest_place::hfimport::parse_repo_ref(repo);
+    if r.repo.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "no repo given".into()));
+    }
+    let kind = if kind.is_empty() && r.dataset {
+        "dataset".to_string()
+    } else {
+        kind.to_string()
+    };
+    Ok((
+        r.repo,
+        kind,
+        revision.filter(|v| !v.is_empty()).or(r.revision),
+    ))
+}
+
 /// Files and bytes of a repo on the Hub (hf's dry run).
 async fn hf_size(State(api): State<Api>, Query(q): Query<HfSizeQ>) -> R<serde_json::Value> {
     let hf = hf_program(None)?;
+    let (repo, kind, revision) = repo_ref(&q.repo, &q.kind, q.revision)?;
     let s = nest_place::hfimport::download_size(
         &hf,
         &mount_hub(&api)?,
-        &q.repo,
-        &q.kind,
-        q.revision.as_deref(),
+        &repo,
+        &kind,
+        revision.as_deref(),
     )
     .await?;
-    Ok(Json(json!(s)))
+    Ok(Json(json!({
+        "repo": repo,
+        "kind": kind,
+        "revision": revision,
+        "files": s.files,
+        "missing_files": s.missing_files,
+        "missing_bytes": s.missing_bytes,
+    })))
+}
+
+#[derive(Deserialize)]
+struct HfRefsQ {
+    repo: String,
+    #[serde(default)]
+    kind: String,
+}
+
+/// A repo's branches and tags on the Hub, each marked with whether the
+/// hub here holds it (its `refs/<name>` names the same commit) .
+async fn hf_refs(State(api): State<Api>, Query(q): Query<HfRefsQ>) -> R<serde_json::Value> {
+    let (repo, kind, named) = repo_ref(&q.repo, &q.kind, None)?;
+    let hub = mount_hub(&api)?;
+    let r = nest_place::hfimport::repo_refs(&hub, &repo, &kind).await?;
+    let dir = hub
+        .join(nest_place::hfimport::repo_dir(&kind, &repo))
+        .join("refs");
+    // Read through the mount: off the async executor.
+    let (branches, tags) = tokio::task::spawn_blocking(move || {
+        let mark = |v: Vec<nest_place::hfimport::HubRef>| -> Vec<serde_json::Value> {
+            v.into_iter()
+                .map(|b| {
+                    let have = std::fs::read_to_string(dir.join(&b.name)).ok();
+                    let cached = match have.as_deref().map(str::trim) {
+                        Some(c) if c == b.sha => "current",
+                        Some(_) => "older",
+                        None => "",
+                    };
+                    json!({ "name": b.name, "sha": b.sha, "cached": cached })
+                })
+                .collect()
+        };
+        (mark(r.branches), mark(r.tags))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "repo": repo,
+        "kind": kind,
+        "named": named,
+        "branches": branches,
+        "tags": tags,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -993,16 +1119,12 @@ struct HfDownloadReq {
 /// its first copy lands there; nothing the cluster holds moves. Returns the
 /// job (on this node), with byte progress per host.
 async fn hf_download(State(api): State<Api>, Json(r): Json<HfDownloadReq>) -> R<serde_json::Value> {
-    let repo = r
-        .repo
-        .trim()
-        .trim_start_matches("https://huggingface.co/")
-        .trim_start_matches("hf:")
-        .trim_matches('/')
-        .to_string();
-    if repo.is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "no repo given".into()));
-    }
+    let (repo, kind, revision) = repo_ref(&r.repo, &r.kind, r.revision)?;
+    let r = HfDownloadReq {
+        kind,
+        revision,
+        ..r
+    };
     if let Some(archive) = r.archive.filter(|a| !a.is_empty()) {
         if !r.host.is_empty() || !r.hosts.is_empty() {
             return Err(ApiError(
@@ -1246,17 +1368,47 @@ async fn hf_detail(State(api): State<Api>, Query(q): Query<DetailQ>) -> R<serde_
         max_children: 100_000,
         hub: api.hub.clone(),
         store_names,
+        refs: hub_refs(&api).await,
     };
     let c = api.conn()?;
     let want = sel.describe();
     let tree = tokio::task::spawn_blocking(move || nest_place::space::tree(&c, &req))
         .await
         .map_err(|e| bad(e.to_string()))??;
+    // The repo, or for repo@branch that branch's revision in it (a repo
+    // with one revision is not split: it is that branch).
+    let repo_sel = Selector::Hf {
+        hub: api.hub.clone(),
+        repo: repo.clone(),
+        revision: None,
+        repo_type: repo_type.clone(),
+    }
+    .describe();
     let node = tree
         .children
         .into_iter()
-        .find(|n| n.selector.as_deref() == Some(want.as_str()))
+        .find(|n| n.selector.as_deref() == Some(repo_sel.as_str()))
         .unwrap_or_default();
+    let node = if want == repo_sel {
+        node
+    } else {
+        let split = node.children.iter().any(|c| c.kind == "revision");
+        match node
+            .children
+            .iter()
+            .find(|c| c.kind == "revision" && c.selector.as_deref() == Some(want.as_str()))
+        {
+            Some(r) => nest_place::space::TreeNode {
+                name: node.name.clone(),
+                path: node.path.clone(),
+                kind: "repo".into(),
+                selector: Some(want.clone()),
+                ..r.clone()
+            },
+            None if !split => node,
+            None => nest_place::space::TreeNode::default(),
+        }
+    };
     // Revisions and refs.
     let mut revisions: Vec<serde_json::Value> = Vec::new();
     let mut refs: Vec<(String, nest_types::FileId)> = Vec::new();
@@ -1383,21 +1535,48 @@ async fn hf_repos(State(api): State<Api>) -> R<serde_json::Value> {
         }
     }
     drop(c);
-    let mut out = Vec::new();
+    let all_refs = hub_refs(&api).await;
+    // A repo with several revisions cached (quant branches, typically) is
+    // one row per revision, named and selected by its branch.
+    let mut rows = Vec::new();
     for (kind, repo, dir) in repos {
-        let sel = Selector::Hf {
-            hub: hub.clone(),
-            repo: repo.clone(),
-            revision: None,
-            repo_type: kind.to_string(),
-        };
-        let revisions = {
+        let snaps: Vec<String> = {
             let c = api.conn()?;
             selector::resolve_path(&c, &format!("{hub}/{dir}/snapshots"))
                 .ok()
                 .and_then(|(id, _)| query::readdir(&c, id, 0, 1000).ok())
-                .map(|v| v.len())
-                .unwrap_or(0)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, e)| String::from_utf8_lossy(&e.name).into_owned())
+                .filter(|n| n != "." && n != "..")
+                .collect()
+        };
+        let names = all_refs.get(&dir);
+        if snaps.len() < 2 {
+            let branches = snaps
+                .first()
+                .and_then(|s| names.and_then(|m| m.get(s)))
+                .cloned()
+                .unwrap_or_default();
+            rows.push((kind, repo, None, branches, snaps.len()));
+            continue;
+        }
+        for commit in &snaps {
+            let branches = names
+                .and_then(|m| m.get(commit))
+                .cloned()
+                .unwrap_or_default();
+            let at = branches.first().cloned().unwrap_or_else(|| commit.clone());
+            rows.push((kind, repo.clone(), Some(at), branches, snaps.len()));
+        }
+    }
+    let mut out = Vec::new();
+    for (kind, repo, branch, branches, revisions) in rows {
+        let sel = Selector::Hf {
+            hub: hub.clone(),
+            repo: repo.clone(),
+            revision: branch.clone(),
+            repo_type: kind.to_string(),
         };
         match api.placer.readiness(&sel, &[]).await {
             Ok((m, ready)) => {
@@ -1411,6 +1590,10 @@ async fn hf_repos(State(api): State<Api>) -> R<serde_json::Value> {
                 out.push(json!({
                     "repo": repo,
                     "kind": kind,
+                    // Set on a row that is one revision of a repo with
+                    // several; `branches` names every ref pointing at it.
+                    "branch": branch,
+                    "branches": branches,
                     "selector": sel.describe(),
                     "files": m.entries.len(),
                     "bytes": m.bytes(),
@@ -1421,7 +1604,7 @@ async fn hf_repos(State(api): State<Api>) -> R<serde_json::Value> {
                     "last_open_ms": last,
                 }))
             }
-            Err(e) => out.push(json!({ "repo": repo, "kind": kind, "error": e.to_string() })),
+            Err(e) => out.push(json!({ "repo": repo, "kind": kind, "branch": branch, "selector": sel.describe(), "error": e.to_string() })),
         }
     }
     Ok(Json(json!({ "hub": hub, "repos": out })))
@@ -1560,6 +1743,11 @@ async fn space_tree(State(api): State<Api>, Query(q): Query<TreeQ>) -> R<serde_j
         max_children: q.max.unwrap_or(150).clamp(2, 2000),
         hub: api.hub.clone(),
         store_names: names,
+        refs: if q.shape.as_deref() != Some("path") {
+            hub_refs(&api).await
+        } else {
+            HashMap::new()
+        },
     };
     let c = api.conn()?;
     let tree = tokio::task::spawn_blocking(move || nest_place::space::tree(&c, &req))

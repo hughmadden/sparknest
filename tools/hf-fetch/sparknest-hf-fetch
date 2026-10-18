@@ -8,6 +8,9 @@ stdout.
   sparknest-hf-fetch plan REPO [--repo-type model|dataset] [--revision REV]
       {"sha": COMMIT, "files": [{"name": PATH, "size": BYTES}, ...]}
 
+  sparknest-hf-fetch refs REPO [--repo-type model|dataset]
+      {"branches": [{"name": N, "sha": COMMIT}, ...], "tags": [...]}
+
   sparknest-hf-fetch fetch REPO --revision COMMIT --cache-dir HUB [--repo-type T]
       file names, one per line, on stdin; downloads them one after another
       (hf_xet already spreads one file over several connections) into the hub
@@ -71,6 +74,14 @@ def plan(args):
     emit({"sha": info.sha, "files": files})
 
 
+def refs(args):
+    from huggingface_hub import HfApi
+
+    r = HfApi().list_repo_refs(args.repo, repo_type=args.repo_type)
+    ref = lambda x: {"name": x.name, "sha": x.target_commit}
+    emit({"branches": [ref(b) for b in r.branches], "tags": [ref(t) for t in r.tags]})
+
+
 def fetch(args):
     from huggingface_hub import hf_hub_download
 
@@ -95,7 +106,7 @@ def fetch(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("plan", "fetch"):
+    for name in ("plan", "fetch", "refs"):
         s = sub.add_parser(name)
         s.add_argument("repo")
         s.add_argument("--repo-type", default="model", choices=["model", "dataset"])
@@ -105,7 +116,7 @@ def main():
     args = p.parse_args()
     if args.cmd == "fetch" and not args.revision:
         p.error("fetch needs --revision COMMIT (from plan)")
-    {"plan": plan, "fetch": fetch}[args.cmd](args)
+    {"plan": plan, "fetch": fetch, "refs": refs}[args.cmd](args)
 
 
 if __name__ == "__main__":

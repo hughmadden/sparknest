@@ -195,6 +195,10 @@ export interface Repo {
   bytes: number;
   writing: number;
   revisions: number;
+  /** When several revisions are cached, each is its own row: its branch
+   *  (or commit) and every ref naming it. */
+  branch?: string | null;
+  branches?: string[];
   hosts: Readiness[];
   usage: Record<string, HostUsage>;
   last_open_ms: number;

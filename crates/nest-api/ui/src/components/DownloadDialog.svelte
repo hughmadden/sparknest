@@ -3,7 +3,9 @@
   // downloaded first) or paste org/name, see its size (hf's dry run), then
   // spread it over hosts (each file lands on one, evenly), put it on one, or
   // put it in an archive store (ADR-055; the request goes to this node, so
-  // only archives it is a gateway of are offered).
+  // only archives it is a gateway of are offered). A repo with branches
+  // (turboderp's quants live one per branch) offers them; each downloaded
+  // branch is its own model.
   import { get } from "../lib/api";
   import { app, startJob } from "../lib/state.svelte";
   import { human } from "../lib/format";
@@ -17,6 +19,11 @@
   let results = $state<Hit[]>([]);
   let searching = $state(false);
   let repo = $state("");
+  type Ref = { name: string; sha: string; cached: "current" | "older" | "" };
+  let refs = $state<Ref[]>([]);
+  let branch = $state("");
+  // What is downloaded: org/name, or org/name@branch off the default one.
+  const target = $derived(branch && branch !== "main" ? `${repo}@${branch}` : repo);
   let size = $state<{ files: number; missing_files: number; missing_bytes: number } | null>(null);
   let sizeErr = $state("");
   let host = $state("");
@@ -53,10 +60,15 @@
   });
   const toggle = (h: string) => (chosen = chosen.includes(h) ? chosen.filter((x) => x !== h) : hosts.map((x) => x.name).filter((x) => x === h || chosen.includes(x)));
 
-  // A pasted repo id or huggingface.co URL is offered as is.
+  // A pasted repo id or huggingface.co URL is offered as is; a link into a
+  // branch (…/tree/<branch>) or org/name@branch picks that branch.
   const pasted = $derived.by(() => {
-    const t = q.trim().replace(/^https?:\/\/huggingface\.co\/(datasets\/)?/, "").replace(/\/+$/, "");
-    return /^[\w.-]+(\/[\w.-]+)?$/.test(t) && t.includes("/") ? t : "";
+    let t = q.trim().replace(/[?#].*$/, "").replace(/^https?:\/\/huggingface\.co\/(datasets\/|models\/)?/, "").replace(/\/+$/, "");
+    let b = "";
+    const tree = /^([^/]+\/[^/]+)\/(?:tree|blob|resolve)\/([^/]+)/.exec(t);
+    if (tree) [t, b] = [tree[1], decodeURIComponent(tree[2])];
+    else if (t.includes("@")) [t, b] = [t.slice(0, t.indexOf("@")), t.slice(t.indexOf("@") + 1)];
+    return /^[\w.-]+(\/[\w.-]+)?$/.test(t) && t.includes("/") ? { id: t, branch: b } : null;
   });
 
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -81,17 +93,37 @@
     }, 350);
   });
 
-  function choose(id: string) {
+  function choose(id: string, want = "") {
     repo = id;
+    refs = [];
+    branch = want;
+    sizeUp();
+    get<{ branches: Ref[] }>(`/v1/hf/refs?repo=${encodeURIComponent(id)}&kind=${kind}`)
+      .then((r) => {
+        if (repo !== id) return;
+        refs = r.branches ?? [];
+        // A repo whose main holds only a README (one quant per branch)
+        // still starts on main; the picker shows the rest.
+        if (!branch && refs.length) branch = refs.some((b) => b.name === "main") ? "main" : refs[0].name;
+      })
+      .catch(() => {});
+  }
+  function sizeUp() {
+    const t = target;
     size = null;
     sizeErr = "";
-    get<{ files: number; missing_files: number; missing_bytes: number }>(`/v1/hf/size?repo=${encodeURIComponent(id)}&kind=${kind}`)
+    get<{ files: number; missing_files: number; missing_bytes: number }>(`/v1/hf/size?repo=${encodeURIComponent(t)}&kind=${kind}`)
       .then((s) => {
-        if (repo === id) size = s;
+        if (target === t) size = s;
       })
       .catch((e) => {
-        if (repo === id) sizeErr = (e as Error).message;
+        if (target === t) sizeErr = (e as Error).message;
       });
+  }
+  function pickBranch(b: string) {
+    if (b === branch) return;
+    branch = b;
+    sizeUp();
   }
 
   const free = $derived(
@@ -107,6 +139,8 @@
     open = false;
     q = "";
     repo = "";
+    refs = [];
+    branch = "";
     results = [];
     size = null;
     sizeErr = "";
@@ -115,10 +149,11 @@
 
   async function download() {
     const everyone = chosen.length === hosts.length;
-    if (where === "archive") await startJob("/v1/hf/download", { repo, kind, archive }, `Downloading ${repo} into ${archive}`);
+    const t = target;
+    if (where === "archive") await startJob("/v1/hf/download", { repo: t, kind, archive }, `Downloading ${t} into ${archive}`);
     else if (spread)
-      await startJob("/v1/hf/download", { repo, kind, hosts: everyone ? [] : chosen }, `Downloading ${repo} over ${everyone ? "every host" : chosen.join(", ")}`);
-    else await startJob("/v1/hf/download", { repo, kind, host }, `Downloading ${repo} to ${host}`);
+      await startJob("/v1/hf/download", { repo: t, kind, hosts: everyone ? [] : chosen }, `Downloading ${t} over ${everyone ? "every host" : chosen.join(", ")}`);
+    else await startJob("/v1/hf/download", { repo: t, kind, host }, `Downloading ${t} to ${host}`);
     close();
   }
 </script>
@@ -132,15 +167,15 @@
         <h3>Download from the Hub</h3>
         <span class="spacer"></span>
         <div class="chips">
-          <button class="chip" class:on={kind === "model"} onclick={() => ((kind = "model"), (repo = ""))}>Model</button>
-          <button class="chip" class:on={kind === "dataset"} onclick={() => ((kind = "dataset"), (repo = ""))}>Dataset</button>
+          <button class="chip" class:on={kind === "model"} onclick={() => ((kind = "model"), (repo = ""), (refs = []))}>Model</button>
+          <button class="chip" class:on={kind === "dataset"} onclick={() => ((kind = "dataset"), (repo = ""), (refs = []))}>Dataset</button>
         </div>
       </div>
       <!-- svelte-ignore a11y_autofocus -->
       <input type="search" placeholder="search, or paste org/name" bind:value={q} autofocus />
       <div class="hits">
-        {#if pasted && !results.some((r) => r.id === pasted)}
-          <button class="hit" class:on={repo === pasted} onclick={() => choose(pasted)}><b>{pasted}</b><span class="tiny muted">as typed</span></button>
+        {#if pasted && (pasted.branch || !results.some((r) => r.id === pasted.id))}
+          <button class="hit" class:on={repo === pasted.id && (!pasted.branch || branch === pasted.branch)} onclick={() => choose(pasted.id, pasted.branch)}><b>{pasted.id}{pasted.branch ? "@" + pasted.branch : ""}</b><span class="tiny muted">as typed</span></button>
         {/if}
         {#each results as r (r.id)}
           <button class="hit" class:on={repo === r.id} onclick={() => choose(r.id)}>
@@ -153,8 +188,16 @@
       </div>
       {#if repo}
         <div class="pick">
+          {#if refs.length > 1}
+            <div class="row small">
+              <span class="muted">branch</span>
+              <select value={branch} onchange={(e) => pickBranch((e.currentTarget as HTMLSelectElement).value)}>
+                {#each refs as b (b.name)}<option value={b.name}>{b.name}{b.cached === "current" ? " · downloaded" : b.cached === "older" ? " · older copy here" : ""}</option>{/each}
+              </select>
+            </div>
+          {/if}
           <div class="small">
-            <b>{repo}</b>:
+            <b>{target}</b>:
             {#if size}{size.missing_files === size.files ? `${size.files} files, ${human(size.missing_bytes)}` : size.missing_files ? `${size.missing_files} of ${size.files} files missing, ${human(size.missing_bytes)}` : "already complete in the cluster"}{:else if sizeErr}<span style="color:var(--bad)">{sizeErr}</span>{:else}<span class="muted">sizing…</span>{/if}
           </div>
           <div class="chips">

@@ -1759,3 +1759,47 @@ connections' standby probe, ADR-057) would also find it but adds traffic
 to every lane; the timeout already is that signal for a lane in use, and
 the kernel options cover idle ones. Shorter `read_timeout`: a 4 MiB read
 over a busy 10G link can legitimately take seconds.
+
+## ADR-061 — Each cached branch of a Hugging Face repo is its own model (2026-10-18)
+
+**Context.** Some publishers keep one quantisation per branch:
+turboderp's `Qwen3.5-9B-exl3` has `2.00bpw`, `6.00bpw` and more, with
+`main` holding only the README. huggingface_hub caches several revisions
+of one repo side by side: `refs/<branch>` names a commit, each commit has
+its own `snapshots/<commit>/` of symlinks into the repo's `blobs/`, and a
+blob two revisions share is stored once. `hf cache rm <commit>` removes
+one revision and only the blobs no other revision uses. sparknest showed
+a repo as one row whatever it held, the download dialog had no way to
+name a branch, and `hf rm` removed every revision.
+
+**Decision.**
+1. Wherever a repo is named (`/v1/hf/download`, `/v1/hf/size`,
+   `/v1/hf/refs`, `nest hf download`, the dialog) `org/name@branch` and
+   `huggingface.co/org/name/tree/<branch>` links name that branch;
+   `revision` still overrides.
+2. `/v1/hf` lists a repo with two or more cached revisions as one row per
+   revision: `branch` is its first ref (main first) or its commit,
+   `branches` every ref naming it, and `selector`
+   `hf:org/name@<branch>`, which placement already accepted (the
+   revision narrows a selector to that snapshot's files). Sizes,
+   readiness, detail, Place, Copy and Remove-from all work per branch
+   through that selector. A repo with one revision keeps its plain row
+   and selector.
+3. `hf:org/name@<branch or commit>` in `/v1/hf/remove` resolves a branch
+   through `refs/` and removes that commit with `hf cache rm`, so blobs
+   another branch shares stay.
+4. `/v1/hf/refs` lists the Hub's branches and tags (huggingface_hub's
+   `list_repo_refs`, through `sparknest-hf-fetch refs`), each marked
+   `current`, `older` or not cached here; the dialog offers them as a
+   branch picker, `nest hf refs` prints them.
+5. Download job names carry `@branch` when one was asked for.
+
+Tested on the trial cluster with turboderp/Qwen3-0.6B-exl3 `3.0bpw` and
+`2.75bpw_H5`: both downloaded, listed as two rows of their own sizes
+(611 MB, 578 MB), the second placed on kiwi without moving the first, and
+removing it left `3.0bpw` whole.
+
+**Alternatives.** One row with revisions underneath: a quant is chosen
+and placed like a model, and a single row hides which one a host holds.
+Treating each branch as a separate repo directory: huggingface_hub
+would not find it.

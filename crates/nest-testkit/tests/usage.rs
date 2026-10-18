@@ -269,6 +269,7 @@ async fn space_tree_groups_by_model_and_weighs_copies() {
             (StoreId(2), "n2".to_string()),
         ]
         .into(),
+        refs: Default::default(),
     };
     let conn = c.node(1).meta.open_reader().unwrap();
     let t = tree(&conn, &req(Weight::Logical, true, None)).unwrap();

@@ -799,6 +799,96 @@ pub fn find_hf() -> Option<PathBuf> {
     dirs.into_iter().map(|d| d.join("hf")).find(|p| p.is_file())
 }
 
+/// A repo as people paste it: `org/name`, `org/name@branch`, `hf:...`, or
+/// a huggingface.co link (`https://huggingface.co/org/name`,
+/// `.../tree/<branch>`, `.../blob/<branch>/<file>`, `datasets/...`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoRef {
+    pub repo: String,
+    /// The branch, tag or commit named, if any.
+    pub revision: Option<String>,
+    /// Named as a dataset (`hf-dataset:`, `datasets/` in a link).
+    pub dataset: bool,
+}
+
+pub fn parse_repo_ref(s: &str) -> RepoRef {
+    let mut t = s.trim();
+    let mut dataset = false;
+    for p in ["https://", "http://"] {
+        t = t.strip_prefix(p).unwrap_or(t);
+    }
+    for p in ["huggingface.co/", "hf.co/", "hf:"] {
+        t = t.strip_prefix(p).unwrap_or(t);
+    }
+    if let Some(r) = t.strip_prefix("hf-dataset:") {
+        (t, dataset) = (r, true);
+    }
+    let t = t.split(['?', '#']).next().unwrap_or(t).trim_matches('/');
+    let (t, mut revision) = match t.split_once('@') {
+        Some((r, v)) => (r, Some(v.to_string())),
+        None => (t, None),
+    };
+    let t = match t.strip_prefix("datasets/") {
+        Some(r) => {
+            dataset = true;
+            r
+        }
+        None => t.strip_prefix("models/").unwrap_or(t),
+    };
+    let parts: Vec<&str> = t.split('/').collect();
+    // org/name/tree/<branch>[/dir...], or a legacy name/tree/<branch>.
+    let at = parts
+        .iter()
+        .position(|p| matches!(*p, "tree" | "blob" | "resolve"))
+        .filter(|&i| i >= 1 && i + 1 < parts.len());
+    let repo = parts[..at.unwrap_or(parts.len()).min(2)].join("/");
+    if let Some(i) = at {
+        // A branch with a / in it ("refs/pr/1") is only reachable as
+        // repo@branch: a link cannot tell where it ends.
+        revision = Some(parts[i + 1].replace("%2F", "/"));
+    }
+    RepoRef {
+        repo,
+        revision: revision.filter(|r| !r.is_empty()),
+        dataset,
+    }
+}
+
+/// `rm_target`, except that a target naming one revision
+/// (`hf:org/m@3.0bpw`, a commit) removes only that revision: hf takes the
+/// commit, which the cache's `refs/<branch>` gives for a branch. hf then
+/// drops the snapshot, the refs pointing at it, and the blobs nothing else
+/// uses. A branch the cache does not hold is an error, never the repo.
+pub fn rm_target_in(mount_hub: &Path, t: &str) -> NestResult<String> {
+    let r = parse_repo_ref(t);
+    let Some(rev) = r.revision else {
+        return Ok(rm_target(t));
+    };
+    if is_commit(&rev) {
+        return Ok(rev);
+    }
+    let kind = if r.dataset || t.trim().starts_with("dataset/") {
+        "dataset"
+    } else {
+        "model"
+    };
+    let repo = r
+        .repo
+        .trim_start_matches("model/")
+        .trim_start_matches("dataset/");
+    let p = mount_hub.join(repo_dir(kind, repo)).join("refs").join(&rev);
+    let commit = std::fs::read_to_string(&p).unwrap_or_default();
+    let commit = commit.trim();
+    if !is_commit(commit) {
+        return Err(NestError::NotFound);
+    }
+    Ok(commit.to_string())
+}
+
+fn is_commit(r: &str) -> bool {
+    r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// A repo target for `hf cache rm`: `model/org/name`, `dataset/org/name`
 /// (also accepts the selectors `hf:org/name` and `hf-dataset:org/name`,
 /// `org/name`, `datasets/org/name`; a `@revision` is dropped: the repo
@@ -1066,10 +1156,14 @@ pub async fn remove(
     targets: &[String],
     dry_run: bool,
 ) -> NestResult<serde_json::Value> {
+    let targets = targets
+        .iter()
+        .map(|t| rm_target_in(mount_hub, t))
+        .collect::<NestResult<Vec<_>>>()?;
     let mut cmd = tokio::process::Command::new(hf);
     cmd.arg("cache")
         .arg("rm")
-        .args(targets.iter().map(|t| rm_target(t)))
+        .args(&targets)
         .arg("--cache-dir")
         .arg(mount_hub)
         .arg("--json")
@@ -1123,6 +1217,47 @@ mod rm_tests {
         let _ = std::fs::remove_dir_all(hub.parent().unwrap());
     }
 
+    /// With hf installed: removing `repo@branch` removes that branch's
+    /// snapshot and ref only; the other branch and its files stay.
+    #[tokio::test]
+    async fn hf_removes_one_branch() {
+        let Some(hf) = super::find_hf() else { return };
+        let hub = std::env::temp_dir().join(format!("nest-hf-rmb-{}/hub", std::process::id()));
+        let r = hub.join("models--org--quants");
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        for (sha, blob, body) in [(&a, "e1", "small"), (&b, "e2", "bigger")] {
+            std::fs::create_dir_all(r.join("blobs")).unwrap();
+            std::fs::create_dir_all(r.join(format!("snapshots/{sha}"))).unwrap();
+            std::fs::write(r.join("blobs").join(blob), body).unwrap();
+            std::os::unix::fs::symlink(
+                format!("../../blobs/{blob}"),
+                r.join(format!("snapshots/{sha}/model.safetensors")),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(r.join("refs")).unwrap();
+        std::fs::write(r.join("refs/2bpw"), &a).unwrap();
+        std::fs::write(r.join("refs/6bpw"), &b).unwrap();
+        // A branch the cache does not have is refused, not the repo.
+        let gone = vec!["hf:org/quants@4bpw".to_string()];
+        assert!(super::remove(&hf, &hub, &gone, true).await.is_err());
+        let t = vec!["hf:org/quants@2bpw".to_string()];
+        let d = super::remove(&hf, &hub, &t, true).await.unwrap();
+        assert_eq!(
+            (d["repos"].as_u64(), d["revisions"].as_u64()),
+            (Some(0), Some(1)),
+            "{d}"
+        );
+        let v = super::remove(&hf, &hub, &t, false).await.unwrap();
+        assert_eq!(v["revisions_deleted"], 1, "{v}");
+        assert!(!r.join(format!("snapshots/{a}")).exists());
+        assert!(!r.join("refs/2bpw").exists());
+        assert!(!r.join("blobs/e1").exists());
+        assert!(r.join(format!("snapshots/{b}/model.safetensors")).exists());
+        assert!(r.join("refs/6bpw").exists());
+        let _ = std::fs::remove_dir_all(hub.parent().unwrap());
+    }
+
     #[test]
     fn hf_sizes_parse() {
         assert_eq!(super::parse_size("548.1M"), 548_100_000);
@@ -1141,6 +1276,48 @@ mod rm_tests {
         assert_eq!(rm_target("dataset/cais/mmlu"), "dataset/cais/mmlu");
         assert_eq!(rm_target("hf-dataset:cais/mmlu"), "dataset/cais/mmlu");
         assert_eq!(rm_target("hf:org/m@main"), "model/org/m");
+    }
+
+    #[test]
+    fn repo_refs_parse_from_ids_and_links() {
+        use super::{RepoRef, parse_repo_ref as p};
+        let r = |repo: &str, v: Option<&str>, dataset: bool| RepoRef {
+            repo: repo.into(),
+            revision: v.map(str::to_string),
+            dataset,
+        };
+        let q = "turboderp/Qwen3-0.6B-exl3";
+        assert_eq!(p(q), r(q, None, false));
+        assert_eq!(p("hf:org/m@3.0bpw"), r("org/m", Some("3.0bpw"), false));
+        assert_eq!(
+            p("https://huggingface.co/turboderp/Qwen3-0.6B-exl3/tree/2.75bpw_H5"),
+            r(q, Some("2.75bpw_H5"), false)
+        );
+        assert_eq!(
+            p("https://huggingface.co/turboderp/Qwen3-0.6B-exl3/tree/3.0bpw/sub/dir?x=1"),
+            r(q, Some("3.0bpw"), false)
+        );
+        assert_eq!(
+            p("huggingface.co/org/m/blob/main/config.json"),
+            r("org/m", Some("main"), false)
+        );
+        assert_eq!(p("https://huggingface.co/org/m/"), r("org/m", None, false));
+        assert_eq!(
+            p("https://huggingface.co/datasets/cais/mmlu/tree/v2"),
+            r("cais/mmlu", Some("v2"), true)
+        );
+        assert_eq!(
+            p("hf-dataset:cais/mmlu@v2"),
+            r("cais/mmlu", Some("v2"), true)
+        );
+        assert_eq!(p("gpt2"), r("gpt2", None, false));
+        assert_eq!(
+            p("https://huggingface.co/gpt2/tree/main"),
+            r("gpt2", Some("main"), false)
+        );
+        assert_eq!(p("org/m@"), r("org/m", None, false));
+        // A repo whose name is "tree" is still a repo.
+        assert_eq!(p("org/tree"), r("org/tree", None, false));
     }
 }
 
@@ -1242,6 +1419,30 @@ pub async fn repo_plan(
     hf_env(&mut cmd, mount_hub);
     let v = hf_json(cmd, "sparknest-hf-fetch plan").await?;
     serde_json::from_value(v).map_err(|e| NestError::Io(format!("unexpected plan: {e}")))
+}
+
+/// A repo's branches and tags on the Hub, each with its commit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RepoRefs {
+    pub branches: Vec<HubRef>,
+    pub tags: Vec<HubRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HubRef {
+    pub name: String,
+    pub sha: String,
+}
+
+/// List `repo`'s branches and tags on the Hub.
+pub async fn repo_refs(mount_hub: &Path, repo: &str, kind: &str) -> NestResult<RepoRefs> {
+    let (py, drv) = driver(None)?;
+    let mut cmd = tokio::process::Command::new(py);
+    cmd.arg(drv)
+        .args(["refs", repo, "--repo-type", repo_type(kind)]);
+    hf_env(&mut cmd, mount_hub);
+    let v = hf_json(cmd, "sparknest-hf-fetch refs").await?;
+    serde_json::from_value(v).map_err(|e| NestError::Io(format!("unexpected refs: {e}")))
 }
 
 /// One host's share of a download, as it goes.

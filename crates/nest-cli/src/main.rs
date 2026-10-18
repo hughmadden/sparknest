@@ -419,7 +419,8 @@ enum HfCmd {
     ///
     /// Runs `hf cache rm` on the hub through this host's mount, so hf decides
     /// which of the hub's shared blobs other repos still use. REPO is
-    /// org/name (a model), dataset/org/name, or hf:org/name.
+    /// org/name (a model), dataset/org/name, or hf:org/name; append
+    /// @branch (or @commit) to remove only that revision.
     Rm {
         #[arg(required = true)]
         repos: Vec<String>,
@@ -439,9 +440,11 @@ enum HfCmd {
     /// cannot fetch (it fails twice in a row, or stalls) hands its files to
     /// the others. Files the cluster already holds stay where they are.
     /// Without --revision, a repo the hub already has is finished at its
-    /// cached revision; a new one is fetched at its main branch.
+    /// cached revision; a new one is fetched at its main branch. Several
+    /// branches of one repo can be downloaded; each is its own model.
     Download {
-        /// org/name (or a huggingface.co URL).
+        /// org/name, org/name@branch, or a huggingface.co URL (a
+        /// .../tree/<branch> link names that branch).
         repo: String,
         /// Put every file on this host instead of spreading them.
         #[arg(long, conflicts_with = "hosts")]
@@ -470,6 +473,13 @@ enum HfCmd {
         /// Follow the job until it finishes.
         #[arg(long)]
         wait: bool,
+    },
+    /// List a repo's branches and tags on the Hub, and which are downloaded
+    Refs {
+        /// org/name or a huggingface.co URL.
+        repo: String,
+        #[arg(long)]
+        dataset: bool,
     },
     /// Search the Hub (most downloaded first)
     Search {
@@ -2053,6 +2063,35 @@ async fn main() -> Result<()> {
                 .await?;
             let jid = v["job"].as_u64().unwrap_or(0);
             if *wait { wait_job(&c, jid).await? } else { v }
+        }
+        Cmd::Hf {
+            cmd: HfCmd::Refs { repo, dataset },
+        } => {
+            let v = c
+                .get(&format!(
+                    "/v1/hf/refs?repo={}&kind={}",
+                    urlencode(repo),
+                    if *dataset { "dataset" } else { "model" }
+                ))
+                .await?;
+            if !cli.json {
+                for (what, k) in [("branch", "branches"), ("tag", "tags")] {
+                    for r in v[k].as_array().into_iter().flatten() {
+                        let cached = match r["cached"].as_str().unwrap_or("") {
+                            "current" => "downloaded",
+                            "older" => "older copy here",
+                            _ => "",
+                        };
+                        println!(
+                            "{what:<6} {:<32} {:.10}  {cached}",
+                            r["name"].as_str().unwrap_or(""),
+                            r["sha"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            v
         }
         Cmd::Hf {
             cmd:

@@ -19,14 +19,17 @@
 
   let downloading = $state(false);
 
-  const key = (r: Repo) => `${r.kind}:${r.repo}`;
+  // A repo, or one branch of it (org/name@branch) when several are cached.
+  const ref = (r: Repo) => (r.branch ? `${r.repo}@${r.branch}` : r.repo);
+  const key = (r: Repo) => `${r.kind}:${ref(r)}`;
+  const shortRef = (b: string) => (/^[0-9a-f]{40}$/.test(b) ? b.slice(0, 10) : b);
   const lacking = (r: Repo) => missing[key(r)]?.missing_files ?? 0;
   const checkMissing = singleFlight(async () => {
     const stale = repos.filter((r) => !r.error && !r.writing && !(Date.now() - (missing[key(r)]?.at ?? 0) < 600_000));
     const next = async () => {
       for (let r = stale.shift(); r; r = stale.shift()) {
         try {
-          const s = await get<Omit<Missing, "at">>(`/v1/hf/size?repo=${encodeURIComponent(r.repo)}&kind=${r.kind}`);
+          const s = await get<Omit<Missing, "at">>(`/v1/hf/size?repo=${encodeURIComponent(ref(r))}&kind=${r.kind}`);
           missing[key(r)] = { ...s, at: Date.now() };
         } catch {
           // Unknown to the Hub (or offline): nothing to finish.
@@ -62,14 +65,14 @@
         .map((h) => ({ name: h.host, kind: "host", note: `${human(free(h.host))} free${held(h) ? ` · holds ${human(held(h))}` : ""}` })),
     ];
     const got = await pick(
-      `Finish ${r.repo} on…`,
+      `Finish ${ref(r)} on…`,
       opts,
       false,
       `hf downloads the ${m?.missing_files ?? ""} files (${human(m?.missing_bytes ?? 0)}) no host has, spread over every host or onto the one you pick. Nothing already in the cluster moves.`,
     );
     if (!got?.[0]) return;
-    if (got[0] === ALL) await startJob("/v1/hf/download", { repo: r.repo, kind: r.kind, hosts: [] }, `Finishing ${r.repo} over every host`);
-    else await startJob("/v1/hf/download", { repo: r.repo, kind: r.kind, host: got[0] }, `Finishing ${r.repo} on ${got[0]}`);
+    if (got[0] === ALL) await startJob("/v1/hf/download", { repo: ref(r), kind: r.kind, hosts: [] }, `Finishing ${ref(r)} over every host`);
+    else await startJob("/v1/hf/download", { repo: ref(r), kind: r.kind, host: got[0] }, `Finishing ${ref(r)} on ${got[0]}`);
   }
 
   let repos = $state<Repo[]>([]);
@@ -115,7 +118,7 @@
 
   const shown = $derived.by(() => {
     const needle = q.trim().toLowerCase();
-    const list = repos.filter((r) => (kind === "all" || r.kind === kind) && (!needle || r.repo.toLowerCase().includes(needle)));
+    const list = repos.filter((r) => (kind === "all" || r.kind === kind) && (!needle || ref(r).toLowerCase().includes(needle)));
     return list.sort((a, b) =>
       sort === "name" ? a.repo.localeCompare(b.repo) : sort === "used" ? (b.last_open_ms ?? 0) - (a.last_open_ms ?? 0) : b.bytes - a.bytes,
     );
@@ -132,7 +135,7 @@
     if (inflight.has(r.selector + " " + h.host)) return;
     // Complete: offer to remove (asks first). Missing or partial: copy now.
     if (h.ready) return removeFrom(r.selector, [h.host]);
-    await startJob("/v1/replicate", { selector: r.selector, hosts: [h.host] }, `Copying ${r.repo} to ${h.host}`);
+    await startJob("/v1/replicate", { selector: r.selector, hosts: [h.host] }, `Copying ${ref(r)} to ${h.host}`);
   }
 
   const detail = $derived(route.view === "models" && route.arg ? route.arg : "");
@@ -186,11 +189,12 @@
         <button class="name" onclick={() => go("models", r.selector)}>
           <div class="title">
             <span class="org">{splitRepo(r.repo)[0]}</span><b>{splitRepo(r.repo)[1]}</b>
+            {#if r.branch}<span class="badge spark mono" title={(r.branches ?? []).join(", ")}>{shortRef(r.branch)}</span>{/if}
             {#if r.kind === "dataset"}<span class="badge">dataset</span>{/if}
             {#if r.writing}<span class="badge warn">{r.writing} writing</span>{/if}
           </div>
           <div class="meta tiny muted mono">
-            {human(r.bytes)} · {r.files} files{r.revisions > 1 ? ` · ${r.revisions} revisions` : ""}
+            {human(r.bytes)} · {r.files} files{r.revisions > 1 && !r.branch ? ` · ${r.revisions} revisions` : ""}
             · {r.last_open_ms ? `used ${ago(r.last_open_ms)}${lastHost ? " on " + lastHost[0] : ""}` : "unused in 30 days"}
           </div>
         </button>
@@ -223,7 +227,7 @@
             {/each}
           </div>
           <div class="acts">
-            <button class="btn sm" onclick={() => openPlace(r.selector, r.repo)} title="Place: spread or replicate over hosts, gather on one, or archive"><Icon name="target" size={14} /> Place…</button>
+            <button class="btn sm" onclick={() => openPlace(r.selector, ref(r))} title="Place: spread or replicate over hosts, gather on one, or archive"><Icon name="target" size={14} /> Place…</button>
             <button class="btn sm ghost" onclick={() => go("models", r.selector)} title="Details"><Icon name="info" size={14} /></button>
           </div>
         {/if}

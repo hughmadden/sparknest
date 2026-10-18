@@ -1251,7 +1251,7 @@ paths:
               properties:
                 targets:
                   type: array
-                  description: "`org/name`, `hf:org/name`, `model/org/name` or `dataset/org/name`."
+                  description: "`org/name`, `hf:org/name`, `model/org/name` or `dataset/org/name`; `hf:org/name@<branch or commit>` removes only that revision."
                   items:
                     type: string
                 dry_run:
@@ -1273,6 +1273,46 @@ paths:
                       dry_run:
                         description: hf's JSON summary.
                   - $ref: "#/components/schemas/JobRef"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/hf/refs:
+    get:
+      tags: [hf]
+      summary: A repo's branches and tags on the Hub, marked with whether this hub holds them
+      operationId: hfRefs
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          description: "`org/name`, `hf:org/name` or a huggingface.co URL."
+          schema:
+            type: string
+        - $ref: "#/components/parameters/HfKindQuery"
+      responses:
+        "200":
+          description: Refs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [repo, kind, branches, tags]
+                properties:
+                  repo:
+                    type: string
+                  kind:
+                    type: string
+                  named:
+                    type: [string, "null"]
+                    description: A branch named in `repo` (`@rev` or `/tree/<rev>`).
+                  branches:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/HfRef"
+                  tags:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/HfRef"
         default:
           $ref: "#/components/responses/Error"
 
@@ -1332,6 +1372,13 @@ paths:
                 type: object
                 required: [files, missing_files, missing_bytes]
                 properties:
+                  repo:
+                    type: string
+                  kind:
+                    type: string
+                  revision:
+                    type: [string, "null"]
+                    description: The branch, tag or commit sized (from `revision`, `@rev` or a `/tree/<rev>` link).
                   files:
                     type: integer
                   missing_files:
@@ -1357,7 +1404,7 @@ paths:
               properties:
                 repo:
                   type: string
-                  description: "`org/name`, `hf:org/name` or a huggingface.co URL."
+                  description: "`org/name`, `hf:org/name`, `org/name@branch` or a huggingface.co URL (a `/tree/<branch>` link names that branch)."
                 kind:
                   type: string
                   default: ""
@@ -1373,6 +1420,7 @@ paths:
                     type: string
                 revision:
                   type: [string, "null"]
+                  description: Branch, tag or commit; overrides one named in `repo`. Each cached branch is its own model.
                 in_flight:
                   type: [integer, "null"]
                   description: Files downloading at once across the cluster (default 4, 1..16).
@@ -2755,6 +2803,20 @@ components:
       additionalProperties:
         $ref: "#/components/schemas/HostUsage"
 
+    HfRef:
+      type: object
+      required: [name, sha, cached]
+      properties:
+        name:
+          type: string
+        sha:
+          type: string
+          description: The commit it points at on the Hub.
+        cached:
+          type: string
+          enum: [current, older, ""]
+          description: "`current`: the hub here holds that commit under this name; `older`: an earlier commit; empty: not cached."
+
     HfRepo:
       type: object
       description: A repo; when its readiness cannot be computed, only `repo`, `kind` and `error`.
@@ -2775,6 +2837,17 @@ components:
           type: integer
         revisions:
           type: integer
+        branch:
+          type: [string, "null"]
+          description: >-
+            Set when the repo has several cached revisions: each is its own
+            row, named by its first ref (main first) or its commit, and
+            `selector` is `hf:org/name@<branch>`.
+        branches:
+          type: array
+          description: Every ref naming this row's revision.
+          items:
+            type: string
         hosts:
           type: array
           items:

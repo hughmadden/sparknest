@@ -41,6 +41,10 @@ pub struct TreeReq {
     pub hub: String,
     /// Store id → display name, for leaves' `hosts`.
     pub store_names: HashMap<StoreId, String>,
+    /// Hub repo directory (`models--org--name`) → commit → the branches
+    /// and tags its `refs/` names for it: revisions are shown and selected
+    /// by those names (models shape).
+    pub refs: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -501,10 +505,18 @@ pub fn tree(c: &Connection, req: &TreeReq) -> NestResult<TreeNode> {
                 .cloned()
                 .unwrap_or_default();
             let many = revs.len() > 1;
+            let names = req.refs.get(&dname);
             for (rev, rev_id) in revs {
+                // Named by its branches ("3.0bpw"), selected by the first.
+                let branches = names.and_then(|m| m.get(&rev)).filter(|v| !v.is_empty());
                 let mut rnode = TreeNode {
-                    name: rev.chars().take(10).collect(),
+                    name: branches.map_or_else(|| rev.chars().take(10).collect(), |v| v.join(", ")),
                     kind: "revision".into(),
+                    selector: Some(format!(
+                        "{}@{}",
+                        node.selector.as_deref().unwrap_or_default(),
+                        branches.map_or(rev.as_str(), |v| v[0].as_str())
+                    )),
                     ..Default::default()
                 };
                 let mut stack = vec![(rev_id, String::new())];

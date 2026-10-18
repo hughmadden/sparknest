@@ -1150,7 +1150,7 @@ impl Placer {
         kind: String,
         revision: Option<String>,
     ) -> u64 {
-        let what = format!("hf download {repo}");
+        let what = format!("hf download {}", at_revision(&repo, &revision));
         tracing::info!(%repo, %kind, "hf download started");
         let me = self.clone();
         self.local_job(what, move |_vfs, progress, notes| async move {
@@ -1494,7 +1494,7 @@ impl Placer {
         let id = self.next_job.fetch_add(1, Ordering::Relaxed);
         let job = Arc::new(Mutex::new(ClusterJob {
             id,
-            what: format!("hf download {repo}"),
+            what: format!("hf download {}", at_revision(&repo, &revision)),
             started_ms: now_ms(),
             ..Default::default()
         }));
@@ -1786,7 +1786,10 @@ impl Placer {
             .map_err(|e| NestError::Io(e.to_string()))?
             .map_err(|e| NestError::Io(format!("{}: {e}", scratch.display())))?;
         }
-        let what = format!("hf download {repo} -> archive {archive}");
+        let what = format!(
+            "hf download {} -> archive {archive}",
+            at_revision(&repo, &revision)
+        );
         tracing::info!(%repo, %archive, sha = %plan.sha, files = missing.len(), "hf download into an archive started");
         Ok(
             self.local_job(what, move |vfs, progress, notes| async move {
@@ -2993,5 +2996,14 @@ impl Placer {
             return Err(NestError::NotFound);
         }
         Ok(ids)
+    }
+}
+
+/// `org/name@branch` when a revision was asked for, as job names show it
+/// (each branch is its own model in the UI).
+fn at_revision(repo: &str, revision: &Option<String>) -> String {
+    match revision {
+        Some(r) => format!("{repo}@{r}"),
+        None => repo.to_string(),
     }
 }

@@ -3,6 +3,16 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-18 — 0.5.2: Hugging Face branches as models (ADR-061)
+
+- Several branches of one repo can be downloaded, and each is its own
+  model: its own row, size, detail page, placement and delete
+  (`hf:org/name@branch`). The download dialog takes `/tree/<branch>`
+  links and offers the Hub's branches; `nest hf refs` lists them.
+  Checked on the trial cluster with turboderp/Qwen3-0.6B-exl3 `3.0bpw`
+  and `2.75bpw_H5` (download both, place one on kiwi, delete one).
+- `/v1/hf/refs` reads `refs/` through the mount off the async executor.
+
 ## 2026-10-18 — 0.5.1: a stuck TCP lane is replaced; cancel stops mid-file (ADR-060)
 
 - Raptor's reads from oliver hung for 30 s each, three hours after an
