@@ -118,6 +118,19 @@ async fn import_seal_replicate_evict_rules() {
             "/hub/models--org--tiny/refs/main"
         ]
     );
+    // A snapshot no ref names (caches hold 64-hex ids too) is selected
+    // by its directory name.
+    let old = Selector::parse("hf:org/tiny@aaaa", "/hub").unwrap();
+    let m = n1.placer.manifest(&old).await.unwrap();
+    let mut paths: Vec<&str> = m.entries.iter().map(|e| e.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            "/hub/models--org--tiny/blobs/cfg1",
+            "/hub/models--org--tiny/refs/main"
+        ]
+    );
     let (_, ready1) = n1.placer.readiness(&sel, &[]).await.unwrap();
     assert!(ready1.iter().find(|h| h.host == "n1").unwrap().ready);
     assert!(!ready1.iter().find(|h| h.host == "n2").unwrap().ready);

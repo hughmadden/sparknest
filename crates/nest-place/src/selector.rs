@@ -209,7 +209,12 @@ where
             let Some(rev) = revision else {
                 return resolve_tree(&c_open()?, &dir);
             };
-            let commit = if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+            // A snapshot directory of that name (a commit, or any name a
+            // cache holds there: some carry 64-hex ids) is the revision;
+            // otherwise a branch or tag names one through refs/.
+            let commit = if (rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()))
+                || resolve_path(&c_open()?, &format!("{dir}/snapshots/{rev}")).is_ok()
+            {
                 rev.clone()
             } else {
                 let (rid, _) = resolve_path(&c_open()?, &format!("{dir}/refs/{rev}"))?;

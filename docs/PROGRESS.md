@@ -3,6 +3,15 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-18 — 0.5.3: a snapshot no ref names is still a revision
+
+- After the 0.5.2 rollout five wrldsuksgo2mars repos listed with errors:
+  their extra snapshots are named by 64-hex ids that no ref points at,
+  and `hf:org/name@<id>` was looked up as a branch in `refs/`. A
+  revision that names a snapshot directory is now that snapshot
+  (selector resolution and `hf rm`); tests in `m5` and
+  `hf_removes_one_branch`.
+
 ## 2026-10-18 — 0.5.2: Hugging Face branches as models (ADR-061)
 
 - Several branches of one repo can be downloaded, and each is its own

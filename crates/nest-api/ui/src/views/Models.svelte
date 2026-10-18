@@ -22,7 +22,7 @@
   // A repo, or one branch of it (org/name@branch) when several are cached.
   const ref = (r: Repo) => (r.branch ? `${r.repo}@${r.branch}` : r.repo);
   const key = (r: Repo) => `${r.kind}:${ref(r)}`;
-  const shortRef = (b: string) => (/^[0-9a-f]{40}$/.test(b) ? b.slice(0, 10) : b);
+  const shortRef = (b: string) => (/^[0-9a-f]{40,64}$/.test(b) ? b.slice(0, 10) : b);
   const lacking = (r: Repo) => missing[key(r)]?.missing_files ?? 0;
   const checkMissing = singleFlight(async () => {
     const stale = repos.filter((r) => !r.error && !r.writing && !(Date.now() - (missing[key(r)]?.at ?? 0) < 600_000));

@@ -876,8 +876,13 @@ pub fn rm_target_in(mount_hub: &Path, t: &str) -> NestResult<String> {
         .repo
         .trim_start_matches("model/")
         .trim_start_matches("dataset/");
-    let p = mount_hub.join(repo_dir(kind, repo)).join("refs").join(&rev);
-    let commit = std::fs::read_to_string(&p).unwrap_or_default();
+    let dir = mount_hub.join(repo_dir(kind, repo));
+    // A snapshot of that name is the revision itself (some caches name
+    // snapshots by 64-hex ids no ref points at).
+    if !rev.contains('/') && dir.join("snapshots").join(&rev).is_dir() {
+        return Ok(rev);
+    }
+    let commit = std::fs::read_to_string(dir.join("refs").join(&rev)).unwrap_or_default();
     let commit = commit.trim();
     if !is_commit(commit) {
         return Err(NestError::NotFound);
@@ -1238,6 +1243,14 @@ mod rm_tests {
         std::fs::create_dir_all(r.join("refs")).unwrap();
         std::fs::write(r.join("refs/2bpw"), &a).unwrap();
         std::fs::write(r.join("refs/6bpw"), &b).unwrap();
+        // A snapshot no ref names is removed by its directory name.
+        let odd = "c".repeat(64);
+        std::fs::create_dir_all(r.join(format!("snapshots/{odd}"))).unwrap();
+        assert_eq!(
+            super::rm_target_in(&hub, &format!("hf:org/quants@{odd}")).unwrap(),
+            odd
+        );
+        std::fs::remove_dir(r.join(format!("snapshots/{odd}"))).unwrap();
         // A branch the cache does not have is refused, not the repo.
         let gone = vec!["hf:org/quants@4bpw".to_string()];
         assert!(super::remove(&hf, &hub, &gone, true).await.is_err());
