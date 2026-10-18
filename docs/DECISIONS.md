@@ -1808,3 +1808,27 @@ Amended in 0.5.4 (this ADR's item 2): only snapshots a ref names get
 rows, and only when two or more are named. Updates leave the previous
 commit's snapshot behind with no ref, and listing those split about 25
 ordinary repos into near-duplicate rows.
+
+## ADR-062 — The OOM killer passes over the daemon (2026-10-19)
+
+**Context.** On 2026-10-18 ostrich ran out of memory while a container
+built with CUDA. The kernel killed sparknestd first, then each restart of
+it, four times in 11 s, before reaching the python processes. On a DGX
+Spark the GPU shares system memory, and the memory a CUDA context holds is
+not charged to its process: the report showed about 9 GiB of process
+memory and no page cache on a 121 GiB host. The largest charged task was
+the daemon, whose ~960 MiB of registered RDMA slots (ADR-032) are
+anonymous and pinned. Killing the daemon frees little and unmounts
+`/mnt/sparknest` under every reader, including the job that needed the
+memory.
+
+**Decision.**
+- The system unit sets `OOMScoreAdjust=-500`. The daemon is still a
+  candidate when nothing else is left (not -1000).
+- Children inherit the score, so hf and `sparknest-hf-fetch` are started
+  back at 0 (writing their own `oom_score_adj`, which needs no
+  privilege): a download is ordinary work.
+- Hosts installed earlier pick this up by copying the rendered unit to
+  `/etc/systemd/system/` again (root, `systemctl daemon-reload`); it
+  applies from the next restart.
+

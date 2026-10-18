@@ -3,6 +3,14 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-19 — 0.5.5: the OOM killer passes over the daemon (ADR-062)
+
+- ostrich's daemon was OOM-killed four times in a row while a container
+  ran CUDA: Spark GPU memory is not charged to its process, so the
+  daemon's pinned RDMA slots made it the largest task. The unit now sets
+  `OOMScoreAdjust=-500`; hf children are started back at 0. Installed
+  units need the rendered unit copied again.
+
 ## 2026-10-18 — 0.5.4: only named branches split a model
 
 - 0.5.3 listed about 25 ordinary repos as several rows: a `main` row

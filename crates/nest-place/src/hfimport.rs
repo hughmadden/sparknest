@@ -372,17 +372,16 @@ async fn hf_finalize(
         .map(|(r, _)| r.as_str())
         .collect();
     for chunk in names.chunks(200) {
-        let out = tokio::process::Command::new(hf)
-            .arg("download")
+        let mut cmd = tokio::process::Command::new(hf);
+        cmd.arg("download")
             .arg(&repo.repo_id)
             .args(chunk)
             .args(["--revision", commit, "--repo-type", repo.repo_type])
             .env("HF_HUB_CACHE", mount_hub)
             .env("HF_HUB_DISABLE_PROGRESS_BARS", "1")
             .env("HF_HUB_DISABLE_TELEMETRY", "1")
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output()
+            .kill_on_drop(true);
+        let out = output(&mut cmd)
             .await
             .map_err(|e| format!("running {}: {e}", hf.display()))?;
         if !out.status.success() {
@@ -927,6 +926,28 @@ pub fn rm_target(t: &str) -> String {
 /// What every hf run gets: the hub (through this node's mount) as its
 /// cache and HF_HOME, and the user's token where hf found it before HF_HOME
 /// moved into sparknest.
+/// Start hf or the fetch driver at the default OOM score. The unit
+/// protects the daemon (`OOMScoreAdjust=-500`: on a Spark, GPU memory is
+/// not charged to the process holding it, so the kernel sees sparknestd as
+/// the largest task) and children inherit it; a download is ordinary work
+/// the kernel may stop first. Raising the score needs no privilege.
+fn spawn(cmd: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+    let child = cmd.spawn()?;
+    if let Some(pid) = child.id() {
+        let _ = std::fs::write(format!("/proc/{pid}/oom_score_adj"), "0");
+    }
+    Ok(child)
+}
+
+/// `Command::output`, through [`spawn`].
+async fn output(cmd: &mut tokio::process::Command) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(cmd)?.wait_with_output().await
+}
+
 fn hf_env(cmd: &mut tokio::process::Command, mount_hub: &Path) {
     if let Some(home) = mount_hub.parent() {
         cmd.env("HF_HOME", home);
@@ -946,8 +967,7 @@ fn hf_env(cmd: &mut tokio::process::Command, mount_hub: &Path) {
 
 /// Run hf; its last JSON line, or the error it printed.
 async fn hf_json(mut cmd: tokio::process::Command, what: &str) -> NestResult<serde_json::Value> {
-    let out = cmd
-        .output()
+    let out = output(&mut cmd)
         .await
         .map_err(|e| NestError::Io(format!("running hf: {e}")))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1116,9 +1136,7 @@ pub async fn download(
         cmd.args(["--revision", r]);
     }
     hf_env(&mut cmd, mount_hub);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| NestError::Io(format!("running hf: {e}")))?;
+    let mut child = spawn(&mut cmd).map_err(|e| NestError::Io(format!("running hf: {e}")))?;
     let mut stderr = child.stderr.take();
     let tail = tokio::spawn(async move {
         let mut buf = Vec::new();
@@ -1174,8 +1192,7 @@ pub async fn remove(
         .arg("--json")
         .arg(if dry_run { "--dry-run" } else { "--yes" });
     hf_env(&mut cmd, mount_hub);
-    let out = cmd
-        .output()
+    let out = output(&mut cmd)
         .await
         .map_err(|e| NestError::Io(format!("running {}: {e}", hf.display())))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1563,9 +1580,8 @@ pub async fn fetch_files(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     hf_env(&mut cmd, mount_hub);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| NestError::Io(format!("running sparknest-hf-fetch: {e}")))?;
+    let mut child =
+        spawn(&mut cmd).map_err(|e| NestError::Io(format!("running sparknest-hf-fetch: {e}")))?;
     let names: String = progress
         .lock()
         .files

@@ -36,6 +36,12 @@ Restart=on-failure
 RestartSec=2
 LimitNOFILE=1048576
 LimitMEMLOCK=infinity
+# Keep the kernel's OOM killer off the daemon: killing it unmounts the
+# filesystem under every reader, and on a DGX Spark (unified memory) the GPU
+# memory CUDA processes hold is not charged to them, so the daemon's ~1 GiB
+# of pinned RDMA buffers looks like the largest task. The daemon starts hf
+# downloads back at 0.
+OOMScoreAdjust=-500
 Environment=RUST_LOG=info,openraft=warn
 
 [Install]
