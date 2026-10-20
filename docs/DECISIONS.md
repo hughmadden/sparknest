@@ -1832,3 +1832,213 @@ memory.
   `/etc/systemd/system/` again (root, `systemctl daemon-reload`); it
   applies from the next restart.
 
+
+## ADR-063 — Push loads: each source disk streams once, each rank receives only its bytes (2026-10-21)
+
+**Context.** The LLM engine (cuteafd) starts a model on 6 Spark expert
+ranks and a coordinator (raptor). Each rank needs slices of many files,
+and which bytes belong to which rank changes with the TP degree of each
+run. Measured on 2026-10-20 (`benchmarks/M13-MODEL-LOAD.md`):
+- **GLM 5.3 EXL3 K4:** each rank requested 248 GB to keep ~57 GB. EXL3
+  trellis rows interleave every rank's columns (1 KiB runs every 6 KiB at
+  TP6), so a reader must fetch whole rows.
+- **Kimi K3 EXL3 K2:** 467 GB requested per rank for 109 GB owned; each
+  Spark's NIC received ~545 GB; read+upload took ~315 s.
+- **The pull path's limits:**
+  - a per-rank receive ceiling near 5 GB/s (16 lanes of ≤1 MiB FUSE
+    requests, each a fabric round trip of ~4 ms under load);
+  - a source hot spot whenever all ranks read the same layer (one file,
+    one holder);
+  - each source disk re-reading its files for every rank once the page
+    cache is lost.
+- **What the engine fixes reached:** random layer order, open handles and
+  coalesced reads brought GLM from 143 s to 102 s, with every source and
+  disk still mostly idle.
+
+Rearranging checkpoints per TP is not an option (no space for extra copies,
+and TP changes run to run). Host memory on the Sparks is nearly all
+weights (Kimi leaves 5–9 GB free), so nothing may hold whole layers.
+
+**Decision.**
+1. **Push groups.** An engine may load weights by *push* instead of
+   reading through the mount. It is an accelerator, never a dependency:
+   when the weights are not on sparknest, the socket is absent, or any
+   step fails, the engine reads through the mount as before.
+   - **Plan:** the coordinator describes the load in one plan: which bytes
+     of which files go to which rank, at which offset in that rank's
+     memory.
+   - **Schedule:** sparknest does the rest: which copy to read, one stream
+     per source store, flow control and failover.
+   - **Load times:** one group per load time (the Spark experts, and the
+     coordinator's own tensors, are separate groups).
+   - **State:** groups live only in memory, on the hosts taking part. No
+     Raft state, no persisted types.
+2. **Plan format: N-dimensional strided slices.**
+   - **Patterns:**
+     `{run: u32, dims: [{count | indices[], src_stride: u64, dst_stride: u64}; ≤4]}`,
+     outermost dimension first. A pattern copies the file bytes at
+     `src_base + Σ iₖ·src_strideₖ` (`run` bytes each) to
+     `dst_base + Σ iₖ·dst_strideₖ`.
+   - **Entries:** `{file, pattern, src_base, dst_base, rank}`. Patterns
+     are sent once and shared by every expert and layer.
+   - **Index-list dimensions:** at most one dimension per pattern may be
+     an index list (sorted, unique; mixed-K EXLR8), in place of `count`.
+   - **Destination strides:** these let the engine land each rank's runs
+     already packed in its own layout; the engine computes them from its
+     TP and balance, and sparknest knows nothing about kernel layouts.
+   - **Ordering rule:** within each dimension, steps are increasing and
+     non-overlapping on both sides (each stride ≥ the extent of the
+     dimensions inside it).
+   - **One writer per destination range:** each entry's destination
+     extent is disjoint from every other entry's for the same rank, which
+     holds when a share lands packed and contiguous. Bytes sent to every
+     rank are one entry per rank.
+3. **Checked before any byte moves.** At start, the hub resolves each file
+   to its current generation, which must be sealed, and pins it. It then
+   checks, in closed form:
+   - every entry lies within its file;
+   - destination extents are disjoint per rank and within the rank's
+     arena size;
+   - byte totals per rank and per source.
+
+   A bad plan is refused with the first bad entry and why. Plans are data
+   that is checked, never code that is run.
+4. **Sources: one stream per store, one pass in disk order.**
+   - **Assigning files:** the hub gives each file to one live copy,
+     balancing bytes per store. A host's own store comes first, then
+     fabric hosts; an archive store only if no host holds the file, an
+     off-grid host only if nothing else does.
+   - **Reading:** each source sorts its files' entry extents by offset,
+     merges them (gaps under 1 MiB are read through) and reads with
+     O_DIRECT through io_uring in 16 MiB reads, a few files in flight, the
+     object opened through `ReadSource` (fencing and in-flight guards as
+     for every read).
+   - **Packing:** for each buffer read, it walks the entries overlapping
+     it (each pattern jumps to its first run in the buffer in O(dims))
+     and copies each run into the destination rank's open send slot. Runs
+     adjacent in the destination merge into one fragment.
+   - **Sending:** a slot goes out when full or at the end of the stream.
+     Every source streams at once: 8–9 streams with 6 Sparks, raptor and
+     an archive.
+5. **Delivery into a ring the engine owns.**
+   - **The ring:** each rank creates a memfd ring (default 128 MiB, slots
+     of `slot_bytes`, e.g. 4 MiB) and `cudaHostRegister`s it. It passes
+     the fd to its local sparknestd, which maps it and registers it with
+     its NICs.
+   - **Slot contents:** `payload | fragment table | footer`. The footer is
+     `{magic, n_frags, payload_len}` in the last 16 bytes; each fragment
+     is `{dst_off: u64, len: u32, _: u32}`, with payloads in order.
+   - **RDMA:** sources RDMA-WRITE_WITH_IMM a whole slot; the immediate
+     names the slot, and the completion's byte count gives the length, as
+     for reads (ADR-032).
+   - **Checking:** the receiving sparknestd checks the footer and that
+     every fragment lies in the rank's arena, then tells the engine
+     `Filled{slot, len}`.
+   - **Copying:** the engine copies, or converts, each fragment to
+     `arena + dst_off`, and sends `Release{slot}` only after that copy has
+     completed (a CUDA event).
+   - **Ordering:** arrival order is arbitrary. The engine allocates its
+     whole arena before the load and runs any format transform after
+     `Done`, over complete tensors.
+6. **Flow control from the receiver.** A free slot is a credit.
+   - **Who gets credits:** the receiver hands credits to the source with
+     the most bytes still owed to this rank.
+   - **Incast:** it keeps the bytes granted and not yet filled within the
+     fabric's incast budget (`[fabric] inflight_mib`, ADR-032). The
+     switch is lossy without PFC.
+   - **A slow rank:** it stalls only the sources' slots for that rank; a
+     source keeps reading for other ranks until its read ring is full.
+7. **Transports.**
+   - **RDMA, per group:** queue pairs are made just for the group between
+     each source and receiver host, so the read path's lanes, windows and
+     protocol are untouched. They are torn down at the end, after the QPs
+     are in the error state and flushed (as dead lanes are, ADR-060).
+   - **TCP, a real transport:** used for off-grid or archive sources, not
+     only for tests. A slot travels as a frame on the existing TCP lanes,
+     and the receiver's lane thread reads it straight into the ring. Push
+     moves 4–5× fewer bytes than pull, so slow links gain the most.
+   - **Same host:** a source on the rank's own host packs straight into
+     the ring.
+8. **Who talks to whom.**
+   - **Engine ↔ local sparknestd:** an abstract SEQPACKET socket
+     `@sparknest-push` (the engine's containers share the host network
+     namespace; `[push] socket` overrides it). Peers are checked with
+     `SO_PEERCRED`; messages are postcard, defined in a small
+     `nest-push` crate that engines may depend on.
+   - **Coordinator:** it opens the group on its local sparknestd (the
+     *hub*): `Create{ranks: [{rank, host, arena_bytes}]}` →
+     `{group, token}`; then `Patterns`, `Entries` in batches, then
+     `Start`. The hub answers with the predicted bytes and time per store
+     and per rank (and which streams are slow: archive, TCP), then
+     progress, then `Done` or `Failed{reason, missing}`.
+   - **Each rank:** `Join{group, token, rank}` plus the ring fd, to its
+     own sparknestd; then `Filled` events, its `Release`s, then `Done` or
+     `Failed`.
+   - **Start:** waits until every rank has joined (bounded by a timeout).
+   - **Between sparknestds:** a new RPC service, `PUSH`, carries create,
+     join, stream start and progress; each source sends the hub its slot
+     counts per rank.
+   - **Done:** the hub sends `Done` to a rank's host with those counts,
+     and that host tells the engine once it has seen that many slots.
+9. **Failure.**
+   - **Closing the socket** cancels: a coordinator closing ends the group,
+     a rank closing fails it.
+   - **A source that fails a file** (a dead host, an I/O error, a stale
+     generation) hands it to another live copy if there is one, and
+     *the whole file is sent again*. Resending is harmless: the same bytes
+     land at the same addresses, and nothing is transformed before `Done`.
+   - **No other copy:** the group fails, naming the files and ranks left
+     incomplete. The engine falls back to the mount for them, or for
+     everything.
+   - **Stalls:** a group with no progress for 30 s fails.
+   - **The hub restarting** fails the group.
+   - **The engine** must drain its copies before freeing its arena, and
+     never publish a partial load.
+10. **Mixed versions.** Every host in a group (hub, ranks and sources)
+    must run a version with `PUSH`; otherwise `Create` or `Start` is
+    refused and the engine falls back. Nothing else changes for older
+    hosts.
+11. **Memory.**
+    - **Source, while streaming:** a read ring of 4 × 16 MiB plus send
+      slots of (credits + 1) per rank × `slot_bytes`: about 250 MiB with
+      7 ranks and 4 MiB slots. It is registered at group start and freed
+      at the end.
+    - **Receiver:** sparknestd maps the engine's ring and holds nothing of
+      its own beyond that mapping.
+    - **Hub:** the plan, held during the load: tens of MB for Kimi.
+    - **No checksums** on this path; tests verify bytes, and integrity
+      comes from the up-front checks and per-rank totals.
+12. **Phase 1 (0.6.0).**
+    - **What's covered:** the Spark expert weights and the coordinator's
+      tensors, which are whole source tensors, or each GPU's share, landed
+      for the engine's own transforms.
+    - **Sources:** host and archive stores.
+    - **Transports and failover:** RDMA and TCP, failover between copies.
+    - **Status and tools:** `nest push` and `GET /v1/push` show running
+      groups (bytes and rates per store and per rank). `nest push bench`
+      builds a synthetic plan (a file set and a TP split) so the trial
+      cluster can measure push without the engine.
+
+**Expected.** Each source reads its share once at disk speed (≈5–9 GB/s
+on a Spark), so a load takes about the largest share divided by that
+rate. For Kimi that is ~133 GB per source, about 15–27 s against ~315 s
+now. For GLM, about 10–15 s against ~74 s. Ranks receive at a third of
+their NIC.
+
+**Alternatives.**
+- **Rank-side reads through the mount, tuned:** these hit the per-rank
+  round-trip ceiling and still move every byte that a rank's rows touch.
+- **Per-TP copies of each checkpoint:** no space, and TP changes every
+  run.
+- **Lists of ranges instead of strided patterns:** half a million runs per
+  rank per layer at TP6, not checkable in closed form.
+- **A scripting language for plans:** it cannot be bounds-checked without
+  running it.
+- **RDMA straight into the engine's GPU memory:** it saves a copy the
+  receiver makes anyway, and adds dma-buf registration and ordering
+  problems. Rejected.
+- **Gather WRITEs from the read buffer (no packing copy):** 30 SGEs per
+  work request against 1 KiB runs is too many requests, and it pins read
+  buffers until the write completes.
+- **Reusing the read lanes:** it would mix credits into the read
+  protocol's windows and immediates, and starve FUSE reads during a load.

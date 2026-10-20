@@ -3,6 +3,20 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-21 — Model-load baseline; push loads designed (ADR-063)
+
+- Measured the engine's model loads through the mount with a 1 Hz
+  NIC/disk sampler on every host (`benchmarks/M13-MODEL-LOAD.md`): ranks
+  move 2–5× the bytes they keep (EXL3 rows interleave every rank's
+  columns), and reading through FUSE caps each rank near 5 GB/s peak
+  while sources and disks idle. With the engine's random order and
+  reader fix, GLM 5.3 K4 went from 143 s to 102 s; Kimi K3 still takes
+  ~315 s.
+- ADR-063: push loads. The engine sends a strided plan, each source
+  store streams its share once in disk order, and each rank receives only
+  its own bytes into a ring it owns. Planned for 0.6.0 with the read-only
+  placement attributes and the end of the daemon's speculative readahead.
+
 ## 2026-10-19 — 0.5.5: the OOM killer passes over the daemon (ADR-062)
 
 - ostrich's daemon was OOM-killed four times in a row while a container
