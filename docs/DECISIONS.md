@@ -1980,7 +1980,17 @@ weights (Kimi leaves 5–9 GB free), so nothing may hold whole layers.
      counts per rank.
    - **Done:** the hub sends `Done` to a rank's host with those counts,
      and that host tells the engine once it has seen that many slots.
+     A rank's `Done` therefore always follows every `Filled` of that rank.
+   - **Several ranks per process:** a host may hold several ranks, and one
+     process may join several (the coordinator's GPUs at TP2: one rank,
+     arena and ring per GPU).
+   - **Ring memory:** any fd that `mmap(MAP_SHARED)` accepts, a memfd or
+     the engine's own exported allocation. sparknestd maps it and
+     registers the mapping; a mapping the NIC cannot register fails the
+     `Join`, and the engine falls back.
 9. **Failure.**
+   - **Per group in phase 1:** on `Failed` the engine loads the whole
+     group through the mount.
    - **Closing the socket** cancels: a coordinator closing ends the group,
      a rank closing fails it.
    - **A source that fails a file** (a dead host, an I/O error, a stale
