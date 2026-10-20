@@ -1143,6 +1143,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nest-push"
+version = "0.5.5"
+dependencies = [
+ "libc",
+ "postcard",
+ "proptest",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "nest-raft"
 version = "0.5.5"
 dependencies = [

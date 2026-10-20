@@ -24,6 +24,7 @@ nest-api = { path = "crates/nest-api" }
 nest-client = { path = "crates/nest-client" }
 nest-testkit = { path = "crates/nest-testkit" }
 nest-rpc = { path = "crates/nest-rpc" }
+nest-push = { path = "crates/nest-push" }
 
 # external
 anyhow = "1"
