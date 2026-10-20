@@ -20,6 +20,7 @@ nest-raft.workspace = true
 nest-rpc.workspace = true
 nest-store.workspace = true
 nest-data.workspace = true
+nest-push.workspace = true
 nest-fuse.workspace = true
 nest-fabric.workspace = true
 nest-place.workspace = true

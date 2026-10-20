@@ -718,7 +718,7 @@ impl Vfs {
         self.d.id()
     }
 
-    fn rpc(&self) -> &nest_rpc::Rpc {
+    pub(crate) fn rpc(&self) -> &nest_rpc::Rpc {
         self.d.meta().rpc()
     }
 
@@ -1383,6 +1383,28 @@ impl Vfs {
     #[doc(hidden)]
     pub fn read_order(&self, file: FileId) -> NestResult<Vec<NodeId>> {
         self.holders(&self.raw_attr(file)?)
+    }
+
+    /// The file at namespace path `path`, following symlinks (a snapshot
+    /// entry resolves to its blob).
+    pub fn resolve_path(&self, path: &str) -> NestResult<Option<FileId>> {
+        self.q(|c| query::resolve_follow(c, path.as_bytes()))
+    }
+
+    /// Open `generation` of `file` for a push source to read (ADR-063): the
+    /// same checks as serving a read, and the object stays open for later
+    /// reads of it. Blocking.
+    pub fn push_open(
+        &self,
+        file: FileId,
+        generation: Generation,
+    ) -> NestResult<Arc<std::fs::File>> {
+        self.serve_file(file, generation)
+    }
+
+    /// Whether this host's own store holds a live copy of `a`'s generation.
+    pub fn holds_live(&self, a: &FileAttr) -> bool {
+        self.d.servable(ObjectKey::new(a.id, a.generation))
     }
 
     /// Where `file`'s current generation can be read from: every live copy,

@@ -92,6 +92,8 @@ pub struct Node {
     pub vfs: Arc<Vfs>,
     fabric: Arc<parking_lot::Mutex<Option<Arc<nest_fabric::Fabric>>>>,
     pub placer: Arc<nest_place::Placer>,
+    /// Push loads (ADR-063).
+    pub push: Arc<nest_data::push::Push>,
     api_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     mounted: parking_lot::Mutex<Option<nest_fuse::Mounted>>,
     runstate: parking_lot::Mutex<crate::runstate::RunState>,
@@ -434,6 +436,13 @@ impl Node {
             };
             tokio::join!(unix, tcp, counters);
         });
+        let push = nest_data::push::Push::new(&vfs);
+        if !cfg.push.socket.is_empty()
+            && let Err(e) = nest_data::push::listen(push.clone(), &cfg.push.socket)
+        {
+            // Engines fall back to reading through the mount.
+            tracing::warn!(error = %e, socket = %cfg.push.socket, "push socket unavailable");
+        }
         let node = Node {
             cfg,
             rpc,
@@ -442,6 +451,7 @@ impl Node {
             vfs,
             fabric,
             placer,
+            push,
             api_task: parking_lot::Mutex::new(Some(api_task)),
             mounted: parking_lot::Mutex::new(None),
             runstate: parking_lot::Mutex::new(runstate),

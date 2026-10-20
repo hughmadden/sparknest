@@ -17,6 +17,30 @@ pub struct Config {
     pub fuse: FuseSection,
     #[serde(default)]
     pub hf: HfSection,
+    #[serde(default)]
+    pub push: PushSection,
+}
+
+/// Push loads (ADR-063): the socket engines connect to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushSection {
+    /// `@name` for an abstract socket (reachable from containers sharing
+    /// the host's network namespace), else a path. Empty: no push.
+    #[serde(default = "default_push_socket")]
+    pub socket: String,
+}
+
+fn default_push_socket() -> String {
+    nest_push::proto::SOCKET.to_string()
+}
+
+impl Default for PushSection {
+    fn default() -> Self {
+        PushSection {
+            socket: default_push_socket(),
+        }
+    }
 }
 
 /// Hugging Face: where HF_HOME lives in the namespace. Point HF_HOME at the

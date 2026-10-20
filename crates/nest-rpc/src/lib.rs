@@ -38,6 +38,8 @@ pub mod service {
     pub const FABRIC: u8 = 5;
     /// Versions and recovery coordination before Raft starts (ADR-026).
     pub const HELLO: u8 = 6;
+    /// Push loads (ADR-063).
+    pub const PUSH: u8 = 7;
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]

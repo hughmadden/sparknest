@@ -256,6 +256,62 @@ pub fn resolve(c: &Connection, path: &[u8]) -> rusqlite::Result<Option<FileId>> 
     Ok(Some(cur))
 }
 
+/// Resolve a path from the root following symlinks in every component, the
+/// last included (as `open` does): a model snapshot's entries lead to their
+/// blobs. `None` if a component is missing or the links loop (40 hops).
+pub fn resolve_follow(c: &Connection, path: &[u8]) -> rusqlite::Result<Option<FileId>> {
+    let mut stack: Vec<Vec<u8>> = path
+        .split(|b| *b == b'/')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_vec())
+        .collect();
+    stack.reverse();
+    let (mut dir, mut cur) = (FileId::ROOT, FileId::ROOT);
+    let mut hops = 0;
+    while let Some(comp) = stack.pop() {
+        match comp.as_slice() {
+            b"." => continue,
+            b".." => {
+                dir = dir_parent(c, dir)?.unwrap_or(FileId::ROOT);
+                cur = dir;
+                continue;
+            }
+            _ => {}
+        }
+        let Some(id) = lookup(c, dir, &comp)? else {
+            return Ok(None);
+        };
+        let Some(a) = getattr(c, id)? else {
+            return Ok(None);
+        };
+        if a.kind == FileKind::Symlink {
+            hops += 1;
+            if hops > 40 {
+                return Ok(None);
+            }
+            let t = readlink(c, id)?.unwrap_or_default();
+            if t.starts_with(b"/") {
+                dir = FileId::ROOT;
+            }
+            stack.extend(
+                t.split(|b| *b == b'/')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_vec())
+                    .rev(),
+            );
+            cur = dir;
+            continue;
+        }
+        if a.kind == FileKind::Directory {
+            dir = id;
+        } else if !stack.is_empty() {
+            return Ok(None);
+        }
+        cur = id;
+    }
+    Ok(Some(cur))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Totals {
     pub files: u64,

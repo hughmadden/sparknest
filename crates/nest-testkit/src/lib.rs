@@ -232,7 +232,18 @@ impl TestCluster {
                 balance_reads: self.tuning.vfs.balance_reads,
             },
             hf: Default::default(),
+            push: sparknestd::config::PushSection {
+                socket: self.push_socket(id),
+            },
         }
+    }
+
+    /// Node `id`'s push socket: abstract, unique to this cluster.
+    pub fn push_socket(&self, id: u64) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.dir.path().hash(&mut h);
+        format!("@sparknest-push-test-{:x}-{id}", h.finish())
     }
 
     async fn boot(&mut self, id: u64, listen: SocketAddr) {
