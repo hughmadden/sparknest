@@ -78,13 +78,20 @@ pub(crate) enum PushMsg {
         /// Per rank: its host and slot size.
         ranks: Vec<(NodeId, u32)>,
     },
-    /// Rank host → source: `n` more slots of `rank` may be sent.
-    Credit { group: u64, rank: u32, n: u32 },
-    /// Source → rank host: a packed slot (`slot_bytes` long) for `rank`.
+    /// Rank host → source: these ring slots of `rank` may be filled, each
+    /// by RDMA into its target when it has one, else by `Slot`.
+    Credit {
+        group: u64,
+        rank: u32,
+        grants: Vec<Grant>,
+    },
+    /// Source → rank host: a packed slot (`slot_bytes` long) for ring slot
+    /// `slot` of `rank`.
     Slot {
         group: u64,
         rank: u32,
         source: NodeId,
+        slot: u32,
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
@@ -108,6 +115,15 @@ pub(crate) enum PushMsg {
     RankDone { group: u64, rank: u32, slots: u64 },
     /// Any → any: the group ended (cancelled or failed).
     End { group: u64, reason: String },
+}
+
+/// One ring slot a source may fill.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Grant {
+    slot: u32,
+    /// Where to RDMA-write it (the ring is registered with the rank
+    /// host's fabric).
+    target: Option<nest_fabric::push::PushTarget>,
 }
 
 /// A file a source streams, with the entries that read it.
@@ -166,24 +182,28 @@ struct RankSlot {
     reported: u64,
     /// Ring slots no credit names.
     free: Vec<u32>,
-    /// Per source, the ring slots its granted credits fill, in order.
-    granted: HashMap<NodeId, VecDeque<u32>>,
+    /// Ring slots granted and not yet filled, and to which source.
+    granted: HashMap<u32, NodeId>,
+    /// The ring registered with this host's fabric (RDMA delivery).
+    rdma: Option<Arc<nest_fabric::push::PushRing>>,
+    /// This rank's token prefix: landing tokens are `id << 12 | slot`.
+    token_id: u32,
     /// Sources owing this rank slots, granted to round robin.
     sources: Vec<NodeId>,
     next: usize,
     done_sent: bool,
 }
 
-/// A source stream's credits per rank, and its wake-up.
+/// A source stream's grants per rank, and its wake-up.
 struct SourceState {
-    credits: Vec<u32>,
+    credits: Vec<VecDeque<Grant>>,
     notify: Arc<tokio::sync::Notify>,
     cancelled: bool,
 }
 
 /// The engine's ring, mapped into this process: `slots` of `slot_bytes`.
 struct Ring {
-    map: nest_fabric::verbs::SharedMap,
+    map: Arc<nest_fabric::verbs::SharedMap>,
     slots: u32,
     slot_bytes: u32,
 }
@@ -197,7 +217,7 @@ impl Ring {
         let map = nest_fabric::verbs::SharedMap::map(fd, len)
             .map_err(|e| invalid(format!("mapping the ring: {e}")))?;
         Ok(Ring {
-            map,
+            map: Arc::new(map),
             slots,
             slot_bytes,
         })
@@ -230,7 +250,18 @@ struct State {
     sources: HashMap<u64, SourceState>,
     /// Credits that came before their group's `Stream` (rank hosts start
     /// granting as soon as they learn their sources): (group, rank) → n.
-    early: HashMap<(u64, u32), u32>,
+    early: HashMap<(u64, u32), Vec<Grant>>,
+    /// Landing tokens' rank ids → the rank they belong to.
+    tokens: HashMap<u32, (u64, u32)>,
+    next_token: u32,
+}
+
+/// What this host's push service has done, for status and tests.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PushStats {
+    /// Slots this host sent by RDMA and by RPC (as a source).
+    pub rdma_slots: u64,
+    pub rpc_slots: u64,
 }
 
 /// The push service of one host.
@@ -238,6 +269,10 @@ pub struct Push {
     vfs: std::sync::Weak<Vfs>,
     state: Mutex<State>,
     next_group: AtomicU64,
+    /// The fabric's landing sink (it holds a Weak).
+    landings: std::sync::OnceLock<Arc<dyn nest_fabric::push::PushSink>>,
+    rdma_slots: AtomicU64,
+    rpc_slots: AtomicU64,
 }
 
 /// A file resolved at start: its current sealed generation, pinned for the
@@ -277,6 +312,9 @@ impl Push {
             vfs: Arc::downgrade(vfs),
             state: Mutex::new(State::default()),
             next_group: AtomicU64::new(rand::random::<u64>() >> 16 << 16),
+            landings: std::sync::OnceLock::new(),
+            rdma_slots: AtomicU64::new(0),
+            rpc_slots: AtomicU64::new(0),
         });
         vfs.rpc().register(
             nest_rpc::service::PUSH,
@@ -293,6 +331,23 @@ impl Push {
             });
         }
         p
+    }
+
+    pub fn stats(&self) -> PushStats {
+        PushStats {
+            rdma_slots: self.rdma_slots.load(Ordering::Relaxed),
+            rpc_slots: self.rpc_slots.load(Ordering::Relaxed),
+        }
+    }
+
+    fn landings(self: &Arc<Self>) -> std::sync::Weak<dyn nest_fabric::push::PushSink> {
+        let s = self.landings.get_or_init(|| {
+            Arc::new(Landings(
+                Arc::downgrade(self),
+                tokio::runtime::Handle::current(),
+            ))
+        });
+        Arc::downgrade(s)
     }
 
     fn vfs(&self) -> NestResult<Arc<Vfs>> {
@@ -373,16 +428,21 @@ impl Push {
                     me.stream(group, hub, patterns, files, ranks);
                     Ok(())
                 }
-                PushMsg::Credit { group, rank, n } => {
-                    me.credit(group, rank, n);
+                PushMsg::Credit {
+                    group,
+                    rank,
+                    grants,
+                } => {
+                    me.credit(group, rank, grants);
                     Ok(())
                 }
                 PushMsg::Slot {
                     group,
                     rank,
                     source,
+                    slot,
                     bytes,
-                } => me.slot(group, rank, source, &bytes),
+                } => me.slot_rpc(group, rank, source, slot, &bytes),
                 PushMsg::SourceDone {
                     group,
                     source,
@@ -742,6 +802,7 @@ impl Push {
         slots: Vec<u64>,
         failed: Vec<(u32, String)>,
     ) {
+        tracing::trace!(group, %source, ?slots, ?failed, "push source done");
         let all_done = {
             let mut st = self.state.lock();
             let Some(g) = st.hub.get_mut(&group) else {
@@ -880,6 +941,8 @@ impl Push {
                 reported: 0,
                 free: Vec::new(),
                 granted: HashMap::new(),
+                rdma: None,
+                token_id: 0,
                 sources: Vec::new(),
                 next: 0,
                 done_sent: false,
@@ -911,10 +974,33 @@ impl Push {
             }
             r.free = (0..ring.slots).rev().collect();
             let b = ring.slot_bytes;
+            // With a fabric, sources' NICs write straight into the ring;
+            // a ring the NIC cannot register is filled over RPC instead.
+            if ring.slots <= 1 << 12
+                && let Ok(v) = self.vfs()
+                && let Some(f) = v.fabric()
+            {
+                f.set_push_sink(self.landings());
+                match f.register_push_ring(ring.map.clone()) {
+                    Ok(reg) => r.rdma = Some(Arc::new(reg)),
+                    Err(e) => {
+                        tracing::info!(error = %e, "push ring not registered with the NIC; slots come over RPC")
+                    }
+                }
+            }
             r.ring = Some(Arc::new(ring));
             r.engine = Some(engine);
             (r.hub, b)
         };
+        {
+            let mut st = self.state.lock();
+            st.next_token = (st.next_token + 1) % (1 << 19);
+            let id = st.next_token;
+            st.tokens.insert(id, (group, rank));
+            if let Some(r) = st.ranks.get_mut(&(group, rank)) {
+                r.token_id = id;
+            }
+        }
         self.send(
             hub,
             PushMsg::Joined {
@@ -933,9 +1019,9 @@ impl Push {
         self.grant(group, rank);
     }
 
-    /// Hand free ring slots to sources as credits, round robin.
+    /// Hand free ring slots to sources as grants, round robin.
     fn grant(self: &Arc<Self>, group: u64, rank: u32) {
-        let mut out: Vec<(NodeId, u32)> = Vec::new();
+        let mut out: Vec<(NodeId, Vec<Grant>)> = Vec::new();
         {
             let mut st = self.state.lock();
             let Some(r) = st.ranks.get_mut(&(group, rank)) else {
@@ -944,35 +1030,71 @@ impl Push {
             if r.sources.is_empty() {
                 return;
             }
+            let slot_bytes = r.ring.as_ref().map_or(0, |x| x.slot_bytes) as u64;
             while let Some(slot) = r.free.pop() {
                 let s = r.sources[r.next % r.sources.len()];
                 r.next = r.next.wrapping_add(1);
-                r.granted.entry(s).or_default().push_back(slot);
+                r.granted.insert(slot, s);
+                let target = r
+                    .rdma
+                    .as_ref()
+                    .map(|ring| ring.target(slot as u64 * slot_bytes, r.token_id << 12 | slot));
+                let g = Grant { slot, target };
                 match out.iter_mut().find(|(n, _)| *n == s) {
-                    Some((_, k)) => *k += 1,
-                    None => out.push((s, 1)),
+                    Some((_, v)) => v.push(g),
+                    None => out.push((s, vec![g])),
                 }
             }
         }
-        for (src, n) in out {
+        for (src, grants) in out {
             let me = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = me.send(src, PushMsg::Credit { group, rank, n }).await {
+                if let Err(e) = me
+                    .send(
+                        src,
+                        PushMsg::Credit {
+                            group,
+                            rank,
+                            grants,
+                        },
+                    )
+                    .await
+                {
                     me.end_rank(group, rank, format!("credit to a source: {e}"));
                 }
             });
         }
     }
 
-    /// A slot from `source` for `rank`: into the ring slot its oldest
-    /// credit named, checked, then to the engine.
-    fn slot(
+    /// A slot sent by RPC for ring slot `slot`: written into the ring here.
+    fn slot_rpc(
         self: &Arc<Self>,
         group: u64,
         rank: u32,
         source: NodeId,
+        slot: u32,
         bytes: &[u8],
     ) -> NestResult<()> {
+        {
+            let st = self.state.lock();
+            let r = st
+                .ranks
+                .get(&(group, rank))
+                .ok_or_else(|| invalid("no such rank here"))?;
+            if r.granted.get(&slot) != Some(&source) {
+                return Err(invalid("a slot without a credit"));
+            }
+            r.ring
+                .as_ref()
+                .ok_or_else(|| invalid("rank not joined"))?
+                .write_slot(slot, bytes)?;
+        }
+        self.landed(group, rank, slot)
+    }
+
+    /// Ring slot `slot` of `rank` holds a slot (written by RPC above, or by
+    /// a source's NIC): check it, then tell the engine.
+    fn landed(self: &Arc<Self>, group: u64, rank: u32, slot: u32) -> NestResult<()> {
         let (hub, delivered, complete, report) = {
             let mut st = self.state.lock();
             let r = st
@@ -980,24 +1102,22 @@ impl Push {
                 .get_mut(&(group, rank))
                 .ok_or_else(|| invalid("no such rank here"))?;
             let ring = r.ring.clone().ok_or_else(|| invalid("rank not joined"))?;
-            let i = r
-                .granted
-                .get_mut(&source)
-                .and_then(|q| q.pop_front())
-                .ok_or_else(|| invalid("a slot without a credit"))?;
-            ring.write_slot(i, bytes)?;
-            let p = match slot::parse(ring.slot(i), r.arena) {
+            if r.granted.remove(&slot).is_none() {
+                return Err(invalid("a slot without a credit"));
+            }
+            let p = match slot::parse(ring.slot(slot), r.arena) {
                 Ok(p) => p,
                 Err(e) => {
-                    r.free.push(i);
+                    r.free.push(slot);
                     return Err(invalid(format!("bad slot: {e}")));
                 }
             };
             r.filled += 1;
             r.bytes += p.payload as u64;
+            tracing::trace!(group, rank, slot, filled = r.filled, expected = ?r.expected, engine = r.engine.is_some(), "push filled");
             if let Some(e) = &r.engine {
                 let _ = e.send(Event::Filled {
-                    slot: i,
+                    slot,
                     len: ring.slot_bytes,
                 });
             }
@@ -1052,6 +1172,7 @@ impl Push {
     }
 
     fn rank_done(self: &Arc<Self>, group: u64, rank: u32, slots: u64) {
+        tracing::trace!(group, rank, slots, "push rank done");
         let report = {
             let mut st = self.state.lock();
             let Some(r) = st.ranks.get_mut(&(group, rank)) else {
@@ -1133,9 +1254,13 @@ impl Push {
         let notify = Arc::new(tokio::sync::Notify::new());
         {
             let mut st = self.state.lock();
-            let mut credits = vec![0; ranks.len()];
+            let mut credits: Vec<VecDeque<Grant>> = vec![VecDeque::new(); ranks.len()];
             for (r, c) in credits.iter_mut().enumerate() {
-                *c = st.early.remove(&(group, r as u32)).unwrap_or(0);
+                *c = st
+                    .early
+                    .remove(&(group, r as u32))
+                    .unwrap_or_default()
+                    .into();
             }
             st.sources.insert(
                 group,
@@ -1149,6 +1274,14 @@ impl Push {
         let me = self.clone();
         tokio::spawn(async move {
             let src = me.me().unwrap_or(NodeId(0));
+            // Staging for RDMA writes, sized to the largest ring slot.
+            let slot_max = ranks.iter().map(|(_, b)| *b as usize).max().unwrap_or(0);
+            let pool = me
+                .vfs()
+                .ok()
+                .and_then(|v| v.fabric())
+                .and_then(|f| f.push_pool(IN_FLIGHT as u32, slot_max).ok())
+                .map(Arc::new);
             let mut s = Stream {
                 push: me.clone(),
                 group,
@@ -1157,6 +1290,8 @@ impl Push {
                 notify,
                 open: Vec::new(),
                 sent: Vec::new(),
+                sends: tokio::task::JoinSet::new(),
+                pool,
             };
             let failed = s.run(&patterns, files).await;
             let slots = std::mem::take(&mut s.sent);
@@ -1175,39 +1310,41 @@ impl Push {
         });
     }
 
-    fn credit(&self, group: u64, rank: u32, n: u32) {
+    fn credit(&self, group: u64, rank: u32, grants: Vec<Grant>) {
         let mut st = self.state.lock();
         match st.sources.get_mut(&group) {
             Some(s) => {
                 if let Some(c) = s.credits.get_mut(rank as usize) {
-                    *c += n;
+                    c.extend(grants);
                     s.notify.notify_waiters();
                 }
             }
-            None => *st.early.entry((group, rank)).or_default() += n,
+            None => st.early.entry((group, rank)).or_default().extend(grants),
         }
     }
 
-    /// Wait for a credit for `rank` and take it; false if cancelled or
-    /// none came within `STALL`.
-    async fn take_credit(&self, group: u64, rank: u32, notify: &tokio::sync::Notify) -> bool {
+    /// Wait for a grant for `rank` and take it; None if cancelled or none
+    /// came within `STALL`.
+    async fn take_credit(
+        &self,
+        group: u64,
+        rank: u32,
+        notify: &tokio::sync::Notify,
+    ) -> Option<Grant> {
         loop {
             let n = notify.notified();
             {
                 let mut st = self.state.lock();
-                let Some(s) = st.sources.get_mut(&group) else {
-                    return false;
-                };
+                let s = st.sources.get_mut(&group)?;
                 if s.cancelled {
-                    return false;
+                    return None;
                 }
-                if s.credits[rank as usize] > 0 {
-                    s.credits[rank as usize] -= 1;
-                    return true;
+                if let Some(g) = s.credits[rank as usize].pop_front() {
+                    return Some(g);
                 }
             }
             if tokio::time::timeout(STALL, n).await.is_err() {
-                return false;
+                return None;
             }
         }
     }
@@ -1363,9 +1500,16 @@ struct Stream {
     ranks: Vec<(NodeId, u32)>,
     notify: Arc<tokio::sync::Notify>,
     open: Vec<Option<slot::Packer>>,
-    /// Slots sent per rank.
+    /// Slots sent per rank (counted when handed to a send).
     sent: Vec<u64>,
+    /// Sends in flight (bounded by `IN_FLIGHT`).
+    sends: tokio::task::JoinSet<Result<(), String>>,
+    /// Registered staging for RDMA sends, when this host has a fabric.
+    pool: Option<Arc<nest_fabric::push::PushPool>>,
 }
+
+/// Slot sends a source keeps in flight.
+const IN_FLIGHT: usize = 8;
 
 impl Stream {
     /// Stream every file; the files that failed, by plan index.
@@ -1390,6 +1534,11 @@ impl Stream {
             if let Err(e) = self.flush(r).await {
                 failed.push((u32::MAX, e));
                 break;
+            }
+        }
+        while let Some(r) = self.sends.join_next().await {
+            if let Err(e) = r.map_err(|e| e.to_string()).and_then(|x| x) {
+                failed.push((u32::MAX, e));
             }
         }
         failed
@@ -1476,30 +1625,78 @@ impl Stream {
         Ok(())
     }
 
-    /// Send rank `r`'s open slot once a credit allows.
+    /// Send rank `r`'s open slot once a grant allows: by RDMA into the
+    /// granted ring slot when possible, else by RPC.
     async fn flush(&mut self, r: u32) -> Result<(), String> {
         let ri = r as usize;
         let Some(s) = self.open[ri].take() else {
             return Ok(());
         };
         let (bytes, _, _) = s.finish();
-        if !self.push.take_credit(self.group, r, &self.notify).await {
-            return Err("cancelled, or no credit came".into());
+        let grant = self
+            .push
+            .take_credit(self.group, r, &self.notify)
+            .await
+            .ok_or("cancelled, or no credit came")?;
+        while self.sends.len() >= IN_FLIGHT {
+            if let Some(res) = self.sends.join_next().await {
+                res.map_err(|e| e.to_string())??;
+            }
         }
-        self.push
-            .send(
-                self.ranks[ri].0,
+        let (push, group, me, to) = (self.push.clone(), self.group, self.me, self.ranks[ri].0);
+        let pool = self.pool.clone();
+        self.sends.spawn(async move {
+            if let (Some(t), Some(pool)) = (&grant.target, &pool)
+                && to != me
+                && bytes.len() <= pool.slot_bytes()
+                && let Some(f) = push.vfs().ok().and_then(|v| v.fabric())
+            {
+                match f.push_write(to, pool, &bytes, t).await {
+                    Ok(()) => {
+                        push.rdma_slots.fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                    // Never landed: the slot is still ours to fill.
+                    Err(e) => tracing::debug!(error = %e, "push write over RDMA failed; using RPC"),
+                }
+            }
+            push.rpc_slots.fetch_add(1, Ordering::Relaxed);
+            push.send(
+                to,
                 PushMsg::Slot {
-                    group: self.group,
+                    group,
                     rank: r,
-                    source: self.me,
+                    source: me,
+                    slot: grant.slot,
                     bytes,
                 },
             )
             .await
-            .map_err(|e| format!("sending a slot: {e}"))?;
+            .map_err(|e| format!("sending a slot: {e}"))
+        });
         self.sent[ri] += 1;
         Ok(())
+    }
+}
+
+/// RDMA landings, from the fabric's completion thread (a plain thread:
+/// the runtime to hand work to is captured here).
+pub(crate) struct Landings(std::sync::Weak<Push>, tokio::runtime::Handle);
+
+impl nest_fabric::push::PushSink for Landings {
+    fn landed(&self, token: u32, _len: u32) {
+        let Some(p) = self.0.upgrade() else { return };
+        let Some((group, rank)) = p.state.lock().tokens.get(&(token >> 12)).copied() else {
+            tracing::debug!(token, "push landing for an unknown rank");
+            return;
+        };
+        tracing::trace!(token, group, rank, "push landed");
+        // Off the completion thread: checking takes locks and may send.
+        self.1.spawn(async move {
+            if let Err(e) = p.landed(group, rank, token & 0xfff) {
+                tracing::warn!(error = %e, group, rank, "bad push slot");
+            }
+        });
     }
 }
 

@@ -783,6 +783,9 @@ pub struct Stats {
     pub pulled_bytes: AtomicU64,
     /// Pulled writes that had to wait for a staging slot.
     pub pull_waits: AtomicU64,
+    /// Push writes into engines' rings (ADR-063), sent from this host.
+    pub push_writes: AtomicU64,
+    pub push_bytes: AtomicU64,
 }
 
 impl Fabric {

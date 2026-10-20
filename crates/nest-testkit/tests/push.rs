@@ -466,3 +466,167 @@ async fn a_coordinator_that_leaves_cancels_the_ranks() {
         "{r:?}"
     );
 }
+
+/// Over the real RDMA fabric (skips without RoCE): every slot travels as a
+/// WRITE_WITH_IMM into the rank's registered ring, none by RPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn over_rdma_slots_land_by_nic_writes() {
+    if nest_fabric::discover(&[]).is_empty() {
+        return;
+    }
+    let mut t = nest_testkit::fast_tuning();
+    t.fabric = Some(nest_fabric::FabricConfig {
+        devices: vec![],
+        ..nest_fabric::FabricConfig::default()
+    });
+    let c = TestCluster::start_with(3, t).await;
+    c.eventually("serving", Duration::from_secs(8), |c| {
+        (1..=3).all(|i| c.node(i).data.caught_up() && c.node(i).data.session().is_some())
+    })
+    .await;
+    c.eventually("names registered", Duration::from_secs(8), |c| {
+        c.node(1)
+            .placer
+            .nodes()
+            .map(|n| n.iter().all(|h| !h.name.starts_with("node")))
+            .unwrap_or(false)
+    })
+    .await;
+    let mib: usize = std::env::var("NEST_PUSH_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let len = mib << 20;
+    let data: Vec<u8> = (0..len)
+        .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+        .collect();
+    sealed(&c, 2, "big.bin", data.clone()).await;
+    // Rank 0 on node 3 takes even 4 KiB runs, rank 1 on node 1 odd ones.
+    let run = 4096u32;
+    let rows = (len / (2 * run as usize)) as u32;
+    let pat = Pattern {
+        run,
+        dims: vec![Dim {
+            steps: Steps::Count(rows),
+            src_stride: 2 * run as u64,
+            dst_stride: run as u64,
+        }],
+    };
+    let share = rows as u64 * run as u64;
+    let (slots, slot_bytes) = (32u32, 1u32 << 20);
+    let (hub, socks) = (c.push_socket(1), [c.push_socket(3), c.push_socket(1)]);
+    let before = c
+        .node(2)
+        .vfs
+        .fabric()
+        .unwrap()
+        .stats
+        .push_writes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    let arenas = tokio::task::spawn_blocking(move || {
+        let g = Coordinator::create(
+            &hub,
+            vec![
+                RankSpec {
+                    rank: 0,
+                    host: "n3".into(),
+                    arena_bytes: share,
+                },
+                RankSpec {
+                    rank: 1,
+                    host: "n1".into(),
+                    arena_bytes: share,
+                },
+            ],
+            vec!["/big.bin".into()],
+            Some(Duration::from_secs(30)),
+        )
+        .unwrap();
+        g.patterns(vec![pat]).unwrap();
+        g.entries(vec![
+            Entry {
+                file: 0,
+                pattern: 0,
+                src_base: 0,
+                dst_base: 0,
+                rank: 0,
+            },
+            Entry {
+                file: 0,
+                pattern: 0,
+                src_base: run as u64,
+                dst_base: 0,
+                rank: 1,
+            },
+        ])
+        .unwrap();
+        let (group, token) = (g.group, g.token);
+        let ranks: Vec<_> = (0..2u32)
+            .map(|r| {
+                let sock = socks[r as usize].clone();
+                std::thread::spawn(move || {
+                    let ring = memfd(slots as usize * slot_bytes as usize);
+                    let rank = loop {
+                        if let Ok(k) = Rank::join(
+                            &sock,
+                            JoinArgs {
+                                group,
+                                token,
+                                rank: r,
+                                ring_fd: ring.as_raw_fd(),
+                                slots,
+                                slot_bytes,
+                            },
+                            Some(Duration::from_secs(30)),
+                        ) {
+                            break k;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    };
+                    run_rank(rank, ring, slots, slot_bytes, share as usize)
+                })
+            })
+            .collect();
+        g.start().unwrap();
+        let out: Vec<Vec<u8>> = ranks
+            .into_iter()
+            .map(|h| h.join().unwrap().expect("rank"))
+            .collect();
+        loop {
+            match g.next().unwrap() {
+                Some(Event::Done) => break,
+                Some(Event::Progress { .. }) => {}
+                other => panic!("coordinator got {other:?}"),
+            }
+        }
+        out
+    })
+    .await
+    .unwrap();
+    let dt = t0.elapsed();
+    let f2 = c.node(2).vfs.fabric().unwrap();
+    let writes = f2
+        .stats
+        .push_writes
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - before;
+    for (r, got) in arenas.iter().enumerate() {
+        let want: Vec<u8> = (0..rows as usize)
+            .flat_map(|k| {
+                let at = (2 * k + r) * run as usize;
+                data[at..at + run as usize].iter().copied()
+            })
+            .collect();
+        assert!(got == &want, "rank {r}");
+    }
+    // Both ranks are remote from the source (node 2): every slot went by
+    // RDMA, none fell back to RPC.
+    let rpc = c.node(2).push.stats().rpc_slots;
+    assert!(writes > 0 && rpc == 0, "{writes} RDMA writes, {rpc} by RPC");
+    eprintln!(
+        "push over RDMA: {} MiB to 2 ranks in {dt:?} ({:.2} GB/s), {writes} NIC writes",
+        (2 * share) >> 20,
+        (2 * share) as f64 / dt.as_secs_f64() / 1e9
+    );
+}

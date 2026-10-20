@@ -218,7 +218,13 @@ impl Fabric {
             return Err(NestError::Unavailable(e.to_string()));
         }
         match tokio::time::timeout(PUSH_TIMEOUT, rx).await {
-            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(true)) => {
+                self.stats.push_writes.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .push_bytes
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                Ok(())
+            }
             Ok(_) => Err(NestError::Unavailable("push write failed".into())),
             Err(_) => {
                 // The NIC may still read the slot: never reuse it.
