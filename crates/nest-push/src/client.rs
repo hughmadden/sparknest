@@ -25,36 +25,30 @@
 
 use crate::plan::{Entry, Pattern};
 use crate::proto::{self, Event, Forecast, RankSpec, Request};
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use nix::sys::socket::{
+    self, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
+    UnixAddr, sockopt,
+};
+use nix::sys::time::TimeVal;
+use std::io::{self, IoSlice, IoSliceMut};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 /// A connected SEQPACKET socket.
 pub struct Conn {
     fd: OwnedFd,
 }
 
-fn sockaddr(path: &str) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-    // SAFETY: sockaddr_un is plain data; zeroed is a valid value.
-    let mut a: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    a.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    let (bytes, abstract_) = match path.strip_prefix('@') {
-        Some(name) => (name.as_bytes(), true),
-        None => (path.as_bytes(), false),
-    };
-    let off = abstract_ as usize;
-    if bytes.len() + off >= a.sun_path.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "socket path too long",
-        ));
+fn nix_io(e: nix::Error) -> io::Error {
+    io::Error::from_raw_os_error(e as i32)
+}
+
+/// `@name` is an abstract address; anything else a filesystem path.
+fn address(path: &str) -> io::Result<UnixAddr> {
+    match path.strip_prefix('@') {
+        Some(name) => UnixAddr::new_abstract(name.as_bytes()),
+        None => UnixAddr::new(path),
     }
-    for (i, b) in bytes.iter().enumerate() {
-        a.sun_path[i + off] = *b as libc::c_char;
-    }
-    let base = std::mem::offset_of!(libc::sockaddr_un, sun_path);
-    // An abstract name's length is exact; a path's includes its NUL.
-    let len = base + off + bytes.len() + (!abstract_) as usize;
-    Ok((a, len as libc::socklen_t))
+    .map_err(nix_io)
 }
 
 impl Conn {
@@ -62,23 +56,30 @@ impl Conn {
     /// socket's connect does not wait: it connects or fails at once
     /// (ECONNREFUSED when nothing listens, ENOENT for a missing path).
     pub fn connect(path: &str) -> io::Result<Conn> {
-        let (addr, len) = sockaddr(path)?;
-        // SAFETY: plain syscalls; the fd is owned on success.
-        unsafe {
-            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
+        Self::connect_timeout(path, None)
+    }
+
+    /// Connect, waiting at most `timeout` (a listener whose backlog is full
+    /// makes a Unix connect wait), and keep `timeout` for every later send
+    /// and receive (see [`Conn::set_timeout`]).
+    pub fn connect_timeout(path: &str, timeout: Option<std::time::Duration>) -> io::Result<Conn> {
+        let addr = address(path)?;
+        let fd = socket::socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .map_err(nix_io)?;
+        let conn = Conn { fd };
+        // Linux bounds a Unix connect by SO_SNDTIMEO.
+        conn.set_timeout(timeout)?;
+        loop {
+            match socket::connect(conn.fd.as_raw_fd(), &addr) {
+                Ok(()) => return Ok(conn),
+                Err(nix::Error::EINTR) => continue,
+                Err(e) => return Err(timed_out(nix_io(e))),
             }
-            let fd = OwnedFd::from_raw_fd(fd);
-            if libc::connect(
-                fd.as_raw_fd(),
-                &addr as *const _ as *const libc::sockaddr,
-                len,
-            ) != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Conn { fd })
         }
     }
 
@@ -86,73 +87,62 @@ impl Conn {
         Conn { fd }
     }
 
+    /// A connected pair, for tests and in-process use.
+    pub fn pair() -> io::Result<(Conn, Conn)> {
+        let (a, b) = socket::socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .map_err(nix_io)?;
+        Ok((Conn { fd: a }, Conn { fd: b }))
+    }
+
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.fd.as_fd()
+    }
+
     /// Bound every later send and receive: one that waits longer fails
     /// with `ErrorKind::TimedOut`. `None` waits forever (the default).
     pub fn set_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
+        // A zero TimeVal means forever; round a zero duration up to 1 µs.
         let tv = match t {
-            Some(d) => libc::timeval {
+            Some(d) => TimeVal::from(libc::timeval {
                 tv_sec: d.as_secs() as libc::time_t,
-                // A zero timeval means forever; round up to 1 µs.
-                tv_usec: (d.subsec_micros().max(u32::from(d.is_zero()))) as libc::suseconds_t,
-            },
-            None => libc::timeval {
+                tv_usec: d.subsec_micros().max(u32::from(d.is_zero())) as libc::suseconds_t,
+            }),
+            None => TimeVal::from(libc::timeval {
                 tv_sec: 0,
                 tv_usec: 0,
-            },
+            }),
         };
-        for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
-            // SAFETY: plain setsockopt with a local timeval.
-            let r = unsafe {
-                libc::setsockopt(
-                    self.fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    opt,
-                    &tv as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-                )
-            };
-            if r != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
+        socket::setsockopt(&self.fd, sockopt::ReceiveTimeout, &tv).map_err(nix_io)?;
+        socket::setsockopt(&self.fd, sockopt::SendTimeout, &tv).map_err(nix_io)?;
         Ok(())
-    }
-
-    pub fn fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
     }
 
     /// Send one message, with `pass` as SCM_RIGHTS if given.
     pub fn send(&self, msg: &[u8], pass: Option<RawFd>) -> io::Result<()> {
-        let mut iov = libc::iovec {
-            iov_base: msg.as_ptr() as *mut _,
-            iov_len: msg.len(),
-        };
-        // Room for one fd.
-        let mut cbuf = [0u64; 4];
-        // SAFETY: msghdr is plain data; the pointers stay valid for the call.
-        unsafe {
-            let mut h: libc::msghdr = std::mem::zeroed();
-            h.msg_iov = &mut iov;
-            h.msg_iovlen = 1;
-            if let Some(fd) = pass {
-                h.msg_control = cbuf.as_mut_ptr() as *mut _;
-                h.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as _;
-                let c = libc::CMSG_FIRSTHDR(&h);
-                (*c).cmsg_level = libc::SOL_SOCKET;
-                (*c).cmsg_type = libc::SCM_RIGHTS;
-                (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-                std::ptr::write_unaligned(libc::CMSG_DATA(c) as *mut RawFd, fd);
-            }
-            loop {
-                let n = libc::sendmsg(self.fd.as_raw_fd(), &h, libc::MSG_NOSIGNAL);
-                if n >= 0 {
-                    return Ok(());
-                }
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(timed_out(e));
-                }
+        let iov = [IoSlice::new(msg)];
+        let fds = pass.map(|f| [f]);
+        let cmsg: Vec<ControlMessage> = fds
+            .as_ref()
+            .map(|f| ControlMessage::ScmRights(f))
+            .into_iter()
+            .collect();
+        loop {
+            match socket::sendmsg::<()>(
+                self.fd.as_raw_fd(),
+                &iov,
+                &cmsg,
+                MsgFlags::MSG_NOSIGNAL,
+                None,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(nix::Error::EINTR) => continue,
+                Err(e) => return Err(timed_out(nix_io(e))),
             }
         }
     }
@@ -161,50 +151,51 @@ impl Conn {
     /// closed.
     pub fn recv(&self, buf: &mut Vec<u8>) -> io::Result<Option<Option<OwnedFd>>> {
         buf.resize(proto::MAX_MSG, 0);
-        let mut iov = libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut _,
-            iov_len: buf.len(),
+        let mut cbuf = nix::cmsg_space!([RawFd; 1]);
+        let (n, fd, truncated) = loop {
+            let mut iov = [IoSliceMut::new(buf)];
+            match socket::recvmsg::<()>(
+                self.fd.as_raw_fd(),
+                &mut iov,
+                Some(&mut cbuf),
+                MsgFlags::MSG_CMSG_CLOEXEC,
+            ) {
+                Ok(m) => {
+                    let mut fd = None;
+                    for c in m.cmsgs().map_err(nix_io)? {
+                        if let ControlMessageOwned::ScmRights(fds) = c {
+                            for f in fds {
+                                // SAFETY: the kernel just installed this fd for us;
+                                // nothing else owns it.
+                                let owned = unsafe { OwnedFd::from_raw_fd(f) };
+                                fd.get_or_insert(owned);
+                            }
+                        }
+                    }
+                    break (m.bytes, fd, m.flags.contains(MsgFlags::MSG_TRUNC));
+                }
+                Err(nix::Error::EINTR) => continue,
+                Err(e) => return Err(timed_out(nix_io(e))),
+            }
         };
-        let mut cbuf = [0u64; 4];
-        // SAFETY: as in `send`; a received fd is taken into an OwnedFd once.
-        unsafe {
-            let mut h: libc::msghdr = std::mem::zeroed();
-            h.msg_iov = &mut iov;
-            h.msg_iovlen = 1;
-            h.msg_control = cbuf.as_mut_ptr() as *mut _;
-            h.msg_controllen = std::mem::size_of_val(&cbuf) as _;
-            let n = loop {
-                let n = libc::recvmsg(self.fd.as_raw_fd(), &mut h, libc::MSG_CMSG_CLOEXEC);
-                if n >= 0 {
-                    break n as usize;
-                }
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(timed_out(e));
-                }
-            };
-            if h.msg_flags & libc::MSG_TRUNC != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "message too large",
-                ));
-            }
-            let mut fd = None;
-            let mut c = libc::CMSG_FIRSTHDR(&h);
-            while !c.is_null() {
-                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                    let raw = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const RawFd);
-                    fd = Some(OwnedFd::from_raw_fd(raw));
-                }
-                c = libc::CMSG_NXTHDR(&h, c);
-            }
-            if n == 0 && fd.is_none() {
-                buf.clear();
-                return Ok(None);
-            }
-            buf.truncate(n);
-            Ok(Some(fd))
+        if truncated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "message too large",
+            ));
         }
+        if n == 0 && fd.is_none() {
+            buf.clear();
+            return Ok(None);
+        }
+        buf.truncate(n);
+        Ok(Some(fd))
+    }
+
+    /// The peer's (pid, uid, gid), from SO_PEERCRED.
+    pub fn peer(&self) -> io::Result<(i32, u32, u32)> {
+        let c = socket::getsockopt(&self.fd, sockopt::PeerCredentials).map_err(nix_io)?;
+        Ok((c.pid(), c.uid(), c.gid()))
     }
 
     pub fn request(&self, r: &Request, pass: Option<RawFd>) -> io::Result<()> {
@@ -220,6 +211,22 @@ impl Conn {
                 .map(Some)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
         }
+    }
+
+    /// The next request, with an fd if one came; `None` when the engine
+    /// closed (the server side).
+    pub fn next_request(&self) -> io::Result<Option<(Request, Option<OwnedFd>)>> {
+        let mut buf = Vec::new();
+        match self.recv(&mut buf)? {
+            None => Ok(None),
+            Some(fd) => proto::decode(&buf)
+                .map(|r| Some((r, fd)))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+        }
+    }
+
+    pub fn send_event(&self, e: &Event) -> io::Result<()> {
+        self.send(&proto::encode(e), None)
     }
 }
 
@@ -257,8 +264,7 @@ impl Coordinator {
         files: Vec<String>,
         timeout: Option<std::time::Duration>,
     ) -> io::Result<Coordinator> {
-        let conn = Conn::connect(socket)?;
-        conn.set_timeout(timeout)?;
+        let conn = Conn::connect_timeout(socket, timeout)?;
         conn.request(
             &Request::Create {
                 version: proto::VERSION,
@@ -330,8 +336,7 @@ impl Rank {
         j: JoinArgs,
         timeout: Option<std::time::Duration>,
     ) -> io::Result<Rank> {
-        let conn = Conn::connect(socket)?;
-        conn.set_timeout(timeout)?;
+        let conn = Conn::connect_timeout(socket, timeout)?;
         conn.request(
             &Request::Join {
                 version: proto::VERSION,
@@ -368,22 +373,15 @@ impl Rank {
 mod tests {
     use super::*;
 
+    fn memfd() -> OwnedFd {
+        nix::sys::memfd::memfd_create(c"nest-push-test", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
+            .unwrap()
+    }
+
     #[test]
     fn messages_and_an_fd_cross_a_socketpair() {
-        let mut fds = [0; 2];
-        // SAFETY: plain syscall into a local array.
-        assert_eq!(
-            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) },
-            0
-        );
-        // SAFETY: fresh fds owned here.
-        let (a, b) = unsafe {
-            (
-                Conn::from_fd(OwnedFd::from_raw_fd(fds[0])),
-                Conn::from_fd(OwnedFd::from_raw_fd(fds[1])),
-            )
-        };
-        let f = tempfile_fd();
+        let (a, b) = Conn::pair().unwrap();
+        let f = memfd();
         a.request(
             &Request::Join {
                 version: 1,
@@ -396,30 +394,17 @@ mod tests {
             Some(f.as_raw_fd()),
         )
         .unwrap();
-        let mut buf = Vec::new();
-        let got = b.recv(&mut buf).unwrap().unwrap();
-        assert!(got.is_some(), "fd passed");
-        let r: Request = proto::decode(&buf).unwrap();
+        let (r, fd) = b.next_request().unwrap().unwrap();
+        assert!(fd.is_some(), "fd passed");
         assert!(matches!(r, Request::Join { rank: 3, .. }));
+        assert_eq!(b.peer().unwrap().1, nix::unistd::getuid().as_raw());
         drop(a);
-        assert!(b.recv(&mut buf).unwrap().is_none(), "peer closed");
+        assert!(b.next_request().unwrap().is_none(), "peer closed");
     }
 
     #[test]
     fn a_silent_peer_times_out() {
-        let mut fds = [0; 2];
-        // SAFETY: plain syscall into a local array.
-        assert_eq!(
-            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) },
-            0
-        );
-        // SAFETY: fresh fds owned here.
-        let (a, _b) = unsafe {
-            (
-                Conn::from_fd(OwnedFd::from_raw_fd(fds[0])),
-                Conn::from_fd(OwnedFd::from_raw_fd(fds[1])),
-            )
-        };
+        let (a, _b) = Conn::pair().unwrap();
         a.set_timeout(Some(std::time::Duration::from_millis(50)))
             .unwrap();
         let t = std::time::Instant::now();
@@ -428,16 +413,35 @@ mod tests {
         assert!(t.elapsed() < std::time::Duration::from_secs(2));
     }
 
-    fn tempfile_fd() -> OwnedFd {
-        let name = std::ffi::CString::new("nest-push-test").unwrap();
-        // SAFETY: plain syscall; the fd is owned.
-        unsafe { OwnedFd::from_raw_fd(libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC)) }
+    #[test]
+    fn connect_to_a_listener_that_never_accepts_times_out() {
+        let name = format!("@nest-push-test-{}", std::process::id());
+        let l = socket::socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        socket::bind(l.as_raw_fd(), &address(&name).unwrap()).unwrap();
+        socket::listen(&l, socket::Backlog::new(0).unwrap()).unwrap();
+        // Fill the backlog; then a connect would wait for an accept.
+        let mut held = Vec::new();
+        let t = std::time::Instant::now();
+        let err = loop {
+            match Conn::connect_timeout(&name, Some(std::time::Duration::from_millis(100))) {
+                Ok(c) => held.push(c),
+                Err(e) => break e,
+            }
+            assert!(held.len() < 64, "backlog never filled");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
-    fn abstract_addresses_have_no_nul() {
-        let (_, len) = sockaddr("@sparknest-push").unwrap();
-        let base = std::mem::offset_of!(libc::sockaddr_un, sun_path);
-        assert_eq!(len as usize, base + 1 + "sparknest-push".len());
+    fn abstract_and_path_addresses() {
+        assert!(address("@sparknest-push").unwrap().as_abstract().is_some());
+        assert!(address("/run/x.sock").unwrap().path().is_some());
     }
 }

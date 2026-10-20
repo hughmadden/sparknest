@@ -79,13 +79,137 @@ pub enum Access {
     RemoteRead,
 }
 
+/// Memory another process shares with us through an fd (a push ring,
+/// ADR-063), mapped read-write and shared. Usable without a fabric; with
+/// one, `Region::register_shared` registers it with a NIC.
+pub struct SharedMap {
+    ptr: *mut u8,
+    len: usize,
+    _fd: std::os::fd::OwnedFd,
+}
+
+// SAFETY: plain shared bytes; whoever hands out ranges (the push receiver,
+// one owner per ring slot) keeps writers apart.
+unsafe impl Send for SharedMap {}
+unsafe impl Sync for SharedMap {}
+
+impl SharedMap {
+    /// Map the first `len` bytes of `fd`, which must hold at least that many.
+    pub fn map(fd: std::os::fd::OwnedFd, len: usize) -> io::Result<SharedMap> {
+        use std::os::fd::AsRawFd;
+        if len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty mapping"));
+        }
+        // SAFETY: fstat on an fd we own into a local.
+        let size = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd.as_raw_fd(), &mut st) != 0 {
+                return Err(last_err("fstat"));
+            }
+            st.st_size as u64
+        };
+        if size < len as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("fd holds {size} bytes, {len} expected"),
+            ));
+        }
+        // SAFETY: a fresh shared mapping of an fd we own, for a length the
+        // file covers (checked above), so no access can fault with SIGBUS
+        // unless the owner truncates it, which the push protocol forbids.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(last_err("mmap"));
+        }
+        Ok(SharedMap {
+            ptr: ptr as *mut u8,
+            len,
+            _fd: fd,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// A mutable view of `[offset, offset+len)`.
+    ///
+    /// # Safety
+    /// The caller has exclusive use of that range (no DMA, no other view in
+    /// this process; the sharing process does not touch it meanwhile).
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn slice_mut(&self, offset: usize, len: usize) -> &mut [u8] {
+        assert!(offset.checked_add(len).is_some_and(|e| e <= self.len));
+        // SAFETY: bounds checked; exclusivity guaranteed by the caller.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(offset), len) }
+    }
+
+    /// A shared view of `[offset, offset+len)`.
+    ///
+    /// # Safety
+    /// Nothing writes that range for the lifetime of the slice.
+    pub unsafe fn slice(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(offset.checked_add(len).is_some_and(|e| e <= self.len));
+        // SAFETY: bounds checked; no writer, by the caller.
+        unsafe { std::slice::from_raw_parts(self.ptr.add(offset), len) }
+    }
+
+    pub fn addr(&self) -> u64 {
+        self.ptr as u64
+    }
+
+    /// `[offset, offset+len)`, which the caller owns as for `write_owned`
+    /// (so nothing writes it meanwhile).
+    pub fn read_owned(&self, offset: usize, len: usize) -> &[u8] {
+        // SAFETY: bounds checked in slice; owned, so no writer.
+        unsafe { self.slice(offset, len) }
+    }
+
+    /// Copy `bytes` to `offset`. Callers own that range (a push slot granted
+    /// to one sender and not yet handed to the sharing process), which is
+    /// the only rule that makes this sound; the push receiver keeps it.
+    pub fn write_owned(&self, offset: usize, bytes: &[u8]) {
+        // SAFETY: bounds checked in slice_mut; the range is owned, as above.
+        unsafe { self.slice_mut(offset, bytes.len()) }.copy_from_slice(bytes);
+    }
+}
+
+impl Drop for SharedMap {
+    fn drop(&mut self) {
+        // SAFETY: our own mapping; registrations hold an Arc to us, so none
+        // remain.
+        unsafe { libc::munmap(self.ptr as *mut c_void, self.len) };
+    }
+}
+
+/// Who owns a region's memory.
+enum Backing {
+    /// Allocated here; freed after deregistration.
+    Alloc(std::alloc::Layout),
+    /// Another process's mapping, kept alive while registered.
+    Shared(#[allow(dead_code)] Arc<SharedMap>),
+}
+
 /// Page-aligned memory registered with a context.
 pub struct Region {
     ctx: Arc<Context>,
     mr: *mut sys::nf_mr,
     ptr: *mut u8,
     len: usize,
-    layout: std::alloc::Layout,
+    backing: Backing,
 }
 
 // SAFETY: the region's memory is plain bytes; concurrent access to distinct
@@ -134,7 +258,33 @@ impl Region {
             mr,
             ptr,
             len,
-            layout,
+            backing: Backing::Alloc(layout),
+        })
+    }
+
+    /// Register a shared mapping (a push ring) with `ctx`, for peers to
+    /// access as `access` says. The mapping stays alive while registered.
+    pub fn register_shared(
+        ctx: &Arc<Context>,
+        map: Arc<SharedMap>,
+        access: Access,
+    ) -> io::Result<Region> {
+        let remote = match access {
+            Access::Local => 0,
+            Access::RemoteWrite => sys::NF_REMOTE_WRITE,
+            Access::RemoteRead => sys::NF_REMOTE_READ,
+        };
+        // SAFETY: the mapping lives as long as the region (held below).
+        let mr = unsafe { sys::nf_reg(ctx.raw, map.ptr as *mut c_void, map.len, remote) };
+        if mr.is_null() {
+            return Err(last_err("ibv_reg_mr of a shared mapping"));
+        }
+        Ok(Region {
+            ctx: ctx.clone(),
+            mr,
+            ptr: map.ptr,
+            len: map.len,
+            backing: Backing::Shared(map),
         })
     }
 
@@ -200,7 +350,9 @@ impl Drop for Region {
         // reference the region (owners drain their queues first).
         unsafe {
             sys::nf_dereg(self.mr);
-            std::alloc::dealloc(self.ptr, self.layout);
+            if let Backing::Alloc(layout) = self.backing {
+                std::alloc::dealloc(self.ptr, layout);
+            }
         }
     }
 }

@@ -1050,6 +1050,7 @@ dependencies = [
  "libc",
  "nest-fabric",
  "nest-meta",
+ "nest-push",
  "nest-raft",
  "nest-rpc",
  "nest-store",
@@ -1147,6 +1148,7 @@ name = "nest-push"
 version = "0.5.5"
 dependencies = [
  "libc",
+ "nix",
  "postcard",
  "proptest",
  "serde",
