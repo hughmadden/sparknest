@@ -1031,3 +1031,92 @@ async fn unanswered_writes_fail_as_unknown() {
             .unwrap(),
     );
 }
+
+/// Push writes (ADR-063): node 2's NIC writes slot images straight into a
+/// shared ring node 1 registered, and node 1 hears each landing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn push_writes_land_in_a_registered_shared_ring() {
+    use nest_fabric::push::PushSink;
+    use nest_fabric::verbs::SharedMap;
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("warn")
+        .try_init();
+    let cfg = FabricConfig {
+        devices: vec![],
+        ..FabricConfig::default()
+    };
+    let Some((rpc1, f1)) = node(1, cfg.clone()).await else {
+        return;
+    };
+    let (rpc2, f2) = node(2, cfg).await.unwrap();
+    rpc2.set_peer(NodeId(1), rpc1.local_addr());
+    rpc1.set_peer(NodeId(2), rpc2.local_addr());
+
+    // The "engine's" ring: a memfd, 8 slots of 1 MiB, mapped by node 1.
+    let (slots, slot_bytes) = (8usize, 1usize << 20);
+    let fd =
+        nix::sys::memfd::memfd_create(c"ring", nix::sys::memfd::MFdFlags::MFD_CLOEXEC).unwrap();
+    nix::unistd::ftruncate(&fd, (slots * slot_bytes) as i64).unwrap();
+    let engine_view = std::fs::File::from(fd.try_clone().unwrap());
+    let map = Arc::new(SharedMap::map(fd, slots * slot_bytes).unwrap());
+    let ring = f1.register_push_ring(map).unwrap();
+
+    struct Landed(std::sync::Mutex<Vec<(u32, u32)>>, tokio::sync::Notify);
+    impl PushSink for Landed {
+        fn landed(&self, token: u32, len: u32) {
+            self.0.lock().unwrap().push((token, len));
+            self.1.notify_one();
+        }
+    }
+    let sink = Arc::new(Landed(Default::default(), tokio::sync::Notify::new()));
+    let as_dyn: Arc<dyn PushSink> = sink.clone();
+    f1.set_push_sink(Arc::downgrade(&as_dyn));
+
+    let pool = f2.push_pool(4, slot_bytes).unwrap();
+    // Every slot, twice over (the pool has 4 staging slots: reuse).
+    let t = Instant::now();
+    for round in 0..2u32 {
+        for i in 0..slots as u32 {
+            let data: Vec<u8> = (0..slot_bytes)
+                .map(|k| (k as u32 ^ i ^ round) as u8)
+                .collect();
+            let target = ring.target(i as u64 * slot_bytes as u64, round << 8 | i);
+            f2.push_write(NodeId(1), &pool, &data, &target)
+                .await
+                .unwrap();
+        }
+    }
+    let dt = t.elapsed();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sink.0.lock().unwrap().len() < 2 * slots && Instant::now() < deadline {
+        let _ = tokio::time::timeout(Duration::from_millis(100), sink.1.notified()).await;
+    }
+    let got = sink.0.lock().unwrap().clone();
+    assert_eq!(got.len(), 2 * slots, "{got:?}");
+    assert!(got.iter().all(|(_, len)| *len == slot_bytes as u32));
+    let tokens: Vec<u32> = got.iter().map(|(t, _)| *t).collect();
+    let want: Vec<u32> = (0..2u32)
+        .flat_map(|r| (0..slots as u32).map(move |i| r << 8 | i))
+        .collect();
+    assert_eq!(tokens, want);
+    // The engine sees the last round's bytes in every slot.
+    use std::os::unix::fs::FileExt;
+    for i in 0..slots {
+        let mut b = vec![0u8; slot_bytes];
+        engine_view
+            .read_exact_at(&mut b, (i * slot_bytes) as u64)
+            .unwrap();
+        assert!(
+            b.iter()
+                .enumerate()
+                .all(|(k, v)| *v == (k as u32 ^ i as u32 ^ 1) as u8),
+            "slot {i}"
+        );
+    }
+    eprintln!(
+        "push: {} MiB in {dt:?} ({:.1} GB/s, one write at a time)",
+        2 * slots,
+        (2 * slots * slot_bytes) as f64 / dt.as_secs_f64() / 1e9
+    );
+}

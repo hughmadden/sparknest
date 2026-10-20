@@ -444,7 +444,7 @@ const WR_WRITE: u64 = 3;
 /// The owner's RDMA READ of a writer's buffer.
 const WR_PULL: u64 = 4;
 
-fn wr(kind: u64, lane: u32, idx: u32) -> u64 {
+pub(crate) fn wr(kind: u64, lane: u32, idx: u32) -> u64 {
     (kind << 56) | ((lane as u64) << 32) | idx as u64
 }
 
@@ -454,9 +454,9 @@ fn wr_parts(id: u64) -> (u64, u32, u32) {
 
 // ---------------------------------------------------------------- devices
 
-struct Device {
-    id: u32,
-    ctx: Arc<Context>,
+pub(crate) struct Device {
+    pub(crate) id: u32,
+    pub(crate) ctx: Arc<Context>,
     /// The port as /sys/class/infiniband names it (ADR-051).
     info: crate::counters::PortInfo,
     counters: crate::counters::PortCounters,
@@ -572,16 +572,16 @@ impl Drop for ServeRing {
 }
 
 /// One queue pair to one peer on one rail pair.
-struct Lane {
-    id: u32,
-    dev: Arc<Device>,
-    qp: Qp,
-    local: Rail,
+pub(crate) struct Lane {
+    pub(crate) id: u32,
+    pub(crate) dev: Arc<Device>,
+    pub(crate) qp: Qp,
+    pub(crate) local: Rail,
     ring: Region,
     /// Our outstanding requests on this lane.
     window: Arc<Semaphore>,
-    peer: NodeId,
-    dead: AtomicBool,
+    pub(crate) peer: NodeId,
+    pub(crate) dead: AtomicBool,
     /// When the lane died; the expiry sweep releases it after `lane_grace`.
     dead_at: Mutex<Option<std::time::Instant>>,
     /// Path MTU agreed with the peer, bytes (for packet estimates).
@@ -660,9 +660,9 @@ impl Waiter {
     }
 }
 
-struct Link {
-    lanes: Vec<Arc<Lane>>,
-    next: AtomicU32,
+pub(crate) struct Link {
+    pub(crate) lanes: Vec<Arc<Lane>>,
+    pub(crate) next: AtomicU32,
     /// The protocol both ends speak.
     protocol: u32,
 }
@@ -720,7 +720,7 @@ enum FabricResp {
 pub struct Fabric {
     cfg: FabricConfig,
     rails: Vec<Rail>,
-    devices: Vec<Arc<Device>>,
+    pub(crate) devices: Vec<Arc<Device>>,
     rpc: nest_rpc::Rpc,
     lanes: Mutex<HashMap<u32, Arc<Lane>>>,
     next_lane: AtomicU32,
@@ -751,6 +751,8 @@ pub struct Fabric {
     inflight: Arc<Semaphore>,
     /// This host's links, bytes per second.
     link_bps: u64,
+    /// Push loads (ADR-063): writes into engines' rings.
+    pub(crate) push: crate::push::PushState,
     pub stats: Stats,
 }
 
@@ -905,6 +907,7 @@ impl Fabric {
             writes: Mutex::new(HashMap::new()),
             pulls: Mutex::new(HashMap::new()),
             sink: Mutex::new(None),
+            push: Default::default(),
             rt: tokio::runtime::Handle::current(),
             stop: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(Semaphore::new((budget / BUDGET_UNIT as u64) as usize)),
@@ -1261,7 +1264,7 @@ impl Fabric {
         self.reap_lanes()
     }
 
-    async fn link(&self, peer: NodeId) -> Result<Arc<Link>, NestError> {
+    pub(crate) async fn link(&self, peer: NodeId) -> Result<Arc<Link>, NestError> {
         if let Some(l) = self.live_link(peer) {
             return Ok(l);
         }
@@ -1698,7 +1701,7 @@ impl Fabric {
 
     /// Take a lane out of service: the QP enters the error state (so the
     /// NIC stops touching its buffers) and requests sent on it fail.
-    fn fail_lane(&self, lane: &Lane) {
+    pub(crate) fn fail_lane(&self, lane: &Lane) {
         if lane.kill() {
             // A link that died is retried after the backoff, like one that
             // failed to set up: re-pairing at once over a dead switch would
@@ -1768,12 +1771,22 @@ impl Fabric {
                 // The NIC is done with the slot (a failed or flushed read).
                 drop(self.pulls.lock().remove(&wc.wr_id));
             }
+            if kind == crate::push::WR_PUSH {
+                self.push_written(wc.wr_id, false);
+            }
             return;
         }
         let mtu = lane
             .as_ref()
             .map_or(dev.info.path_mtu, |l| l.mtu.load(Ordering::Relaxed));
         match (kind, wc.opcode) {
+            (WR_RING, sys::NF_OP_RECV_IMM) if wc.imm & crate::push::IMM_PUSH != 0 => {
+                dev.counters.received(wc.byte_len as u64, mtu);
+                self.push_landed(wc.imm & !crate::push::IMM_PUSH, wc.byte_len);
+                if let Some(l) = lane {
+                    let _ = self.post_ring(&l, idx);
+                }
+            }
             (WR_RING, sys::NF_OP_RECV_IMM) => {
                 let slot = wc.imm;
                 let len = wc.byte_len as usize;
@@ -1830,6 +1843,11 @@ impl Fabric {
             }
             (WR_WRITE, _) => {
                 if let Some((_, n)) = self.in_flight.lock().remove(&wc.wr_id) {
+                    dev.counters.sent(n as u64, mtu);
+                }
+            }
+            (crate::push::WR_PUSH, _) => {
+                if let Some(n) = self.push_written(wc.wr_id, true) {
                     dev.counters.sent(n as u64, mtu);
                 }
             }
