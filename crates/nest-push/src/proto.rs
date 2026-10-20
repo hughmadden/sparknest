@@ -16,8 +16,13 @@ use serde::{Deserialize, Serialize};
 /// The default socket: abstract, so containers sharing the host's network
 /// namespace reach it without a bind mount.
 pub const SOCKET: &str = "@sparknest-push";
-/// Largest message (entries go in batches below this).
-pub const MAX_MSG: usize = 1 << 20;
+/// Largest message. A SEQPACKET message must fit the sender's socket
+/// buffer, which an unprivileged process cannot raise past
+/// `net.core.wmem_max` (often 212,992 bytes), so this stays below the
+/// default. The client splits `Patterns` and `Entries` into batches under
+/// it; one pattern larger than this (an index list of ~25,000 entries) is
+/// refused.
+pub const MAX_MSG: usize = 128 << 10;
 /// Protocol version spoken on the socket.
 pub const VERSION: u32 = 1;
 

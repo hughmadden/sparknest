@@ -267,6 +267,33 @@ impl Listener {
     }
 }
 
+/// Send `items` as `wrap(batch)` messages, each under `proto::MAX_MSG`,
+/// keeping their order (halving a batch until it fits).
+fn send_batched<T: Clone + serde::Serialize>(
+    conn: &Conn,
+    items: Vec<T>,
+    wrap: fn(Vec<T>) -> Request,
+) -> io::Result<()> {
+    let msg = proto::encode(&wrap(items.clone()));
+    if msg.len() <= proto::MAX_MSG {
+        return conn.send(&msg, None);
+    }
+    if items.len() == 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "one plan item encodes to {} bytes, over {}",
+                msg.len(),
+                proto::MAX_MSG
+            ),
+        ));
+    }
+    let mut items = items;
+    let tail = items.split_off(items.len() / 2);
+    send_batched(conn, items, wrap)?;
+    send_batched(conn, tail, wrap)
+}
+
 /// A socket timeout (EAGAIN under SO_RCVTIMEO/SO_SNDTIMEO) as `TimedOut`.
 fn timed_out(e: io::Error) -> io::Error {
     if e.kind() == io::ErrorKind::WouldBlock {
@@ -321,13 +348,14 @@ impl Coordinator {
         self.conn.set_timeout(t)
     }
 
+    /// Send patterns (appended in order), in as many messages as needed.
     pub fn patterns(&self, p: Vec<Pattern>) -> io::Result<()> {
-        self.conn.request(&Request::Patterns(p), None)
+        send_batched(&self.conn, p, Request::Patterns)
     }
 
-    /// Send entries; keep batches under `proto::MAX_MSG` (a few thousand).
+    /// Send entries (appended), in as many messages as needed.
     pub fn entries(&self, e: Vec<Entry>) -> io::Result<()> {
-        self.conn.request(&Request::Entries(e), None)
+        send_batched(&self.conn, e, Request::Entries)
     }
 
     /// Check the plan; streaming starts once every rank has joined.
@@ -437,6 +465,40 @@ mod tests {
         assert_eq!(b.peer().unwrap().1, nix::unistd::getuid().as_raw());
         drop(a);
         assert!(b.next_request().unwrap().is_none(), "peer closed");
+    }
+
+    /// A message of MAX_MSG crosses with default socket buffers, and large
+    /// plans go in batches under it, in order.
+    #[test]
+    fn big_plans_are_batched_under_the_socket_limit() {
+        let (a, b) = Conn::pair().unwrap();
+        a.send(&vec![7u8; proto::MAX_MSG], None).unwrap();
+        let mut buf = Vec::new();
+        b.recv(&mut buf).unwrap().unwrap();
+        assert_eq!(buf.len(), proto::MAX_MSG);
+        let entries: Vec<Entry> = (0..50_000)
+            .map(|i| Entry {
+                file: i,
+                pattern: 1,
+                src_base: u64::MAX - i as u64,
+                dst_base: (i as u64) << 20,
+                rank: 3,
+            })
+            .collect();
+        let want = entries.clone();
+        let t = std::thread::spawn(move || send_batched(&a, entries, Request::Entries));
+        let mut got = Vec::new();
+        let mut msgs = 0;
+        while got.len() < want.len() {
+            match b.next_request().unwrap().unwrap().0 {
+                Request::Entries(e) => got.extend(e),
+                other => panic!("{other:?}"),
+            }
+            msgs += 1;
+        }
+        t.join().unwrap().unwrap();
+        assert!(msgs > 1);
+        assert_eq!(got, want);
     }
 
     #[test]
