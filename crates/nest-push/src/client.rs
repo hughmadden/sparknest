@@ -4,7 +4,7 @@
 //! use nest_push::{client::*, plan::*, proto::*};
 //! # let (ranks, files, patterns, entries): (Vec<RankSpec>, Vec<String>, Vec<Pattern>, Vec<Entry>) = Default::default();
 //! // Coordinator, on the hub:
-//! let g = Coordinator::create(SOCKET, ranks, files)?;
+//! let g = Coordinator::create(SOCKET, ranks, files, Some(std::time::Duration::from_secs(10)))?;
 //! g.patterns(patterns)?;
 //! for chunk in entries.chunks(4096) { g.entries(chunk.to_vec())?; }
 //! let forecast = g.start()?;
@@ -16,6 +16,12 @@
 //! [`Rank::join`], passing the ring's fd, then loops on [`Rank::next`]:
 //! copy each `Filled` slot out, then [`Rank::release`] it. Any error, or
 //! the socket being absent, means: load through the mount instead.
+//!
+//! Timeouts: the constructors take one and set it before their first send,
+//! so a hung sparknestd fails `create`/`join` with `ErrorKind::TimedOut`.
+//! The same timeout is then an idle deadline on every `next()`: no event
+//! for that long is `TimedOut` (sparknestd sends `Progress` at least every
+//! few seconds while a group runs).
 
 use crate::plan::{Entry, Pattern};
 use crate::proto::{self, Event, Forecast, RankSpec, Request};
@@ -52,7 +58,9 @@ fn sockaddr(path: &str) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
 }
 
 impl Conn {
-    /// Connect to `path` (`@name` for an abstract socket).
+    /// Connect to `path` (`@name` for an abstract socket). A Unix
+    /// socket's connect does not wait: it connects or fails at once
+    /// (ECONNREFUSED when nothing listens, ENOENT for a missing path).
     pub fn connect(path: &str) -> io::Result<Conn> {
         let (addr, len) = sockaddr(path)?;
         // SAFETY: plain syscalls; the fd is owned on success.
@@ -76,6 +84,38 @@ impl Conn {
 
     pub fn from_fd(fd: OwnedFd) -> Conn {
         Conn { fd }
+    }
+
+    /// Bound every later send and receive: one that waits longer fails
+    /// with `ErrorKind::TimedOut`. `None` waits forever (the default).
+    pub fn set_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
+        let tv = match t {
+            Some(d) => libc::timeval {
+                tv_sec: d.as_secs() as libc::time_t,
+                // A zero timeval means forever; round up to 1 µs.
+                tv_usec: (d.subsec_micros().max(u32::from(d.is_zero()))) as libc::suseconds_t,
+            },
+            None => libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+        };
+        for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            // SAFETY: plain setsockopt with a local timeval.
+            let r = unsafe {
+                libc::setsockopt(
+                    self.fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    &tv as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            if r != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 
     pub fn fd(&self) -> RawFd {
@@ -111,7 +151,7 @@ impl Conn {
                 }
                 let e = io::Error::last_os_error();
                 if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(e);
+                    return Err(timed_out(e));
                 }
             }
         }
@@ -140,7 +180,7 @@ impl Conn {
                 }
                 let e = io::Error::last_os_error();
                 if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(e);
+                    return Err(timed_out(e));
                 }
             };
             if h.msg_flags & libc::MSG_TRUNC != 0 {
@@ -183,6 +223,15 @@ impl Conn {
     }
 }
 
+/// A socket timeout (EAGAIN under SO_RCVTIMEO/SO_SNDTIMEO) as `TimedOut`.
+fn timed_out(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::WouldBlock {
+        io::Error::new(io::ErrorKind::TimedOut, "push socket timed out")
+    } else {
+        e
+    }
+}
+
 fn refused(e: Event) -> io::Error {
     io::Error::other(match e {
         Event::Refused(m) => m,
@@ -199,12 +248,17 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    /// `timeout` bounds every call on the group's socket from the first
+    /// send on (see [`Conn::set_timeout`]); [`Coordinator::set_timeout`]
+    /// changes it later.
     pub fn create(
         socket: &str,
         ranks: Vec<RankSpec>,
         files: Vec<String>,
+        timeout: Option<std::time::Duration>,
     ) -> io::Result<Coordinator> {
         let conn = Conn::connect(socket)?;
+        conn.set_timeout(timeout)?;
         conn.request(
             &Request::Create {
                 version: proto::VERSION,
@@ -218,6 +272,10 @@ impl Coordinator {
             Some(e) => Err(refused(e)),
             None => Err(io::Error::other("sparknestd closed the push socket")),
         }
+    }
+
+    pub fn set_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
+        self.conn.set_timeout(t)
     }
 
     pub fn patterns(&self, p: Vec<Pattern>) -> io::Result<()> {
@@ -245,6 +303,17 @@ impl Coordinator {
     }
 }
 
+/// What a rank joins with.
+#[derive(Clone, Copy, Debug)]
+pub struct JoinArgs {
+    pub group: u64,
+    pub token: u64,
+    pub rank: u32,
+    pub ring_fd: RawFd,
+    pub slots: u32,
+    pub slot_bytes: u32,
+}
+
 /// A rank's side of a group.
 pub struct Rank {
     conn: Conn,
@@ -253,26 +322,26 @@ pub struct Rank {
 impl Rank {
     /// Join with the ring at `ring_fd` (`slots × slot_bytes`, mappable
     /// MAP_SHARED).
+    /// Join `j.group` as `j.rank` with the ring at `j.ring_fd`
+    /// (`slots × slot_bytes`, mappable MAP_SHARED). `timeout` bounds every
+    /// call from the first send on (see [`Conn::set_timeout`]).
     pub fn join(
         socket: &str,
-        group: u64,
-        token: u64,
-        rank: u32,
-        ring_fd: RawFd,
-        slots: u32,
-        slot_bytes: u32,
+        j: JoinArgs,
+        timeout: Option<std::time::Duration>,
     ) -> io::Result<Rank> {
         let conn = Conn::connect(socket)?;
+        conn.set_timeout(timeout)?;
         conn.request(
             &Request::Join {
                 version: proto::VERSION,
-                group,
-                token,
-                rank,
-                slots,
-                slot_bytes,
+                group: j.group,
+                token: j.token,
+                rank: j.rank,
+                slots: j.slots,
+                slot_bytes: j.slot_bytes,
             },
-            Some(ring_fd),
+            Some(j.ring_fd),
         )?;
         match conn.event()? {
             Some(Event::Joined) => Ok(Rank { conn }),
@@ -284,6 +353,10 @@ impl Rank {
     /// Filled slots, then Done or Failed; `None` if the socket closed.
     pub fn next(&self) -> io::Result<Option<Event>> {
         self.conn.event()
+    }
+
+    pub fn set_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
+        self.conn.set_timeout(t)
     }
 
     pub fn release(&self, slot: u32) -> io::Result<()> {
@@ -330,6 +403,29 @@ mod tests {
         assert!(matches!(r, Request::Join { rank: 3, .. }));
         drop(a);
         assert!(b.recv(&mut buf).unwrap().is_none(), "peer closed");
+    }
+
+    #[test]
+    fn a_silent_peer_times_out() {
+        let mut fds = [0; 2];
+        // SAFETY: plain syscall into a local array.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: fresh fds owned here.
+        let (a, _b) = unsafe {
+            (
+                Conn::from_fd(OwnedFd::from_raw_fd(fds[0])),
+                Conn::from_fd(OwnedFd::from_raw_fd(fds[1])),
+            )
+        };
+        a.set_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let t = std::time::Instant::now();
+        let e = a.event().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
     }
 
     fn tempfile_fd() -> OwnedFd {
