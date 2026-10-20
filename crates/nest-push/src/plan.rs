@@ -5,11 +5,13 @@
 //! A pattern copies `run` bytes at each point of an N-d index space:
 //!
 //! ```text
-//! src = src_base + Σ iₖ · src_strideₖ      dst = dst_base + Σ iₖ · dst_strideₖ
+//! src = src_base + Σ iₖ · src_strideₖ      dst = dst_base + Σ jₖ · dst_strideₖ
 //! ```
 //!
-//! with `iₖ` ranging over `0..count` or over a sorted index list. Dims are
-//! outermost first. Every stride must step past everything inside it, on
+//! where, along each dimension, `jₖ` counts steps `0, 1, 2, …` and `iₖ` is
+//! the same (a `Count` dimension) or the step's value from a sorted index
+//! list: an index list selects from the source and packs into the
+//! destination. Dims are outermost first. Every stride must step past everything inside it, on
 //! both sides, so a pattern's runs are disjoint, ascending in both the file
 //! and the arena, and each entry's footprint has closed-form bounds.
 
@@ -17,9 +19,9 @@ use serde::{Deserialize, Serialize};
 
 /// Most dimensions a pattern may have.
 pub const MAX_DIMS: usize = 4;
-/// Smallest run: below this the source's copy loop costs more than the
-/// bytes (ADR-063 §2).
-pub const MIN_RUN: u32 = 64;
+/// Smallest run. Runs of a few bytes are allowed (a checkpoint's scalars
+/// and scale slices), only costly in bulk.
+pub const MIN_RUN: u32 = 1;
 
 /// One dimension of a pattern.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,7 +141,9 @@ impl Pattern {
                     dst_len: 0,
                 });
             };
-            if last > 0 && (d.src_stride < src_inner || d.dst_stride < dst_inner) {
+            if (last > 0 && d.src_stride < src_inner)
+                || (d.steps.len() > 1 && d.dst_stride < dst_inner)
+            {
                 return Err(format!(
                     "dim {k}: strides {}/{} overlap the {src_inner}/{dst_inner} bytes inside",
                     d.src_stride, d.dst_stride
@@ -149,7 +153,8 @@ impl Pattern {
             src_inner = mul(last, d.src_stride)?
                 .checked_add(src_inner)
                 .ok_or(format!("dim {k}: overflow"))?;
-            dst_inner = mul(last, d.dst_stride)?
+            // The destination steps by position, not by index value.
+            dst_inner = mul(d.steps.len() - 1, d.dst_stride)?
                 .checked_add(dst_inner)
                 .ok_or(format!("dim {k}: overflow"))?;
             bytes = mul(bytes, d.steps.len())?;
@@ -172,9 +177,8 @@ impl Pattern {
         loop {
             let (mut s, mut d) = (0u64, 0u64);
             for (k, dim) in self.dims.iter().enumerate() {
-                let i = dim.steps.get(idx[k]);
-                s += i * dim.src_stride;
-                d += i * dim.dst_stride;
+                s += dim.steps.get(idx[k]) * dim.src_stride;
+                d += idx[k] * dim.dst_stride;
             }
             out.push((s, d));
             // Increment the innermost index, carrying outward.
@@ -338,9 +342,8 @@ impl<'a> RunWalk<'a> {
     fn offsets(&self) -> (u64, u64) {
         let (mut s, mut d) = (self.src_base, self.dst_base);
         for (k, dim) in self.p.dims.iter().enumerate() {
-            let i = dim.steps.get(self.idx[k]);
-            s += i * dim.src_stride;
-            d += i * dim.dst_stride;
+            s += dim.steps.get(self.idx[k]) * dim.src_stride;
+            d += self.idx[k] * dim.dst_stride;
         }
         (s, d)
     }
@@ -523,6 +526,77 @@ mod tests {
             let got: Vec<(u64, u64, u32)> = RunWalk::new(&p, &e, from, to).collect();
             assert_eq!(got, want, "window {from}..{to}");
         }
+    }
+
+    /// Balanced EXL3 gate/up at TP6: each rank owns an irregular set of
+    /// H128 units per row; one entry per rank lands them packed.
+    #[test]
+    fn index_lists_pack_into_the_destination() {
+        let (rows, units, unit) = (8u32, 24u32, 1024u32);
+        let owned: Vec<Vec<u32>> = (0..6u32)
+            .map(|r| (0..units).filter(|u| (u * 7 + r) % 6 == 0).collect())
+            .collect();
+        let patterns: Vec<Pattern> = owned
+            .iter()
+            .map(|sel| Pattern {
+                run: unit,
+                dims: vec![
+                    Dim {
+                        steps: Steps::Count(rows),
+                        src_stride: units as u64 * unit as u64,
+                        dst_stride: sel.len() as u64 * unit as u64,
+                    },
+                    Dim {
+                        steps: Steps::Indices(sel.clone()),
+                        src_stride: unit as u64,
+                        dst_stride: unit as u64,
+                    },
+                ],
+            })
+            .collect();
+        let row = units as u64 * unit as u64;
+        for (r, p) in patterns.iter().enumerate() {
+            let x = p.check().unwrap();
+            // Packed: the extent is exactly the bytes.
+            assert_eq!(x.dst_len, x.bytes, "rank {r}");
+            assert_eq!(x.bytes, rows as u64 * owned[r].len() as u64 * unit as u64);
+            // Each run comes from the right unit and lands at its position.
+            for (k, (s, d)) in p.runs().into_iter().enumerate() {
+                let (row_i, pos) = (k / owned[r].len(), k % owned[r].len());
+                assert_eq!(s, row_i as u64 * row + owned[r][pos] as u64 * unit as u64);
+                assert_eq!(d, k as u64 * unit as u64);
+            }
+        }
+        // All six ranks' entries on one file: checked, no overlap per rank.
+        let plan = Plan {
+            files: vec!["/w".into()],
+            entries: (0..6)
+                .map(|r| Entry {
+                    file: 0,
+                    pattern: r,
+                    src_base: 0,
+                    dst_base: 0,
+                    rank: r,
+                })
+                .collect(),
+            patterns,
+        };
+        let arenas: Vec<u64> = owned
+            .iter()
+            .map(|o| rows as u64 * o.len() as u64 * unit as u64)
+            .collect();
+        let t = plan.check(&[rows as u64 * row], &arenas).unwrap();
+        assert_eq!(t.rank_bytes, arenas);
+        assert_eq!(t.file_bytes[0], rows as u64 * row);
+    }
+
+    #[test]
+    fn tiny_runs_are_allowed() {
+        let p = Pattern {
+            run: 4,
+            dims: vec![],
+        };
+        assert_eq!(p.check().unwrap().bytes, 4);
     }
 
     proptest::proptest! {

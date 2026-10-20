@@ -230,6 +230,43 @@ impl Conn {
     }
 }
 
+/// The server side: a listening SEQPACKET socket (sparknestd).
+pub struct Listener {
+    fd: OwnedFd,
+}
+
+impl Listener {
+    /// Bind `path` (`@name`: abstract; a path is replaced if present).
+    pub fn bind(path: &str) -> io::Result<Listener> {
+        if !path.starts_with('@') {
+            let _ = std::fs::remove_file(path);
+        }
+        let addr = address(path)?;
+        let fd = socket::socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .map_err(nix_io)?;
+        socket::bind(fd.as_raw_fd(), &addr).map_err(nix_io)?;
+        socket::listen(&fd, socket::Backlog::new(64).map_err(nix_io)?).map_err(nix_io)?;
+        Ok(Listener { fd })
+    }
+
+    /// The next connection.
+    pub fn accept(&self) -> io::Result<Conn> {
+        loop {
+            match socket::accept4(self.fd.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
+                // SAFETY: accept4 returned a fresh fd that nothing else owns.
+                Ok(fd) => return Ok(Conn::from_fd(unsafe { OwnedFd::from_raw_fd(fd) })),
+                Err(nix::Error::EINTR) => continue,
+                Err(e) => return Err(nix_io(e)),
+            }
+        }
+    }
+}
+
 /// A socket timeout (EAGAIN under SO_RCVTIMEO/SO_SNDTIMEO) as `TimedOut`.
 fn timed_out(e: io::Error) -> io::Error {
     if e.kind() == io::ErrorKind::WouldBlock {
@@ -437,6 +474,19 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
         assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn listener_accepts_and_sees_the_peer() {
+        let name = format!("@nest-push-listen-{}", std::process::id());
+        let l = Listener::bind(&name).unwrap();
+        let c = Conn::connect_timeout(&name, Some(std::time::Duration::from_secs(1))).unwrap();
+        let s = l.accept().unwrap();
+        assert_eq!(s.peer().unwrap().0, std::process::id() as i32);
+        c.send(b"x", None).unwrap();
+        let mut b = Vec::new();
+        assert!(s.recv(&mut b).unwrap().is_some());
+        assert_eq!(b, b"x");
     }
 
     #[test]

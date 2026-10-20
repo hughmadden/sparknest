@@ -17,14 +17,15 @@ pub const FOOTER: usize = 16;
 
 /// Fills one slot: payload from the front, fragment table behind it.
 /// Runs that continue the previous fragment in the arena extend it.
-pub struct Packer<'a> {
-    buf: &'a mut [u8],
+pub struct Packer {
+    buf: Vec<u8>,
     payload: usize,
     frags: Vec<(u64, u32)>,
 }
 
-impl<'a> Packer<'a> {
-    pub fn new(buf: &'a mut [u8]) -> Packer<'a> {
+impl Packer {
+    /// A packer filling `buf` (the slot, `slot_bytes` long).
+    pub fn new(buf: Vec<u8>) -> Packer {
         assert!(buf.len() > FOOTER + FRAG, "slot too small");
         Packer {
             buf,
@@ -74,9 +75,14 @@ impl<'a> Packer<'a> {
         take
     }
 
-    /// Write the table and footer; the slot's length on the wire (the whole
-    /// slot: the footer sits at the end of the buffer).
-    pub fn finish(self) -> (usize, usize) {
+    /// Payload bytes so far.
+    pub fn payload(&self) -> usize {
+        self.payload
+    }
+
+    /// Write the table and footer at the slot's end; the slot (whole: the
+    /// footer sits at its end), its payload bytes and fragment count.
+    pub fn finish(mut self) -> (Vec<u8>, usize, usize) {
         let len = self.buf.len();
         let table = len - FOOTER - self.frags.len() * FRAG;
         for (i, (o, n)) in self.frags.iter().enumerate() {
@@ -89,7 +95,8 @@ impl<'a> Packer<'a> {
         self.buf[f..f + 4].copy_from_slice(&MAGIC.to_le_bytes());
         self.buf[f + 4..f + 8].copy_from_slice(&(self.frags.len() as u32).to_le_bytes());
         self.buf[f + 8..f + 16].copy_from_slice(&(self.payload as u64).to_le_bytes());
-        (self.payload, self.frags.len())
+        let (p, n) = (self.payload, self.frags.len());
+        (self.buf, p, n)
     }
 }
 
@@ -188,13 +195,13 @@ mod tests {
 
     #[test]
     fn packs_merges_and_parses() {
-        let mut buf = vec![0u8; 256];
-        let mut p = Packer::new(&mut buf);
+        let mut p = Packer::new(vec![0u8; 256]);
         assert_eq!(p.push(1000, &[1; 40]), 40);
         // Continues the first fragment in the arena: merged.
         assert_eq!(p.push(1040, &[2; 30]), 30);
         assert_eq!(p.push(5000, &[3; 10]), 10);
-        assert_eq!(p.finish(), (80, 2));
+        let (buf, payload, frags) = p.finish();
+        assert_eq!((payload, frags), (80, 2));
         let parsed = parse(&buf, 1 << 20).unwrap();
         assert_eq!(
             parsed,
@@ -213,25 +220,23 @@ mod tests {
 
     #[test]
     fn a_full_slot_takes_what_fits() {
-        let mut buf = vec![0u8; 128];
-        let mut p = Packer::new(&mut buf);
+        let mut p = Packer::new(vec![0u8; 128]);
         let room = p.room();
         assert_eq!(p.push(0, &vec![9; 1000]), room);
         assert_eq!(p.push(1 << 20, &[1]), 0);
         // Extending the last fragment needs no new table entry, but there
         // is no payload room left either.
         assert_eq!(p.push(room as u64, &[1]), 0);
-        p.finish();
+        let (buf, _, _) = p.finish();
         assert!(parse(&buf, 1 << 30).is_ok());
     }
 
     #[test]
     fn garbage_is_refused() {
         assert_eq!(parse(&[0u8; 64], 1 << 30), Err(SlotError::Footer));
-        let mut buf = vec![0u8; 128];
-        let mut p = Packer::new(&mut buf);
+        let mut p = Packer::new(vec![0u8; 128]);
         p.push(0, &[1; 8]);
-        p.finish();
+        let (mut buf, _, _) = p.finish();
         let n = buf.len();
         buf[n - 12..n - 8].copy_from_slice(&1000u32.to_le_bytes());
         assert_eq!(parse(&buf, 1 << 30), Err(SlotError::Table));

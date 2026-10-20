@@ -1878,11 +1878,16 @@ weights (Kimi leaves 5–9 GB free), so nothing may hold whole layers.
      `{run: u32, dims: [{count | indices[], src_stride: u64, dst_stride: u64}; ≤4]}`,
      outermost dimension first. A pattern copies the file bytes at
      `src_base + Σ iₖ·src_strideₖ` (`run` bytes each) to
-     `dst_base + Σ iₖ·dst_strideₖ`.
+     `dst_base + Σ jₖ·dst_strideₖ`, where `jₖ` is the step's position and
+     `iₖ` the same, or the step's value for an index list.
    - **Entries:** `{file, pattern, src_base, dst_base, rank}`. Patterns
      are sent once and shared by every expert and layer.
    - **Index-list dimensions:** at most one dimension per pattern may be
-     an index list (sorted, unique; mixed-K EXLR8), in place of `count`.
+     an index list (sorted, unique), in place of `count`. It selects from
+     the source and packs into the destination: the source steps by the
+     index's value, the destination by its position in the list (balanced
+     EXL3 at TP6, mixed-K EXLR8: one entry per tensor and rank).
+   - **Runs** may be as small as one byte (scalars, scale slices).
    - **Destination strides:** these let the engine land each rank's runs
      already packed in its own layout; the engine computes them from its
      TP and balance, and sparknest knows nothing about kernel layouts.
