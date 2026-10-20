@@ -150,6 +150,10 @@ impl Conn {
     /// Receive one message (and an fd passed with it). `None` when the peer
     /// closed.
     pub fn recv(&self, buf: &mut Vec<u8>) -> io::Result<Option<Option<OwnedFd>>> {
+        self.recv_with(buf, MsgFlags::empty())
+    }
+
+    fn recv_with(&self, buf: &mut Vec<u8>, flags: MsgFlags) -> io::Result<Option<Option<OwnedFd>>> {
         buf.resize(proto::MAX_MSG, 0);
         let mut cbuf = nix::cmsg_space!([RawFd; 1]);
         let (n, fd, truncated) = loop {
@@ -158,7 +162,7 @@ impl Conn {
                 self.fd.as_raw_fd(),
                 &mut iov,
                 Some(&mut cbuf),
-                MsgFlags::MSG_CMSG_CLOEXEC,
+                MsgFlags::MSG_CMSG_CLOEXEC | flags,
             ) {
                 Ok(m) => {
                     let mut fd = None;
@@ -203,6 +207,25 @@ impl Conn {
     }
 
     /// The next event; `None` when sparknestd closed the socket.
+    /// The next event if one is waiting, without blocking: `Ok(Ready(e))`,
+    /// `Ok(Empty)` when none is, `Ok(Closed)` when sparknestd closed.
+    pub fn try_event(&self) -> io::Result<Poll> {
+        let mut buf = Vec::new();
+        match self.recv_with(&mut buf, MsgFlags::MSG_DONTWAIT) {
+            Ok(None) => Ok(Poll::Closed),
+            Ok(Some(_)) => proto::decode(&buf)
+                .map(Poll::Ready)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+            // MSG_DONTWAIT with nothing queued (timed_out maps it).
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                Ok(Poll::Empty)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn event(&self) -> io::Result<Option<Event>> {
         let mut buf = Vec::new();
         match self.recv(&mut buf)? {
@@ -228,6 +251,16 @@ impl Conn {
     pub fn send_event(&self, e: &Event) -> io::Result<()> {
         self.send(&proto::encode(e), None)
     }
+}
+
+/// What a nonblocking receive found.
+#[derive(Debug)]
+pub enum Poll {
+    Ready(Event),
+    /// Nothing waiting yet.
+    Empty,
+    /// sparknestd closed the socket.
+    Closed,
 }
 
 /// The server side: a listening SEQPACKET socket (sparknestd).
@@ -391,6 +424,17 @@ pub struct Rank {
 }
 
 impl Rank {
+    /// The socket, to poll for readability alongside other work (the
+    /// engine's CUDA events): readable means `try_next` has an event.
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        self.conn.fd()
+    }
+
+    /// The next event if one is waiting, without blocking.
+    pub fn try_next(&self) -> io::Result<Poll> {
+        self.conn.try_event()
+    }
+
     /// Join with the ring at `ring_fd` (`slots × slot_bytes`, mappable
     /// MAP_SHARED).
     /// Join `j.group` as `j.rank` with the ring at `j.ring_fd`
@@ -499,6 +543,17 @@ mod tests {
         t.join().unwrap().unwrap();
         assert!(msgs > 1);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn try_event_does_not_block() {
+        let (a, b) = Conn::pair().unwrap();
+        assert!(matches!(b.try_event().unwrap(), Poll::Empty));
+        a.send_event(&Event::Joined).unwrap();
+        assert!(matches!(b.try_event().unwrap(), Poll::Ready(Event::Joined)));
+        assert!(matches!(b.try_event().unwrap(), Poll::Empty));
+        drop(a);
+        assert!(matches!(b.try_event().unwrap(), Poll::Closed));
     }
 
     #[test]
