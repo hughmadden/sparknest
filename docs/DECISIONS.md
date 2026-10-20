@@ -1987,7 +1987,13 @@ weights (Kimi leaves 5–9 GB free), so nothing may hold whole layers.
    - **Ring memory:** any fd that `mmap(MAP_SHARED)` accepts, a memfd or
      the engine's own exported allocation. sparknestd maps it and
      registers the mapping; a mapping the NIC cannot register fails the
-     `Join`, and the engine falls back.
+     `Join`, and the engine falls back. The registration is charged to
+     sparknestd, whose unit sets `LimitMEMLOCK=infinity`, not to the
+     engine's container.
+   - **Who may connect:** `SO_PEERCRED` must show sparknestd's own uid
+     (the engines' containers run as the host user) or root. The abstract
+     socket is reachable only from the host's network namespace, so a
+     container without `--net=host` falls back to the mount.
 9. **Failure.**
    - **Per group in phase 1:** on `Failed` the engine loads the whole
      group through the mount.
