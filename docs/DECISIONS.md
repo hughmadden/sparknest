@@ -2052,3 +2052,37 @@ their NIC.
   buffers until the write completes.
 - **Reusing the read lanes:** it would mix credits into the read
   protocol's windows and immediates, and starve FUSE reads during a load.
+
+## ADR-064 — Placement readable through the mount (2026-10-21)
+
+**Context.** The engine's containers see the hub only through the mount;
+widening their mounts to reach the API socket is unwanted. To read files
+in an order that spreads load over their holders (the rotated order of
+`benchmarks/M13-MODEL-LOAD.md`), a loader needs each file's holders, and
+a tool needs the cluster's hosts, without running `nest`.
+
+**Decision.**
+- **Attributes:** three read-only extended attributes, answered by
+  `getxattr` from metadata on the host (no RPC, so a busy peer never
+  delays them):
+  - `user.sparknest.hosts` on a file: the hosts holding a live copy of
+    its current generation, this host first, archive stores left out;
+  - `user.sparknest.where` on a file: JSON with size, generation, seal
+    and every copy, each with its store name and kind (local, fabric,
+    offgrid, archive);
+  - `user.sparknest.cluster` on the mount's root: JSON with this host,
+    the leader, the members (off-grid flagged) and archive stores with
+    their gateways.
+- **Never listed:** `listxattr` still lists only `user.sparknest.sealed`,
+  so copying tools never carry them to another filesystem. Setting or
+  removing them is `EPERM`. A directory or symlink target that is not a
+  regular file has none (`ENODATA`).
+- **Other filesystems** give `ENODATA` or `ENOTSUP` for these names,
+  which is how an engine detects sparknest.
+
+**Alternatives.** A hidden `.sparknest/cluster.json` file at the root:
+needs a synthetic inode through lookup, open and read, and a stat-able
+file that tree walkers may still reach. Live serving state in the
+cluster attribute: needs an RPC per host, so a hung host would hang a
+getxattr; `nest status` and `/v1/status` keep that.
+

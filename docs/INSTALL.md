@@ -142,6 +142,27 @@ the gateway until `nest replicate` puts copies on hosts.
 
 `nest <command> --help` documents each command.
 
+### Placement from inside the mount
+
+Programs that see only the mount (a container with `/mnt/sparknest` bound
+in) can read placement with `getxattr`, without the API socket or `nest`:
+
+| Attribute | On | Value |
+|---|---|---|
+| `user.sparknest.hosts` | a file | hosts holding a live copy of its current generation, comma-separated, this host first (no archive stores) |
+| `user.sparknest.where` | a file | JSON `{size, generation, sealed, copies: [{store, kind}]}`, `kind` = `local`, `fabric`, `offgrid` or `archive` |
+| `user.sparknest.cluster` | the mount's root | JSON `{me, leader, hosts: [{name, node, offgrid, me}], archives: [{name, gateways}]}` |
+
+```sh
+getfattr --only-values -n user.sparknest.hosts /mnt/sparknest/hf-home/hub/…/model-00001.safetensors
+```
+
+They are read-only and never listed, so `cp -a`, `rsync -X` and `tar
+--xattrs` do not copy them. On another filesystem the same call fails
+with `ENODATA` or `ENOTSUP`, which is how a program tells whether it reads
+from sparknest. A snapshot entry is a symlink: `getxattr` follows it to
+the blob.
+
 ## Upgrades
 
 Stop every daemon, replace the binaries, start them again. Our metadata

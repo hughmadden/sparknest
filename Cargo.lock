@@ -1100,6 +1100,7 @@ dependencies = [
  "nest-types",
  "nix",
  "parking_lot",
+ "serde_json",
  "tokio",
  "tracing",
 ]

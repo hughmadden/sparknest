@@ -95,6 +95,28 @@ pub enum OpenMode {
     Direct,
 }
 
+/// A live copy of a file's current generation (`Vfs::copies`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Copy {
+    /// The store's name: a host's name for its live store.
+    pub store: String,
+    pub kind: CopyKind,
+}
+
+/// What holds a copy, in the order reads prefer them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CopyKind {
+    /// This host's own store.
+    Local,
+    /// Another host on the RDMA fabric.
+    Fabric,
+    /// An off-grid host, reached over TCP lanes (ADR-047).
+    Offgrid,
+    /// An archive store, read through its gateways (ADR-055).
+    Archive,
+}
+
 /// Open-flag bits the VFS cares about (Linux values).
 pub mod oflags {
     pub const ACCMODE: i32 = libc::O_ACCMODE;
@@ -1361,6 +1383,81 @@ impl Vfs {
     #[doc(hidden)]
     pub fn read_order(&self, file: FileId) -> NestResult<Vec<NodeId>> {
         self.holders(&self.raw_attr(file)?)
+    }
+
+    /// Where `file`'s current generation can be read from: every live copy,
+    /// named, with what kind of store holds it. Read-only; for the mount's
+    /// placement attributes.
+    pub fn copies(&self, file: FileId) -> NestResult<(FileAttr, Vec<Copy>)> {
+        let a = self.raw_attr(file)?;
+        let (replicas, stores) = self.q(|c| Ok((query::replicas(c, a.id)?, query::stores(c)?)))?;
+        let offgrid = self.offgrid_hosts();
+        let mut out: Vec<Copy> = replicas
+            .into_iter()
+            .filter(|r| r.generation == a.generation && r.state == nest_types::ReplicaState::Live)
+            .filter_map(|r| {
+                let s = stores.iter().find(|s| s.id == r.store)?;
+                let kind = if crate::is_archive(r.store) {
+                    CopyKind::Archive
+                } else if s.node == Some(self.me()) {
+                    CopyKind::Local
+                } else if s.node.is_some_and(|n| offgrid.contains(&n)) {
+                    CopyKind::Offgrid
+                } else {
+                    CopyKind::Fabric
+                };
+                Some(Copy {
+                    store: s.name.clone(),
+                    kind,
+                })
+            })
+            .collect();
+        out.sort_by(|x, y| (x.kind, &x.store).cmp(&(y.kind, &y.store)));
+        Ok((a, out))
+    }
+
+    /// The cluster as metadata knows it, without asking any host: members
+    /// (this host marked, off-grid ones flagged), the leader, and archive
+    /// stores with their gateways. For the mount root's attribute.
+    pub fn cluster(&self) -> NestResult<serde_json::Value> {
+        let stores = self.q(query::stores)?;
+        let m = self.d.meta().metrics().membership_config;
+        let offgrid = self.offgrid_hosts();
+        let name = |n: NodeId| {
+            stores
+                .iter()
+                .find(|s| s.node == Some(n) && !crate::is_archive(s.id))
+                .map_or_else(|| format!("node{}", n.0), |s| s.name.clone())
+        };
+        let hosts: Vec<_> = m
+            .nodes()
+            .map(|(id, _)| {
+                let n = NodeId(*id);
+                serde_json::json!({
+                    "name": name(n),
+                    "node": n.0,
+                    "offgrid": offgrid.contains(&n),
+                    "me": n == self.me(),
+                })
+            })
+            .collect();
+        let archives: Vec<_> = stores
+            .iter()
+            .filter(|s| crate::is_archive(s.id))
+            .map(|s| {
+                let gateways: Vec<String> =
+                    serde_json::from_str::<crate::local::ArchiveConfig>(&s.config)
+                        .map(|c| c.gateways.into_iter().map(name).collect())
+                        .unwrap_or_default();
+                serde_json::json!({"name": s.name, "gateways": gateways})
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "me": name(self.me()),
+            "leader": self.d.meta().leader().map(name),
+            "hosts": hosts,
+            "archives": archives,
+        }))
     }
 
     fn holders(&self, a: &FileAttr) -> NestResult<Vec<NodeId>> {

@@ -561,3 +561,101 @@ async fn rescues_files_written_while_unmounted() {
     assert_eq!(found.as_deref(), Some(b"keep me".as_slice()));
     c.node(1).unmount();
 }
+
+/// Read-only placement attributes (ADR-064): answered by getxattr, never
+/// listed (so `cp -a` and `rsync -X` do not copy them), refused on set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn placement_attributes_are_readable_and_never_listed() {
+    let Some((c, mp)) = cluster_with_mount(3).await else {
+        return;
+    };
+    let p = mp.join("shard.safetensors");
+    let p2 = p.clone();
+    blocking(move || fs::write(&p2, vec![7u8; 1 << 16]).unwrap()).await;
+    let id = c.lookup(1, FileId::ROOT, "shard.safetensors").unwrap();
+    c.eventually("stable", std::time::Duration::from_secs(3), |c| {
+        c.attr(1, id).unwrap().gen_state == nest_types::GenState::Stable
+    })
+    .await;
+    // A second copy, on node 2.
+    c.eventually("node 2 sees it", std::time::Duration::from_secs(5), |c| {
+        c.attr(2, id).is_some()
+    })
+    .await;
+    assert!(c.node(2).vfs.replicate_here(id).await.unwrap() > 0);
+    let (_, copies) = c.node(1).vfs.copies(id).unwrap();
+    let names: Vec<String> = copies.iter().map(|x| x.store.clone()).collect();
+    let mp2 = mp.clone();
+    blocking(move || {
+        use std::ffi::CString;
+        let get = |path: &std::path::Path, name: &str| -> Result<Vec<u8>, i32> {
+            let path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            let name = CString::new(name).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error().raw_os_error().unwrap());
+            }
+            buf.truncate(n as usize);
+            Ok(buf)
+        };
+        // hosts: both holders, this host's own copy first.
+        let hosts = String::from_utf8(get(&p, "user.sparknest.hosts").unwrap()).unwrap();
+        assert_eq!(hosts.split(',').count(), 2, "{hosts}");
+        assert_eq!(hosts.split(',').next().unwrap(), names[0], "{hosts}");
+        // where: size, generation, copies with their kinds.
+        let w: serde_json::Value =
+            serde_json::from_slice(&get(&p, "user.sparknest.where").unwrap()).unwrap();
+        assert_eq!(w["size"], 1 << 16, "{w}");
+        assert_eq!(w["copies"][0]["kind"], "local", "{w}");
+        assert_eq!(w["copies"][1]["kind"], "fabric", "{w}");
+        // cluster: on the root only.
+        let cl: serde_json::Value =
+            serde_json::from_slice(&get(&mp2, "user.sparknest.cluster").unwrap()).unwrap();
+        assert_eq!(cl["hosts"].as_array().unwrap().len(), 3, "{cl}");
+        assert_eq!(
+            cl["hosts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|h| h["me"] == true)
+                .count(),
+            1,
+            "{cl}"
+        );
+        assert_eq!(get(&p, "user.sparknest.cluster"), Err(libc::ENODATA));
+        // Directories have no placement.
+        assert_eq!(get(&mp2, "user.sparknest.hosts"), Err(libc::ENODATA));
+        // Never listed: only the seal attribute is.
+        let path = CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe { libc::listxattr(path.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
+        assert!(n > 0);
+        assert_eq!(&buf[..n as usize], b"user.sparknest.sealed\0");
+        // Read-only.
+        let name = CString::new("user.sparknest.hosts").unwrap();
+        let r = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                b"x".as_ptr() as *const _,
+                1,
+                0,
+            )
+        };
+        assert_eq!(r, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        );
+    })
+    .await;
+    c.node(1).unmount();
+}

@@ -23,7 +23,7 @@ use fuser::{
 };
 use nest_data::{OpenMode, Vfs};
 use nest_meta::{Effect, LockKind};
-use nest_types::{FileAttr, FileId, FileKind, NestError, Timestamp};
+use nest_types::{FileAttr, FileId, FileKind, NestError, NestResult, Timestamp};
 use parking_lot::Mutex;
 
 mod eio;
@@ -83,6 +83,72 @@ impl std::ops::Deref for Fs {
 
 /// Extended attribute that exposes (and sets) the seal bit.
 const SEAL_XATTR: &[u8] = b"user.sparknest.sealed";
+/// Read-only placement attributes (ADR-064). Answered by getxattr but never
+/// listed, so `cp -a`, `rsync -X` and `tar --xattrs` do not copy them.
+/// `hosts`: the fabric and off-grid hosts holding a live copy of the
+/// current generation, comma-separated (no archive stores).
+const HOSTS_XATTR: &[u8] = b"user.sparknest.hosts";
+/// `where`: JSON `{size, generation, sealed, copies: [{store, kind}]}`,
+/// `kind` one of local, fabric, offgrid, archive.
+const WHERE_XATTR: &[u8] = b"user.sparknest.where";
+/// On the mount's root only: JSON `{me, leader, hosts: [{name, node,
+/// offgrid, me}], archives: [{name, gateways}]}`, from metadata alone.
+const CLUSTER_XATTR: &[u8] = b"user.sparknest.cluster";
+
+fn read_only_xattr(name: &[u8]) -> bool {
+    name == HOSTS_XATTR || name == WHERE_XATTR || name == CLUSTER_XATTR
+}
+
+/// The value of a placement attribute for `name`, or None if `name` is not
+/// one.
+fn placement_xattr(vfs: &Vfs, file: FileId, name: &[u8]) -> Option<NestResult<Vec<u8>>> {
+    use nest_data::CopyKind;
+    if name == CLUSTER_XATTR {
+        return Some(if file == FileId::ROOT {
+            vfs.cluster()
+                .map(|v| serde_json::to_vec(&v).expect("plain JSON"))
+        } else {
+            Err(NestError::NotFound)
+        });
+    }
+    let hosts = name == HOSTS_XATTR;
+    if !hosts && name != WHERE_XATTR {
+        return None;
+    }
+    Some(vfs.copies(file).and_then(|(a, copies)| {
+        if a.kind != FileKind::Regular {
+            return Err(NestError::NotFound);
+        }
+        Ok(if hosts {
+            copies
+                .iter()
+                .filter(|c| c.kind != CopyKind::Archive)
+                .map(|c| c.store.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+                .into_bytes()
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "size": a.size,
+                "generation": a.generation.0,
+                "sealed": a.sealed,
+                "copies": copies,
+            }))
+            .expect("plain JSON")
+        })
+    }))
+}
+
+/// Answer an xattr read with `v`: its size when asked for 0 bytes.
+fn reply_xattr(reply: ReplyXattr, size: u32, v: &[u8]) {
+    if size == 0 {
+        reply.size(v.len() as u32)
+    } else if (size as usize) < v.len() {
+        reply.error(Errno::from_i32(libc::ERANGE))
+    } else {
+        reply.data(v)
+    }
+}
 
 /// The mount's EIO log (ADR-056) and the VFS it names files with.
 static EIO: std::sync::OnceLock<(eio::EioLog, std::sync::Weak<Vfs>)> = std::sync::OnceLock::new();
@@ -886,6 +952,13 @@ impl Filesystem for Fs {
     fn getxattr(&self, _req: &Request, i: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let eino: u64 = i.0;
         if name.as_bytes() != SEAL_XATTR {
+            if let Some(v) = placement_xattr(&self.vfs, fid(i), name.as_bytes()) {
+                return match v {
+                    Ok(v) => reply_xattr(reply, size, &v),
+                    Err(NestError::NotFound) => reply.error(Errno::from_i32(libc::ENODATA)),
+                    Err(e) => reply.error(errno_for("getxattr", eino, &e)),
+                };
+            }
             return reply.error(Errno::from_i32(libc::ENODATA));
         }
         let inner = self.inner.clone();
@@ -893,13 +966,7 @@ impl Filesystem for Fs {
             match inner.vfs.getattr(fid(i)).await {
                 Ok(a) if a.kind == FileKind::Regular => {
                     let v: &[u8] = if a.sealed { b"1" } else { b"0" };
-                    if size == 0 {
-                        reply.size(v.len() as u32)
-                    } else if (size as usize) < v.len() {
-                        reply.error(Errno::from_i32(libc::ERANGE))
-                    } else {
-                        reply.data(v)
-                    }
+                    reply_xattr(reply, size, v)
                 }
                 Ok(_) => reply.error(Errno::from_i32(libc::ENODATA)),
                 Err(e) => reply.error(errno_for("getxattr", eino, &e)),
@@ -932,6 +999,9 @@ impl Filesystem for Fs {
         reply: ReplyEmpty,
     ) {
         let eino: u64 = i.0;
+        if read_only_xattr(name.as_bytes()) {
+            return reply.error(Errno::EPERM);
+        }
         if name.as_bytes() != SEAL_XATTR {
             return reply.error(Errno::from_i32(libc::ENOTSUP));
         }
@@ -949,7 +1019,10 @@ impl Filesystem for Fs {
         });
     }
 
-    fn removexattr(&self, _req: &Request, _i: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+    fn removexattr(&self, _req: &Request, _i: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if read_only_xattr(name.as_bytes()) {
+            return reply.error(Errno::EPERM);
+        }
         reply.error(Errno::from_i32(libc::ENODATA));
     }
 
