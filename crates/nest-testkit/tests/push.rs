@@ -323,6 +323,12 @@ async fn strided_shares(lanes: bool) {
     } else {
         assert_eq!(sent, 0);
     }
+    // Node 3 holds b.bin and rank 1: those slots count as local, not as a
+    // fallback.
+    let i3 = full.sources.iter().position(|s| s == "n3").unwrap();
+    assert!(full.local_slots[i3] > 0, "{:?}", full.local_slots);
+    let i2 = full.sources.iter().position(|s| s == "n2").unwrap();
+    assert_eq!(full.local_slots[i2], 0, "n2 holds no rank");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -810,4 +816,198 @@ async fn ranks_may_join_before_start() {
     .unwrap();
     assert!(arenas[0] == data[..len / 2]);
     assert!(arenas[1] == data[len / 2..]);
+}
+
+/// CuteAFD's first production load: a rank that stops releasing ring
+/// slots stalls every source; when the coordinator gives up, the load's
+/// reason names that rank, its full ring and when it last released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_rank_that_stops_releasing_is_named() {
+    let c = ready(3).await;
+    let len = 8 << 20;
+    let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    sealed(&c, 2, "stall.bin", data).await;
+    let (hub, sock) = (c.push_socket(1), c.push_socket(3));
+    let (slots, slot_bytes) = (4u32, 256u32 << 10);
+    let reason = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(20));
+        let g = Coordinator::create(
+            &hub,
+            vec![RankSpec {
+                rank: 0,
+                host: "n3".into(),
+                arena_bytes: len as u64,
+            }],
+            vec!["/stall.bin".into()],
+            t,
+        )
+        .unwrap();
+        g.patterns(vec![Pattern {
+            run: len as u32,
+            dims: vec![],
+        }])
+        .unwrap();
+        g.entries(vec![Entry {
+            file: 0,
+            pattern: 0,
+            src_base: 0,
+            dst_base: 0,
+            rank: 0,
+        }])
+        .unwrap();
+        let ring = memfd(slots as usize * slot_bytes as usize);
+        let rank = Rank::join(
+            &sock,
+            JoinArgs {
+                group: g.group,
+                token: g.token,
+                rank: 0,
+                ring_fd: ring.as_raw_fd(),
+                slots,
+                slot_bytes,
+            },
+            t,
+        )
+        .unwrap();
+        // Releases the first two slots, then stops releasing.
+        let stuck = std::thread::spawn(move || {
+            let mut released = 0;
+            while let Ok(Some(e)) = rank.next() {
+                if let Event::Filled { slot, .. } = e
+                    && released < 2
+                {
+                    rank.release(slot).unwrap();
+                    released += 1;
+                }
+            }
+        });
+        g.start().unwrap();
+        // The rank host reports its ring within its sweep (5 s); then the
+        // coordinator gives up, as the engine's timeout did.
+        std::thread::sleep(Duration::from_secs(12));
+        let group = g.group;
+        drop(g);
+        let _ = stuck.join();
+        group
+    })
+    .await
+    .unwrap();
+    c.eventually("the load ended", Duration::from_secs(5), |c| {
+        c.node(1)
+            .push
+            .history(None)
+            .iter()
+            .any(|r| r.group == reason && r.outcome != nest_data::push_record::Outcome::Running)
+    })
+    .await;
+    let rec = c
+        .node(1)
+        .push
+        .history(None)
+        .into_iter()
+        .find(|r| r.group == reason)
+        .unwrap();
+    let why = rec.reason.clone().unwrap_or_default();
+    assert!(
+        why.contains("rank 0 (n3) stopped releasing")
+            && why.contains("of 4 slots filled and held")
+            && why.contains("last release"),
+        "{why}"
+    );
+    let ring = rec.rings[0].clone().expect("the rank's ring in the record");
+    assert_eq!(
+        (ring.slots, ring.free, ring.released),
+        (4, 0, 2),
+        "{ring:?}"
+    );
+}
+
+/// The production stall (group 4092384301547520): a source with a small
+/// share finishes first, yet rank hosts kept granting it ring slots it
+/// would never fill, until every slot was held by it and the others
+/// starved. A finished source must give its grants back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_finished_source_gives_back_its_ring_slots() {
+    let c = ready(3).await;
+    // n2 holds a small file, n3 a large one; one rank on n1 reads both.
+    let small: Vec<u8> = (0..(1usize << 20)).map(|i| (i % 241) as u8).collect();
+    let large: Vec<u8> = (0..(24usize << 20)).map(|i| (i % 239) as u8).collect();
+    sealed(&c, 2, "small.bin", small.clone()).await;
+    sealed(&c, 3, "large.bin", large.clone()).await;
+    let total = (small.len() + large.len()) as u64;
+    let (hub, sock) = (c.push_socket(1), c.push_socket(1));
+    // A ring far smaller than the load, as in production (128 of 1 MiB).
+    let (slots, slot_bytes) = (8u32, 128u32 << 10);
+    let (sl, ll) = (small.len() as u64, large.len() as u64);
+    let out = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(30));
+        let g = Coordinator::create(
+            &hub,
+            vec![RankSpec {
+                rank: 0,
+                host: "n1".into(),
+                arena_bytes: total,
+            }],
+            vec!["/small.bin".into(), "/large.bin".into()],
+            t,
+        )
+        .unwrap();
+        g.patterns(vec![
+            Pattern {
+                run: sl as u32,
+                dims: vec![],
+            },
+            Pattern {
+                run: ll as u32,
+                dims: vec![],
+            },
+        ])
+        .unwrap();
+        g.entries(vec![
+            Entry {
+                file: 0,
+                pattern: 0,
+                src_base: 0,
+                dst_base: 0,
+                rank: 0,
+            },
+            Entry {
+                file: 1,
+                pattern: 1,
+                src_base: 0,
+                dst_base: sl,
+                rank: 0,
+            },
+        ])
+        .unwrap();
+        let ring = memfd(slots as usize * slot_bytes as usize);
+        let rank = Rank::join(
+            &sock,
+            JoinArgs {
+                group: g.group,
+                token: g.token,
+                rank: 0,
+                ring_fd: ring.as_raw_fd(),
+                slots,
+                slot_bytes,
+            },
+            t,
+        )
+        .unwrap();
+        let h = std::thread::spawn(move || run_rank(rank, ring, slots, slot_bytes, total as usize));
+        g.start().unwrap();
+        let arena = h.join().unwrap().expect("the load completes");
+        loop {
+            match g.next().unwrap() {
+                Some(Event::Done) => break,
+                Some(Event::Progress { .. }) => {}
+                other => panic!("coordinator got {other:?}"),
+            }
+        }
+        arena
+    })
+    .await
+    .unwrap();
+    assert!(out[..small.len()] == small[..]);
+    assert!(out[small.len()..] == large[..]);
 }

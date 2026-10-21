@@ -46,12 +46,20 @@ pub struct Record {
     pub bin_ms: u64,
     /// `bins[t][s][r]`: bytes from source s to rank r in bin t.
     pub bins: Vec<Vec<Vec<u64>>>,
-    /// Per source: slots sent by RDMA and by RPC (as the source reported).
+    /// Per source: slots sent by RDMA, and by a fallback (a TCP lane or
+    /// the control connection), as the source reported.
     pub rdma_slots: Vec<u64>,
     pub rpc_slots: Vec<u64>,
+    /// Per source: slots to a rank on its own host (no network).
+    #[serde(default)]
+    pub local_slots: Vec<u64>,
     /// Milliseconds from start when each source finished, and each rank.
     pub source_done_ms: Vec<Option<u64>>,
     pub rank_done_ms: Vec<Option<u64>>,
+    /// Each rank's ring as its host last reported it (free slots, filled,
+    /// released, when the engine last released one).
+    #[serde(default)]
+    pub rings: Vec<Option<crate::push::RingState>>,
 }
 
 impl Record {
@@ -72,6 +80,7 @@ impl Record {
             bin_ms: TICK.as_millis() as u64,
             rdma_slots: vec![0; s],
             rpc_slots: vec![0; s],
+            local_slots: vec![0; s],
             source_done_ms: vec![None; s],
             rank_done_ms: vec![None; r],
             sources,

@@ -2073,6 +2073,21 @@ know every ring is registered before it commits to the load) or after.
 host that cannot be told fails `Create`. (The first build sent the
 expectation only at `Start`, refusing an earlier `Join`.)
 
+**Amendment (2026-10-21): a finished source gives back its grants; rings
+are reported.** The first production load (group 4092384301547520, 6
+sources, 2 ranks, 128-slot rings) stopped after 9 s at 18.4 GB/s peak:
+kiwi finished its share, but rank hosts kept it in their grant round
+robin until every source was done, and within 0.3 s every free ring slot
+was granted to a source that would fill none. Now, when a source
+finishes, the hub sends each rank host it owed an updated `Sources`, and
+the rank host takes back that source's outstanding grants. Rank hosts
+report each rank's ring to the hub every 5 s (`RankState`: free,
+granted, filled, released, when the engine last released a slot); the
+load's record keeps it, and a stall's reason says whether a ring waits on
+its engine or on sources. Same-host slots count as `local_slots`, apart
+from fallbacks (`rpc_slots`). Push is not run across versions: hosts are
+upgraded together before loads use it.
+
 ## ADR-064 — Placement readable through the mount (2026-10-21)
 
 **Context.** The engine's containers see the hub only through the mount;

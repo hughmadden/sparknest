@@ -2214,8 +2214,27 @@ components:
             type: integer
         rpc_slots:
           type: array
+          description: Per source, slots sent by a fallback (a TCP lane or the control connection).
           items:
             type: integer
+        local_slots:
+          type: array
+          description: Per source, slots to a rank on the source's own host (no network).
+          items:
+            type: integer
+        rings:
+          type: array
+          description: Each rank's ring as its host last reported it.
+          items:
+            type: [object, "null"]
+            properties:
+              slots: { type: integer }
+              free: { type: integer }
+              granted: { type: integer }
+              filled: { type: integer }
+              released: { type: integer }
+              last_release_ms: { type: [integer, "null"] }
+              at_ms: { type: integer }
         source_done_ms:
           type: array
           items:

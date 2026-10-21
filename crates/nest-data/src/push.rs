@@ -41,6 +41,9 @@ const GAP: u64 = 1 << 20;
 /// A group, or a source waiting for a credit, with no progress this long
 /// fails.
 const STALL: Duration = Duration::from_secs(30);
+/// A group quiet this long when its coordinator leaves gets the stall's
+/// cause in its reason.
+const STALL_NOTE: Duration = Duration::from_secs(5);
 /// How long `Start` waits for every rank to join.
 const JOIN_WAIT: Duration = Duration::from_secs(60);
 /// RPC deadline between hosts.
@@ -123,12 +126,38 @@ pub(crate) enum PushMsg {
         source: NodeId,
         bytes: Vec<u64>,
         rdma: u64,
+        /// By a fallback: a TCP lane or the control connection.
         rpc: u64,
+        /// To a rank on this host: no network.
+        local: u64,
     },
     /// Hub → rank host: everything for `rank` is `slots` slots in all.
     RankDone { group: u64, rank: u32, slots: u64 },
     /// Any → any: the group ended (cancelled or failed).
     End { group: u64, reason: String },
+    /// Rank host → hub, every few seconds while a rank is live: its ring
+    /// (free slots, granted ones, slots filled and released) and when the
+    /// engine last released a slot, so a stall names its cause.
+    RankState {
+        group: u64,
+        rank: u32,
+        ring: RingState,
+    },
+}
+
+/// A rank's ring as its host sees it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RingState {
+    pub slots: u32,
+    pub free: u32,
+    pub granted: u32,
+    pub filled: u64,
+    pub released: u64,
+    /// Milliseconds after the rank joined that the engine last released a
+    /// slot; `None` before its first.
+    pub last_release_ms: Option<u64>,
+    /// Milliseconds after the rank joined, as of this report.
+    pub at_ms: u64,
 }
 
 /// One ring slot a source may fill.
@@ -187,6 +216,47 @@ struct HubGroup {
     /// rank) for the record.
     t0: tokio::time::Instant,
     last_sent: HashMap<NodeId, Vec<u64>>,
+    /// Each rank's ring as its host last reported it.
+    rings: HashMap<u32, RingState>,
+    /// The sources still owing each rank slots.
+    owing: Vec<Vec<NodeId>>,
+}
+
+impl HubGroup {
+    /// Why a started group has stopped moving, from its ranks' rings. With
+    /// no slot free, a ring waits either on its engine (slots filled and
+    /// not released) or on sources (slots granted and not filled).
+    fn stall_reason(&self) -> Option<String> {
+        let mut why: Vec<String> = Vec::new();
+        for (rank, ring) in &self.rings {
+            if ring.slots == 0 || ring.free > 0 {
+                continue;
+            }
+            let host = self
+                .ranks
+                .get(*rank as usize)
+                .map_or("?", |r| r.host.as_str());
+            let held = ring.slots.saturating_sub(ring.granted);
+            why.push(if held > 0 {
+                let last = ring
+                    .last_release_ms
+                    .map_or("never released a slot".to_string(), |t| {
+                        format!("last release {:.1} s after joining", t as f64 / 1000.0)
+                    });
+                format!(
+                    "rank {rank} ({host}) stopped releasing ({held} of {} slots filled and held, {last}; {} filled, {} released)",
+                    ring.slots, ring.filled, ring.released
+                )
+            } else {
+                format!(
+                    "rank {rank} ({host}) waits on sources (all {} slots granted, none filled; {} filled, {} released)",
+                    ring.slots, ring.filled, ring.released
+                )
+            });
+        }
+        why.sort();
+        (!why.is_empty()).then(|| why.join("; "))
+    }
 }
 
 /// A rank this host receives for.
@@ -214,6 +284,28 @@ struct RankSlot {
     sources: Vec<NodeId>,
     next: usize,
     done_sent: bool,
+    /// When the rank joined, its releases and when the last came.
+    joined_at: Option<tokio::time::Instant>,
+    released: u64,
+    last_release: Option<tokio::time::Instant>,
+}
+
+impl RankSlot {
+    fn ring_state(&self) -> RingState {
+        let since = |t: tokio::time::Instant| {
+            self.joined_at
+                .map_or(0, |j| t.saturating_duration_since(j).as_millis() as u64)
+        };
+        RingState {
+            slots: self.ring.as_ref().map_or(0, |r| r.slots),
+            free: self.free.len() as u32,
+            granted: self.granted.len() as u32,
+            filled: self.filled,
+            released: self.released,
+            last_release_ms: self.last_release.map(since),
+            at_ms: since(tokio::time::Instant::now()),
+        }
+    }
 }
 
 /// A source stream's grants per rank, and its wake-up.
@@ -558,14 +650,19 @@ impl Push {
                     me.delivered(group, rank, bytes, complete);
                     Ok(())
                 }
+                PushMsg::RankState { group, rank, ring } => {
+                    me.rank_state(group, rank, ring);
+                    Ok(())
+                }
                 PushMsg::Sent {
                     group,
                     source,
                     bytes,
                     rdma,
                     rpc,
+                    local,
                 } => {
-                    me.sent(group, source, &bytes, rdma, rpc);
+                    me.sent(group, source, &bytes, rdma, rpc, local);
                     Ok(())
                 }
                 PushMsg::RankDone { group, rank, slots } => {
@@ -639,6 +736,8 @@ impl Push {
                 started: false,
                 t0: tokio::time::Instant::now(),
                 last_sent: HashMap::new(),
+                rings: HashMap::new(),
+                owing: Vec::new(),
             },
         );
         let (me, expect) = {
@@ -817,6 +916,9 @@ impl Push {
                 owing[r as usize].push(*src);
             }
         }
+        if let Some(g) = self.state.lock().hub.get_mut(&group) {
+            g.owing = owing.clone();
+        }
         let forecast = Forecast {
             streams: by_source
                 .iter()
@@ -921,7 +1023,7 @@ impl Push {
     }
 
     /// A source's report: into the load's record.
-    fn sent(&self, group: u64, source: NodeId, bytes: &[u64], rdma: u64, rpc: u64) {
+    fn sent(&self, group: u64, source: NodeId, bytes: &[u64], rdma: u64, rpc: u64, local: u64) {
         let mut st = self.state.lock();
         let State { hub, history, .. } = &mut *st;
         let Some(g) = hub.get_mut(&group) else { return };
@@ -933,6 +1035,7 @@ impl Push {
             r.report(i, at, bytes, last);
             r.rdma_slots[i] = r.rdma_slots[i].max(rdma);
             r.rpc_slots[i] = r.rpc_slots[i].max(rpc);
+            r.local_slots[i] = r.local_slots[i].max(local);
         }
     }
 
@@ -1052,10 +1155,34 @@ impl Push {
             }
             g.failed.extend(failed);
             g.progress_at = tokio::time::Instant::now();
-            g.streaming.is_empty()
+            // Ranks that this source owed: their hosts must stop granting
+            // it slots (it will fill none), or a finished source collects
+            // every free ring slot and the others starve.
+            let mut tell = Vec::new();
+            for (r, owing) in g.owing.iter_mut().enumerate() {
+                if owing.contains(&source) {
+                    owing.retain(|s| *s != source);
+                    tell.push((g.rank_hosts[r], r as u32, owing.clone()));
+                }
+            }
+            (g.streaming.is_empty(), tell)
         };
+        let (all_done, tell) = all_done;
         if all_done {
             self.finish(group).await;
+            return;
+        }
+        for (host, rank, sources) in tell {
+            let _ = self
+                .send(
+                    host,
+                    PushMsg::Sources {
+                        group,
+                        rank,
+                        sources,
+                    },
+                )
+                .await;
         }
     }
 
@@ -1142,26 +1269,52 @@ impl Push {
         }
     }
 
-    /// Fail groups that made no progress for `STALL`.
+    /// Fail groups that made no progress for `STALL`; report this host's
+    /// live ranks' rings to their hubs.
     fn sweep(self: &Arc<Self>) {
-        let stale: Vec<u64> = {
+        let stale: Vec<(u64, String)> = {
             let st = self.state.lock();
             st.hub
                 .iter()
                 .filter(|(_, g)| g.started && g.progress_at.elapsed() > STALL)
-                .map(|(id, _)| *id)
+                .map(|(id, g)| {
+                    let why = g.stall_reason().map_or(String::new(), |w| format!(": {w}"));
+                    (*id, format!("no progress for {} s{why}", STALL.as_secs()))
+                })
                 .collect()
         };
-        for g in stale {
+        for (g, why) in stale {
+            let me = self.clone();
+            tokio::spawn(async move { me.fail(g, why, Vec::new()).await });
+        }
+        let live: Vec<(NodeId, u64, u32, RingState)> = {
+            let st = self.state.lock();
+            st.ranks
+                .iter()
+                .filter(|(_, r)| r.ring.is_some() && !r.done_sent)
+                .map(|((g, k), r)| (r.hub, *g, *k, r.ring_state()))
+                .collect()
+        };
+        for (hub, group, rank, ring) in live {
             let me = self.clone();
             tokio::spawn(async move {
-                me.fail(
-                    g,
-                    format!("no progress for {} s", STALL.as_secs()),
-                    Vec::new(),
-                )
-                .await
+                let _ = me.send(hub, PushMsg::RankState { group, rank, ring }).await;
             });
+        }
+    }
+
+    /// A rank host's report of its rank's ring (hub).
+    fn rank_state(&self, group: u64, rank: u32, ring: RingState) {
+        let mut st = self.state.lock();
+        if let Some(g) = st.hub.get_mut(&group) {
+            g.rings.insert(rank, ring.clone());
+        }
+        if let Some(r) = st.history.get_mut(group) {
+            let n = r.ranks.len();
+            r.rings.resize(n, None);
+            if let Some(x) = r.rings.get_mut(rank as usize) {
+                *x = Some(ring);
+            }
         }
     }
 
@@ -1188,6 +1341,9 @@ impl Push {
                 sources: Vec::new(),
                 next: 0,
                 done_sent: false,
+                joined_at: None,
+                released: 0,
+                last_release: None,
             },
         );
         Ok(())
@@ -1232,6 +1388,7 @@ impl Push {
             }
             r.ring = Some(Arc::new(ring));
             r.engine = Some(engine);
+            r.joined_at = Some(tokio::time::Instant::now());
             (r.hub, b)
         };
         {
@@ -1254,9 +1411,28 @@ impl Push {
         .await
     }
 
+    /// The sources owing this rank, at Start and again whenever one
+    /// finishes: grants held by a source no longer listed come back (it
+    /// will fill none of them).
     fn rank_sources(self: &Arc<Self>, group: u64, rank: u32, sources: Vec<NodeId>) {
-        if let Some(r) = self.state.lock().ranks.get_mut(&(group, rank)) {
+        {
+            let mut st = self.state.lock();
+            let Some(r) = st.ranks.get_mut(&(group, rank)) else {
+                return;
+            };
+            let back: Vec<u32> = r
+                .granted
+                .iter()
+                .filter(|(_, (s, _))| !sources.contains(s))
+                .map(|(slot, _)| *slot)
+                .collect();
+            for slot in &back {
+                r.granted.remove(slot);
+                r.free.push(*slot);
+            }
             r.sources = sources;
+            let b = r.ring.as_ref().map_or(0, |x| x.slot_bytes as u64);
+            st.granted_bytes = st.granted_bytes.saturating_sub(b * back.len() as u64);
         }
         self.grant(group, rank);
     }
@@ -1457,6 +1633,8 @@ impl Push {
             };
             if r.ring.as_ref().is_some_and(|ring| slot < ring.slots) && !r.free.contains(&slot) {
                 r.free.push(slot);
+                r.released += 1;
+                r.last_release = Some(tokio::time::Instant::now());
             }
         }
         self.grant(group, rank);
@@ -1775,9 +1953,29 @@ impl Push {
         // had not finished fails it.
         if let Some(g) = owns_group {
             let me = self.clone();
+            // A coordinator that gives up on a stalled load: say why it stalled.
+            let why = {
+                let st = self.state.lock();
+                st.hub
+                    .get(&g)
+                    .filter(|h| h.started && h.progress_at.elapsed() > STALL_NOTE)
+                    .and_then(|h| {
+                        h.stall_reason().map(|w| {
+                            format!(
+                                "; no progress for {} s: {w}",
+                                h.progress_at.elapsed().as_secs()
+                            )
+                        })
+                    })
+                    .unwrap_or_default()
+            };
             rt.spawn(async move {
-                me.fail(g, "the coordinator closed its socket".into(), Vec::new())
-                    .await
+                me.fail(
+                    g,
+                    format!("the coordinator closed its socket{why}"),
+                    Vec::new(),
+                )
+                .await
             });
         }
         if let Some((g, r)) = owns_rank {
@@ -1816,6 +2014,8 @@ struct Counters {
     bytes: Vec<AtomicU64>,
     rdma: AtomicU64,
     rpc: AtomicU64,
+    /// Slots to a rank on this host: no network.
+    local: AtomicU64,
 }
 
 impl Counters {
@@ -1837,6 +2037,7 @@ impl Counters {
                 .collect(),
             rdma: self.rdma.load(Ordering::Relaxed),
             rpc: self.rpc.load(Ordering::Relaxed),
+            local: self.local.load(Ordering::Relaxed),
         }
     }
 }
@@ -2054,8 +2255,13 @@ impl Stream {
                     Err(e) => tracing::debug!(error = %e, "push write over RDMA failed; using RPC"),
                 }
             }
-            push.rpc_slots.fetch_add(1, Ordering::Relaxed);
-            c.rpc.fetch_add(1, Ordering::Relaxed);
+            if to == me {
+                // This host's own rank: handed over in memory.
+                c.local.fetch_add(1, Ordering::Relaxed);
+            } else {
+                push.rpc_slots.fetch_add(1, Ordering::Relaxed);
+                c.rpc.fetch_add(1, Ordering::Relaxed);
+            }
             push.send_bulk(
                 to,
                 PushMsg::Slot {

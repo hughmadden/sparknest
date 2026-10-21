@@ -19,6 +19,8 @@
     bins: number[][][];
     rdma_slots: number[];
     rpc_slots: number[];
+    /** Slots to a rank on the source's own host (no network). */
+    local_slots?: number[];
     source_done_ms: (number | null)[];
     rank_done_ms: (number | null)[];
   };
@@ -104,6 +106,7 @@
   const binS = $derived(full ? full.bin_ms / 1000 : 0.25);
   const rdma = $derived(full ? full.rdma_slots.reduce((a, b) => a + b, 0) : 0);
   const rpc = $derived(full ? full.rpc_slots.reduce((a, b) => a + b, 0) : 0);
+  const local = $derived(full?.local_slots ? full.local_slots.reduce((a, b) => a + b, 0) : 0);
   const slowestSrc = $derived.by(() => {
     if (!full) return null;
     let i = -1, v = -1;
@@ -175,7 +178,7 @@
         <div class="tile panel"><div class="caps">Time</div><div class="big">{duration(full.elapsed_ms)}</div><div class="small muted">{full.outcome}{full.reason ? `: ${full.reason}` : ""}</div></div>
         <div class="tile panel hot"><div class="caps">Rate</div><div class="big">{gbps(full.total_bytes, secs)}</div><div class="small muted">peak {gbps(peakBin, binS)} · {gbps(perRank, secs)} per rank</div></div>
         <div class="tile panel"><div class="caps">Slowest</div><div class="big small2">{slowestSrc?.name ?? "—"}</div><div class="small muted">source {slowestSrc && isFinite(slowestSrc.ms) ? duration(slowestSrc.ms) : "…"} · rank {slowestRank?.name ?? ""} {slowestRank && isFinite(slowestRank.ms) ? duration(slowestRank.ms) : "…"}</div></div>
-        <div class="tile panel" class:bad={rpc > rdma / 10}><div class="caps">By RDMA</div><div class="big">{rdma + rpc ? Math.round((100 * rdma) / (rdma + rpc)) : 0}%</div><div class="small muted">{rdma} slots by NIC writes, {rpc} by RPC</div></div>
+        <div class="tile panel" class:bad={rpc > rdma / 10}><div class="caps">Over the network</div><div class="big">{rdma + rpc ? Math.round((100 * rdma) / (rdma + rpc)) : 0}% RDMA</div><div class="small muted">{rdma} slots by NIC writes, {rpc} by fallback{local ? `; ${local} on the same host` : ""}</div></div>
       </div>
 
       <div class="panel pad">
