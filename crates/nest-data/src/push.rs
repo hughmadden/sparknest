@@ -274,6 +274,13 @@ struct RankSlot {
     free: Vec<u32>,
     /// Ring slots granted and not yet filled: to which source, which grant.
     granted: HashMap<u32, (NodeId, u64)>,
+    /// Those of `granted` given as a source's floor, outside the host's
+    /// budget (`push-grant-floor`).
+    floor: std::collections::HashSet<u32>,
+    /// The floor and the host's incast budget, read once at Join: fixed
+    /// for the group (a setting changed mid-load applies to the next).
+    floor_n: usize,
+    budget: u64,
     /// The next grant's `seq`.
     next_seq: u64,
     /// The ring registered with this host's fabric (RDMA delivery).
@@ -361,9 +368,8 @@ impl State {
     /// Return a departing rank's outstanding grants to the budget.
     fn release_grants(&mut self, r: &RankSlot) {
         let b = r.ring.as_ref().map_or(0, |x| x.slot_bytes as u64);
-        self.granted_bytes = self
-            .granted_bytes
-            .saturating_sub(b * r.granted.len() as u64);
+        let budgeted = r.granted.len() - r.floor.len();
+        self.granted_bytes = self.granted_bytes.saturating_sub(b * budgeted as u64);
     }
 }
 
@@ -1236,6 +1242,7 @@ impl Push {
 
     /// End the group everywhere with `reason`.
     async fn fail(self: &Arc<Self>, group: u64, reason: String, missing: Vec<Missing>) {
+        tracing::info!(group, %reason, "push group failed; telling its hosts");
         self.record_end(
             group,
             crate::push_record::Outcome::Failed,
@@ -1257,7 +1264,7 @@ impl Push {
             h
         };
         for h in hosts {
-            let _ = self
+            let sent = self
                 .send(
                     h,
                     PushMsg::End {
@@ -1266,6 +1273,9 @@ impl Push {
                     },
                 )
                 .await;
+            if let Err(e) = sent {
+                tracing::warn!(group, host = %h, error = %e, "push End not delivered");
+            }
         }
     }
 
@@ -1335,6 +1345,9 @@ impl Push {
                 reported: 0,
                 free: Vec::new(),
                 granted: HashMap::new(),
+                floor: Default::default(),
+                floor_n: 1,
+                budget: 64 << 20,
                 next_seq: 0,
                 rdma: None,
                 token_id: 0,
@@ -1358,6 +1371,7 @@ impl Push {
         ring: Ring,
         engine: EngineTx,
     ) -> NestResult<()> {
+        let (budget, floor_n) = (self.budget(), self.floor());
         let (hub, slot_bytes) = {
             let mut st = self.state.lock();
             let r = st
@@ -1371,6 +1385,7 @@ impl Push {
                 return Err(invalid("rank already joined"));
             }
             r.free = (0..ring.slots).rev().collect();
+            (r.budget, r.floor_n) = (budget, floor_n);
             let b = ring.slot_bytes;
             // With a fabric, sources' NICs write straight into the ring;
             // a ring the NIC cannot register is filled over RPC instead.
@@ -1426,41 +1441,74 @@ impl Push {
                 .filter(|(_, (s, _))| !sources.contains(s))
                 .map(|(slot, _)| *slot)
                 .collect();
+            let mut budgeted = 0;
             for slot in &back {
                 r.granted.remove(slot);
+                if !r.floor.remove(slot) {
+                    budgeted += 1;
+                }
                 r.free.push(*slot);
             }
             r.sources = sources;
             let b = r.ring.as_ref().map_or(0, |x| x.slot_bytes as u64);
-            st.granted_bytes = st.granted_bytes.saturating_sub(b * back.len() as u64);
+            st.granted_bytes = st.granted_bytes.saturating_sub(b * budgeted);
         }
         self.grant(group, rank);
     }
 
-    /// Hand free ring slots to sources as grants, round robin, while this
-    /// host's grants outstanding stay within the incast budget.
+    /// Hand free ring slots to sources as grants: first each owing source's
+    /// floor (`push-grant-floor` grants of this rank held at once, outside
+    /// the budget),
+    /// then round robin while this host's grants outstanding stay within the
+    /// incast budget.
+    ///
+    /// The floor is what keeps two ranks on one host live: sources stream
+    /// in file order, so a source blocked on rank B's credit holds rank A's
+    /// grants unfilled; with one budget for both ranks, A's parked grants
+    /// could take all of it and B never get one (group 120235912134667).
     fn grant(self: &Arc<Self>, group: u64, rank: u32) {
         let mut out: Vec<(NodeId, Vec<Grant>)> = Vec::new();
         {
-            let budget = self.budget();
             let mut st = self.state.lock();
             let mut granted = st.granted_bytes;
             let Some(r) = st.ranks.get_mut(&(group, rank)) else {
                 return;
             };
+            let (budget, floor_n) = (r.budget, r.floor_n);
             if r.sources.is_empty() {
                 return;
             }
             let slot_bytes = r.ring.as_ref().map_or(0, |x| x.slot_bytes) as u64;
-            // At least one grant per rank even past the budget (a ring slot
-            // larger than it must still move).
-            while granted + slot_bytes <= budget || (granted == 0 && r.granted.is_empty()) {
+            // Each owing source's floor first, then the budget's round robin.
+            let mut held: HashMap<NodeId, usize> = HashMap::new();
+            for (s, _) in r.granted.values() {
+                *held.entry(*s).or_default() += 1;
+            }
+            let mut floor: VecDeque<NodeId> = r
+                .sources
+                .iter()
+                .flat_map(|s| {
+                    let need = floor_n.saturating_sub(held.get(s).copied().unwrap_or(0));
+                    std::iter::repeat_n(*s, need)
+                })
+                .collect();
+            loop {
+                let (s, is_floor) = if let Some(s) = floor.pop_front() {
+                    (s, true)
+                } else if granted + slot_bytes <= budget {
+                    let s = r.sources[r.next % r.sources.len()];
+                    r.next = r.next.wrapping_add(1);
+                    (s, false)
+                } else {
+                    break;
+                };
                 let Some(slot) = r.free.pop() else { break };
-                let s = r.sources[r.next % r.sources.len()];
-                r.next = r.next.wrapping_add(1);
                 let seq = r.next_seq;
                 r.next_seq += 1;
                 r.granted.insert(slot, (s, seq));
+                if is_floor {
+                    r.floor.insert(slot);
+                }
                 let target = r
                     .rdma
                     .as_ref()
@@ -1470,7 +1518,9 @@ impl Push {
                     Some((_, v)) => v.push(g),
                     None => out.push((s, vec![g])),
                 }
-                granted += slot_bytes;
+                if !is_floor {
+                    granted += slot_bytes;
+                }
             }
             st.granted_bytes = granted;
         }
@@ -1542,9 +1592,12 @@ impl Push {
             if r.granted.remove(&slot).is_none() {
                 return Err(invalid("a slot without a credit"));
             }
-            // The slot is no longer in flight: its budget is free.
-            let b = ring.slot_bytes as u64;
-            st.granted_bytes = st.granted_bytes.saturating_sub(b);
+            // The slot is no longer in flight: its budget is free (a floor
+            // grant never took any).
+            if !r.floor.remove(&slot) {
+                let b = ring.slot_bytes as u64;
+                st.granted_bytes = st.granted_bytes.saturating_sub(b);
+            }
             let r = st.ranks.get_mut(&(group, rank)).expect("present");
             let p = match slot::parse(ring.slot(slot), r.arena) {
                 Ok(p) => p,
@@ -1599,12 +1652,22 @@ impl Push {
     }
 
     /// The incast budget: what this host lets sources have in flight at
-    /// once toward its rings (the fabric's, or 64 MiB without one).
+    /// once toward its rings: `push-incast-mib`, else the fabric's read
+    /// budget, or 64 MiB without a fabric.
     fn budget(&self) -> u64 {
-        self.vfs()
-            .ok()
-            .and_then(|v| v.fabric())
-            .map_or(64 << 20, |f| f.incast_bytes())
+        let Ok(v) = self.vfs() else { return 64 << 20 };
+        match v.setting(nest_types::Setting::PushIncastMib) {
+            0 => v.fabric().map_or(64 << 20, |f| f.incast_bytes()),
+            mib => mib << 20,
+        }
+    }
+
+    /// Grants of a rank each owing source always holds (`push-grant-floor`,
+    /// at least 1).
+    fn floor(&self) -> usize {
+        self.vfs().map_or(1, |v| {
+            v.setting(nest_types::Setting::PushGrantFloor).max(1) as usize
+        })
     }
 
     fn report(self: &Arc<Self>, group: u64, rank: u32, hub: NodeId, bytes: u64, complete: bool) {
@@ -1686,6 +1749,7 @@ impl Push {
     /// `End` for `group`: drop this host's part of it.
     fn end_here(&self, group: u64, reason: &str) {
         let mut st = self.state.lock();
+        let mut failed_ranks = Vec::new();
         let ranks: Vec<(u64, u32)> = st
             .ranks
             .keys()
@@ -1701,12 +1765,14 @@ impl Push {
                 && let Some(e) = r.engine
                 && !r.done_sent
             {
+                failed_ranks.push(k.1);
                 let _ = e.send(Event::Failed {
                     reason: reason.to_string(),
                     missing: Vec::new(),
                 });
             }
         }
+        tracing::info!(group, %reason, ranks = ?failed_ranks, "push group ended here; ranks told");
         if let Some(s) = st.sources.get_mut(&group) {
             s.cancelled = true;
             s.notify.notify_waiters();

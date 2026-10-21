@@ -1135,3 +1135,234 @@ async fn two_ranks_on_the_hub_which_is_also_a_source() {
     let i1 = full.sources.iter().position(|s| s == "n1").unwrap();
     assert!(full.local_slots[i1] > 0, "{:?}", full.local_slots);
 }
+
+/// Two ranks on one host must not deadlock on that host's incast budget
+/// (group 120235912134667). Each file's first half is rank 0's and its
+/// second half rank 1's, both on node 1; sources stream in file order, so
+/// every source fills rank 0's grants first and then blocks on rank 1.
+/// With a budget of a few slots, rank 0's grants held at sources blocked
+/// on rank 1 used it all, and rank 1 never got a grant. Each owing source's
+/// floor grant, outside the budget, keeps the load moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_ranks_on_one_host_share_its_budget_without_deadlock() {
+    let c = ready(3).await;
+    let half = 8usize << 20;
+    let files: Vec<Vec<u8>> = (0..4)
+        .map(|f| {
+            (0..2 * half)
+                .map(|i| ((i * 7 + f * 31) % 251) as u8)
+                .collect()
+        })
+        .collect();
+    for (f, data) in files.iter().enumerate() {
+        sealed(&c, 2 + (f as u64 % 2), &format!("f{f}.bin"), data.clone()).await;
+    }
+    // Three slots of budget on node 1, for two ranks fed by two sources,
+    // through the cluster setting (read at Join).
+    let slot_bytes = 1u32 << 20;
+    c.node(1)
+        .meta
+        .propose(nest_meta::Command::SetSetting {
+            name: nest_types::Setting::PushIncastMib.name().into(),
+            value: Some(3),
+        })
+        .await
+        .unwrap();
+    c.converge().await;
+    c.eventually("the budget applies", Duration::from_secs(5), |c| {
+        c.node(1).vfs.setting(nest_types::Setting::PushIncastMib) == 3
+    })
+    .await;
+    let patterns = vec![Pattern {
+        run: half as u32,
+        dims: vec![],
+    }];
+    let mut entries = Vec::new();
+    for f in 0..4u32 {
+        for r in 0..2u32 {
+            entries.push(Entry {
+                file: f,
+                pattern: 0,
+                src_base: r as u64 * half as u64,
+                dst_base: f as u64 * half as u64,
+                rank: r,
+            });
+        }
+    }
+    let arena = 4 * half as u64;
+    let slots = 32u32;
+    let hub = c.push_socket(1);
+    let sock = c.push_socket(1);
+    let arenas = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(20));
+        let specs = (0..2u32)
+            .map(|r| RankSpec {
+                rank: r,
+                host: "n1".into(),
+                arena_bytes: arena,
+            })
+            .collect();
+        let names = (0..4).map(|f| format!("/f{f}.bin")).collect();
+        let g = Coordinator::create(&hub, specs, names, t).map_err(|e| format!("create: {e}"))?;
+        g.patterns(patterns).unwrap();
+        g.entries(entries).unwrap();
+        let (group, token) = (g.group, g.token);
+        let ranks: Vec<_> = (0..2u32)
+            .map(|r| {
+                let ring = memfd(slots as usize * slot_bytes as usize);
+                let k = Rank::join(
+                    &sock,
+                    JoinArgs {
+                        group,
+                        token,
+                        rank: r,
+                        ring_fd: ring.as_raw_fd(),
+                        slots,
+                        slot_bytes,
+                    },
+                    t,
+                )
+                .map_err(|e| format!("join {r}: {e}"))?;
+                Ok(std::thread::spawn(move || {
+                    run_rank(k, ring, slots, slot_bytes, arena as usize)
+                }))
+            })
+            .collect::<Result<_, String>>()?;
+        g.start().map_err(|e| format!("start: {e}"))?;
+        let arenas = ranks
+            .into_iter()
+            .enumerate()
+            .map(|(i, h): (usize, std::thread::JoinHandle<_>)| {
+                h.join().unwrap().map_err(|e| format!("rank {i}: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, String>(arenas)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    for (r, got) in arenas.iter().enumerate() {
+        for (f, data) in files.iter().enumerate() {
+            let want = &data[r * half..(r + 1) * half];
+            assert!(&got[f * half..(f + 1) * half] == want, "rank {r}, file {f}");
+        }
+    }
+}
+
+/// One rank per host can deadlock too (group 120235912134669). Grants of a
+/// rank go round robin to every source owing it, needed yet or not. Node
+/// 1's file opens with a long stretch for rank 1 (the coordinator's dense
+/// tensors) and nodes 2 and 3 open with stretches for rank 0 (experts):
+/// each grant of rank 0 handed to node 1 stays there unfilled, so within a
+/// few cycles all of rank 0's budget is parked at node 1, and all of rank
+/// 1's at nodes 2 and 3. Each owing source's floor grant, outside the
+/// budget, keeps every source moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn grants_parked_at_busy_sources_do_not_deadlock_one_rank_per_host() {
+    let c = ready(3).await;
+    let stretch = 16usize << 20;
+    let files: Vec<Vec<u8>> = (0..3)
+        .map(|f| {
+            (0..2 * stretch)
+                .map(|i| ((i * 13 + f * 17) % 251) as u8)
+                .collect()
+        })
+        .collect();
+    for (f, data) in files.iter().enumerate() {
+        sealed(&c, 1 + f as u64, &format!("p{f}.bin"), data.clone()).await;
+    }
+    c.node(1)
+        .meta
+        .propose(nest_meta::Command::SetSetting {
+            name: nest_types::Setting::PushIncastMib.name().into(),
+            value: Some(3),
+        })
+        .await
+        .unwrap();
+    c.converge().await;
+    c.eventually("the budget applies", Duration::from_secs(5), |c| {
+        (1..=3).all(|i| c.node(i).vfs.setting(nest_types::Setting::PushIncastMib) == 3)
+    })
+    .await;
+    let patterns = vec![Pattern {
+        run: stretch as u32,
+        dims: vec![],
+    }];
+    // File 0 (node 1): rank 1 first, then rank 0. Files 1 and 2: rank 0
+    // first, then rank 1. Arena: file f's stretch for a rank at f·stretch.
+    let mut entries = Vec::new();
+    for f in 0..3u32 {
+        for r in 0..2u32 {
+            let first = if f == 0 { 1 } else { 0 };
+            let half = if r == first { 0 } else { 1 };
+            entries.push(Entry {
+                file: f,
+                pattern: 0,
+                src_base: half * stretch as u64,
+                dst_base: f as u64 * stretch as u64,
+                rank: r,
+            });
+        }
+    }
+    let expect = entries.clone();
+    let arena = 3 * stretch as u64;
+    let (slots, slot_bytes) = (32u32, 1u32 << 20);
+    let hub = c.push_socket(1);
+    let socks = [c.push_socket(2), c.push_socket(3)];
+    let got = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(20));
+        let specs = (0..2u32)
+            .map(|r| RankSpec {
+                rank: r,
+                host: format!("n{}", r + 2),
+                arena_bytes: arena,
+            })
+            .collect();
+        let names = (0..3).map(|f| format!("/p{f}.bin")).collect();
+        let g = Coordinator::create(&hub, specs, names, t).map_err(|e| format!("create: {e}"))?;
+        g.patterns(patterns).unwrap();
+        g.entries(entries).unwrap();
+        let (group, token) = (g.group, g.token);
+        let ranks: Vec<_> = (0..2u32)
+            .map(|r| {
+                let ring = memfd(slots as usize * slot_bytes as usize);
+                let k = Rank::join(
+                    &socks[r as usize],
+                    JoinArgs {
+                        group,
+                        token,
+                        rank: r,
+                        ring_fd: ring.as_raw_fd(),
+                        slots,
+                        slot_bytes,
+                    },
+                    t,
+                )
+                .map_err(|e| format!("join {r}: {e}"))?;
+                Ok(std::thread::spawn(move || {
+                    run_rank(k, ring, slots, slot_bytes, arena as usize)
+                }))
+            })
+            .collect::<Result<_, String>>()?;
+        g.start().map_err(|e| format!("start: {e}"))?;
+        ranks
+            .into_iter()
+            .enumerate()
+            .map(|(i, h): (usize, std::thread::JoinHandle<_>)| {
+                h.join().unwrap().map_err(|e| format!("rank {i}: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    for e in &expect {
+        let (s, d) = (e.src_base as usize, e.dst_base as usize);
+        assert!(
+            got[e.rank as usize][d..d + stretch] == files[e.file as usize][s..s + stretch],
+            "rank {}, file {}",
+            e.rank,
+            e.file
+        );
+    }
+}

@@ -2116,6 +2116,36 @@ changing it needs a new amendment and notice to the engine.
   ring (grants go round robin). A file, and so any tensor inside it,
   comes from one source.
 
+**Amendment (2026-10-22): a floor of grants per source, outside the
+budget.** The first group with two ranks on one host (120235912134667:
+six Sparks, and raptor's two GPUs as ranks 6 and 7) stopped in its first
+half second. Raptor's incast budget (95 MiB) covers both of its ranks.
+Rank 6's grants took all of it, held unfilled by sources that were
+blocked on rank 7 (each source streams in file order, and every file feeds
+every rank), so rank 7 never got a grant. A rank host now first gives each
+source owing a rank a floor of grants of that rank (`push-grant-floor`,
+default 1), outside the budget, and only then grants round robin within
+the budget. Freeing budget to the other rank alone still deadlocks (a CPU
+model of the policy, cuteafd commit 48fe74c4a): the floor's grants must not
+count against it. The cost is at most floor × sources × ranks on the host
+extra slots in flight (12 MiB on raptor). The budget itself is now a
+cluster setting too (`push-incast-mib`, 0: the fabric's read budget), so
+both can be tuned without a redeploy. A rank host reads both when the rank
+joins and keeps them for the group: a change applies to the next load,
+never mid-load. A test with two ranks on one host and a 3-slot
+budget fails without the floor and passes with it.
+
+The same gap stalled a load with one rank per host (120235912134669:
+ranks on ostrich, dodo and raptor; six Spark sources). A rank's grants go
+round robin to every source owing it, needed yet or not. Kiwi was
+streaming coordinator tensors only, so each grant of the Spark ranks
+handed to it stayed unfilled; within 0.3 s all of both Spark ranks'
+grants sat at kiwi, and all of raptor's at the five sources busy with
+experts. Each side held what the other needed. The floor fixes this shape
+too: each source always holds a grant of every rank it owes. A second
+test reproduces it (a source opening with another rank's stretch) and
+fails without the floor.
+
 ## ADR-064 — Placement readable through the mount (2026-10-21)
 
 **Context.** The engine's containers see the hub only through the mount;

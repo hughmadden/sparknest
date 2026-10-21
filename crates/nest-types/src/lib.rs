@@ -282,6 +282,13 @@ pub enum Setting {
     /// Control traffic between fabric hosts on the LAN while it answers,
     /// the fabric the fallback (ADR-068). 1 on, 0 off.
     ControlOnLan,
+    /// Push grants of a rank each owing source always holds, outside the
+    /// host's incast budget (ADR-063). At least 1: below it, two ranks on
+    /// one host can deadlock.
+    PushGrantFloor,
+    /// Push bytes a host lets sources have in flight toward its rings
+    /// (MiB); 0 is the fabric's read budget.
+    PushIncastMib,
 }
 
 impl Setting {
@@ -289,6 +296,8 @@ impl Setting {
         Setting::ReadRecoveryWait,
         Setting::PreferredLeader,
         Setting::ControlOnLan,
+        Setting::PushGrantFloor,
+        Setting::PushIncastMib,
     ];
 
     pub fn name(self) -> &'static str {
@@ -296,6 +305,8 @@ impl Setting {
             Setting::ReadRecoveryWait => "read-recovery-wait",
             Setting::PreferredLeader => "preferred-leader",
             Setting::ControlOnLan => "control-on-lan",
+            Setting::PushGrantFloor => "push-grant-floor",
+            Setting::PushIncastMib => "push-incast-mib",
         }
     }
 
@@ -308,6 +319,8 @@ impl Setting {
             Setting::ReadRecoveryWait => 5_000,
             Setting::PreferredLeader => 0,
             Setting::ControlOnLan => 1,
+            Setting::PushGrantFloor => 1,
+            Setting::PushIncastMib => 0,
         }
     }
 
@@ -316,6 +329,8 @@ impl Setting {
             Setting::ReadRecoveryWait => "ms",
             Setting::PreferredLeader => "node",
             Setting::ControlOnLan => "0/1",
+            Setting::PushGrantFloor => "grants",
+            Setting::PushIncastMib => "MiB",
         }
     }
 
@@ -330,6 +345,12 @@ impl Setting {
             Setting::ControlOnLan => {
                 "control traffic on the 10G LAN while it answers, the fabric the fallback (0: fabric first)"
             }
+            Setting::PushGrantFloor => {
+                "push grants per rank each sending source always holds, outside the incast budget"
+            }
+            Setting::PushIncastMib => {
+                "push bytes in flight toward one host's rings (0: the fabric's read budget)"
+            }
         }
     }
 
@@ -339,6 +360,8 @@ impl Setting {
             Setting::ReadRecoveryWait => (0, 120_000),
             Setting::PreferredLeader => (0, u32::MAX as u64),
             Setting::ControlOnLan => (0, 1),
+            Setting::PushGrantFloor => (1, 64),
+            Setting::PushIncastMib => (0, 4096),
         }
     }
 
