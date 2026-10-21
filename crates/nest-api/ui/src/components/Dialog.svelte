@@ -43,8 +43,11 @@
 {/if}
 
 <style>
-  .bg { position: fixed; inset: 0; z-index: 85; background: rgba(1, 4, 12, 0.6); display: grid; place-items: center; padding: 16px; backdrop-filter: blur(3px); }
-  .dlg { width: min(460px, 100%); padding: 20px; animation: rise 0.2s ease-out; background: rgba(8, 16, 34, 0.94); }
+  .bg { position: fixed; inset: 0; z-index: 85; grid-template-columns: minmax(0, 1fr); background: rgba(1, 4, 12, 0.6); display: grid; place-items: center; padding: 16px; backdrop-filter: blur(3px); }
+  /* min-width 0: a long unbroken title (a blob path) must not widen the
+     dialog past the screen; it wraps instead. */
+  .dlg { width: min(460px, 100%); min-width: 0; max-height: calc(100dvh - 32px); overflow: auto; padding: 20px; animation: rise 0.2s ease-out; background: rgba(8, 16, 34, 0.94); }
+  h3, p { overflow-wrap: anywhere; }
   p { margin: 8px 0 0; }
   .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-top: 14px; max-height: 50vh; overflow: auto; scrollbar-gutter: stable; }
   .opt { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: rgba(12, 26, 52, 0.55); cursor: pointer; text-align: left; }

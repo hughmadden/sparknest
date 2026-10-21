@@ -246,9 +246,9 @@
 {/if}
 
 <style>
-  .bg { position: fixed; inset: 0; z-index: 85; background: rgba(1, 4, 12, 0.6); display: grid; place-items: center; padding: 16px; backdrop-filter: blur(3px); }
-  .dlg { width: min(560px, 100%); padding: 20px; display: flex; flex-direction: column; gap: 12px; background: rgba(8, 16, 34, 0.94); animation: rise 0.2s ease-out; }
-  h3 { margin: 0; }
+  .bg { position: fixed; inset: 0; z-index: 85; background: rgba(1, 4, 12, 0.6); display: grid; grid-template-columns: minmax(0, 1fr); place-items: center; padding: 16px; backdrop-filter: blur(3px); }
+  .dlg { width: min(560px, 100%); max-height: calc(100dvh - 32px); overflow: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; background: rgba(8, 16, 34, 0.94); animation: rise 0.2s ease-out; }
+  h3 { margin: 0; overflow-wrap: anywhere; }
   input[type="search"] { width: 100%; }
   .hits { display: flex; flex-direction: column; gap: 4px; max-height: 40vh; overflow: auto; scrollbar-gutter: stable; }
   .hit { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: rgba(12, 26, 52, 0.55); cursor: pointer; text-align: left; }

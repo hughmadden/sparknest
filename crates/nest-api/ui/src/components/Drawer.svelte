@@ -20,7 +20,7 @@
 <style>
   /* A window floating in the middle of the screen, never taller than it:
      its content scrolls inside. */
-  .layer { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 16px; }
+  .layer { position: fixed; inset: 0; z-index: 60; grid-template-columns: minmax(0, 1fr); display: grid; place-items: center; padding: 16px; }
   .scrim { position: absolute; inset: 0; background: rgba(1, 4, 12, 0.45); animation: fade 0.2s; }
   .drawer { position: relative; width: min(680px, 100%); max-height: 100%; overflow: auto; scrollbar-gutter: stable; padding: 22px; background: rgba(6, 13, 30, 0.8); animation: pop 0.24s cubic-bezier(0.2, 0.8, 0.2, 1); }
   .drawer.wide { width: min(1040px, 100%); }
