@@ -161,6 +161,10 @@ enum Cmd {
         /// 1 (everywhere); a fraction like 2/7 or a number (default 1).
         #[arg(long, requires = "place")]
         factor: Option<String>,
+        /// --place: size each host's share by its measured disk read rate
+        /// instead of evenly (push loads then finish on every host together).
+        #[arg(long, requires = "place")]
+        by_speed: bool,
         /// Keep a full copy of a selection on exactly the off-grid hosts
         /// given with --host (none: no off-grid copies); copies on other
         /// off-grid hosts go, never the last one. Fabric hosts are untouched.
@@ -325,6 +329,10 @@ Examples:
   Spread a model over three hosts, one copy of each file; or everywhere:
     nest plan --place hf:Qwen/Qwen3-8B --host dodo --host kiwi --host emu --factor 1/3
     nest plan --place hf:Qwen/Qwen3-8B
+  One copy spread over the Sparks, each holding a share sized by its disk
+  read rate (push loads then finish on every host together):
+    nest plan --place hf:moonshotai/Kimi-K2 --host ostrich --host dodo --host emu \
+      --host kiwi --host rhea --host moa --factor 1/6 --by-speed
   A full copy on off-grid hosts (kakapo and oliver), or on none of them:
     nest plan --offgrid hf:Qwen/Qwen3-8B --host kakapo --host oliver
     nest plan --offgrid hf:Qwen/Qwen3-8B
@@ -1577,6 +1585,7 @@ async fn main() -> Result<()> {
             consolidate,
             place,
             factor,
+            by_speed,
             offgrid,
             hosts,
             min,
@@ -1592,7 +1601,7 @@ async fn main() -> Result<()> {
                         None => f.trim().parse::<f64>()?,
                     },
                 };
-                json!({ "goal": "place", "selector": abspath(sel), "hosts": hosts, "factor": factor })
+                json!({ "goal": "place", "selector": abspath(sel), "hosts": hosts, "factor": factor, "by_speed": by_speed })
             } else if let Some(sel) = consolidate {
                 json!({ "goal": "consolidate", "selector": abspath(sel), "host": hosts.first() })
             } else if let Some(w) = tidy {

@@ -1836,11 +1836,13 @@ async fn make_plan(State(api): State<Api>, Json(r): Json<PlanReq>) -> R<serde_js
                             selector,
                             hosts,
                             factor,
+                            by_speed,
                             ..
                         }) => nest_place::plan::Goal::Place {
                             selector: api.selector_string(&selector),
                             hosts,
                             factor,
+                            by_speed,
                             hub: api.hub.clone(),
                         },
                         PlanReq::Goal(nest_place::plan::Goal::Offgrid {

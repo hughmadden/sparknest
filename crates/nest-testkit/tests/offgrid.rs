@@ -340,6 +340,7 @@ async fn offgrid_placement_place_and_offload() {
         selector: "/m".into(),
         hosts: hosts.iter().map(|h| h.to_string()).collect(),
         factor,
+        by_speed: false,
         hub: "/hub".into(),
     };
     assert!(p.plan(place(&["n4"], 1.0)).await.is_err());

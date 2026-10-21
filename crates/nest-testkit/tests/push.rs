@@ -489,6 +489,18 @@ async fn a_coordinator_that_leaves_cancels_the_ranks() {
 /// WRITE_WITH_IMM into the rank's registered ring, none by RPC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn over_rdma_slots_land_by_nic_writes() {
+    over_rdma(0).await;
+}
+
+/// A write that landed but whose completion was lost (the lane failed
+/// first) is sent again by RPC: the duplicate is dropped, the load
+/// completes with every byte right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_landed_slot_sent_again_by_rpc_is_dropped() {
+    over_rdma(5).await;
+}
+
+async fn over_rdma(lost_acks: u64) {
     if nest_fabric::discover(&[]).is_empty() {
         return;
     }
@@ -519,6 +531,7 @@ async fn over_rdma_slots_land_by_nic_writes() {
         .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
         .collect();
     sealed(&c, 2, "big.bin", data.clone()).await;
+    c.node(2).push.lose_rdma_acks(lost_acks);
     // Rank 0 on node 3 takes even 4 KiB runs, rank 1 on node 1 odd ones.
     let run = 4096u32;
     let rows = (len / (2 * run as usize)) as u32;
@@ -639,9 +652,12 @@ async fn over_rdma_slots_land_by_nic_writes() {
         assert!(got == &want, "rank {r}");
     }
     // Both ranks are remote from the source (node 2): every slot went by
-    // RDMA, none fell back to RPC.
+    // RDMA, none fell back to RPC but those whose ack was lost.
     let rpc = c.node(2).push.stats().rpc_slots;
-    assert!(writes > 0 && rpc == 0, "{writes} RDMA writes, {rpc} by RPC");
+    assert!(
+        writes > 0 && rpc == lost_acks,
+        "{writes} RDMA writes, {rpc} by RPC"
+    );
     eprintln!(
         "push over RDMA: {} MiB to 2 ranks in {dt:?} ({:.2} GB/s), {writes} NIC writes",
         (2 * share) >> 20,

@@ -2145,3 +2145,30 @@ push). A remote-only file is still spread over its copies, per request.
 measured and rejected, as it would keep 1,000 lines for a mode no workload
 here wants. Raising the kernel's `max_pages` instead: needs a sysctl on
 every host and helps only reads larger than 1 MiB.
+
+## ADR-066 — Push reads and placement follow disk speed (2026-10-21)
+
+**Context.** The Sparks' disks differ by two: rhea and moa read 13 GB/s,
+ostrich, dodo, emu and kiwi 5.6 GB/s (raptor 12.3). A push load gave each
+holder an even share of the bytes, so the fast disks finished in less than
+half the time and the load ended on the four slow ones alone: the rate
+held their sum (~22 GB/s) for its second half rather than the cluster's
+(~48 GB/s). Where a model has one copy of each file, the hub has no
+choice of holder at all, and an even spread makes the same tail.
+
+**Decision.**
+- **A push hub assigns each file to the holder that would finish it
+  soonest** at its measured disk read rate (`disk_read_bps`, shared every
+  30 s), largest files first; a holder with no rate counts at the median,
+  and with no rates every holder counts the same (bytes balance, as
+  before). With two or more copies this alone keeps every disk busy.
+- **Place takes `by_speed`** (`nest plan --place … --by-speed`, a toggle
+  in the Place dialog): each host's share of the bytes is sized by its
+  disk read rate instead of evenly. It is per selection, so only the
+  models where load time matters get uneven disk use. It changes nothing
+  when every host holds everything.
+
+**Alternatives.** Spreading every import by speed: disk use would go
+uneven for files nobody pushes. Stealing work while the load runs (fast
+sources take files from slow ones): needs a second copy anyway, which the
+hub's choice already uses.

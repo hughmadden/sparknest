@@ -2705,6 +2705,10 @@ components:
               type: number
               default: 1.0
               description: Share of the hosts each file is on, 1/hosts (spread) to 1 (everywhere).
+            by_speed:
+              type: boolean
+              default: false
+              description: Size each host's share of the bytes by its measured disk read rate instead of evenly.
             hub:
               type: string
         - type: object

@@ -94,6 +94,8 @@ pub(crate) enum PushMsg {
         rank: u32,
         source: NodeId,
         slot: u32,
+        /// The grant this fills (`Grant::seq`).
+        seq: u64,
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
@@ -133,6 +135,9 @@ pub(crate) enum PushMsg {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Grant {
     slot: u32,
+    /// Which grant of the rank this is: a ring slot is granted again once
+    /// filled, so a late duplicate of an earlier fill is told apart.
+    seq: u64,
     /// Where to RDMA-write it (the ring is registered with the rank
     /// host's fabric).
     target: Option<nest_fabric::push::PushTarget>,
@@ -198,8 +203,10 @@ struct RankSlot {
     reported: u64,
     /// Ring slots no credit names.
     free: Vec<u32>,
-    /// Ring slots granted and not yet filled, and to which source.
-    granted: HashMap<u32, NodeId>,
+    /// Ring slots granted and not yet filled: to which source, which grant.
+    granted: HashMap<u32, (NodeId, u64)>,
+    /// The next grant's `seq`.
+    next_seq: u64,
     /// The ring registered with this host's fabric (RDMA delivery).
     rdma: Option<Arc<nest_fabric::push::PushRing>>,
     /// This rank's token prefix: landing tokens are `id << 12 | slot`.
@@ -306,6 +313,10 @@ pub struct Push {
     landings: std::sync::OnceLock<Arc<dyn nest_fabric::push::PushSink>>,
     rdma_slots: AtomicU64,
     rpc_slots: AtomicU64,
+    /// Tests: report this many RDMA writes that landed as failed, as when
+    /// a completion is lost to a lane failure (the slot then also goes by
+    /// RPC).
+    lose_acks: Mutex<u64>,
 }
 
 /// A file resolved at start: its current sealed generation, pinned for the
@@ -318,20 +329,31 @@ struct Resolved {
     holders: Vec<NodeId>,
 }
 
-/// Give each file to one holder, balancing bytes per holder (largest files
-/// first; each to the holder with the fewest bytes so far, this host's own
-/// copy winning ties).
-fn assign(files: &[Resolved], me: NodeId) -> Vec<NodeId> {
+/// Give each file to one holder so the holders finish together: largest
+/// files first, each to the holder whose share would be done soonest at its
+/// measured disk read rate (`rates`, bytes/s; a holder with no rate counts at
+/// the median, and with no rates at all every holder counts the same, which
+/// balances bytes). This host's own copy wins ties (ADR-066).
+fn assign(files: &[Resolved], me: NodeId, rates: &HashMap<NodeId, u64>) -> Vec<NodeId> {
+    let mut known: Vec<u64> = rates.values().copied().filter(|b| *b > 0).collect();
+    known.sort_unstable();
+    let median = known.get(known.len() / 2).copied().unwrap_or(1);
+    let rate = |h: &NodeId| rates.get(h).copied().filter(|b| *b > 0).unwrap_or(median) as f64;
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by_key(|i| std::cmp::Reverse(files[*i].size));
     let mut load: HashMap<NodeId, u64> = HashMap::new();
     let mut out = vec![me; files.len()];
     for i in order {
         let f = &files[i];
+        let done = |h: &NodeId| (load.get(h).copied().unwrap_or(0) + f.size) as f64 / rate(h);
         let pick = *f
             .holders
             .iter()
-            .min_by_key(|h| (load.get(h).copied().unwrap_or(0), **h != me))
+            .min_by(|a, b| {
+                done(a)
+                    .total_cmp(&done(b))
+                    .then((**a != me).cmp(&(**b != me)))
+            })
             .expect("resolved files have holders");
         *load.entry(pick).or_default() += f.size;
         out[i] = pick;
@@ -350,6 +372,7 @@ impl Push {
             landings: std::sync::OnceLock::new(),
             rdma_slots: AtomicU64::new(0),
             rpc_slots: AtomicU64::new(0),
+            lose_acks: Mutex::new(0),
         });
         vfs.rpc().register(
             nest_rpc::service::PUSH,
@@ -366,6 +389,12 @@ impl Push {
             });
         }
         p
+    }
+
+    /// Tests: treat the next `n` RDMA slot writes from this host as failed
+    /// although they landed (each is then sent again by RPC).
+    pub fn lose_rdma_acks(&self, n: u64) {
+        *self.lose_acks.lock() = n;
     }
 
     pub fn stats(&self) -> PushStats {
@@ -476,8 +505,9 @@ impl Push {
                     rank,
                     source,
                     slot,
+                    seq,
                     bytes,
-                } => me.slot_rpc(group, rank, source, slot, &bytes),
+                } => me.slot_rpc(group, rank, source, slot, seq, &bytes),
                 PushMsg::SourceDone {
                     group,
                     source,
@@ -665,7 +695,11 @@ impl Push {
         let totals = plan
             .check(&sizes, &arenas)
             .map_err(|e| invalid(format!("plan: {e}")))?;
-        let holder = assign(&resolved, me);
+        let rates = self
+            .vfs()
+            .map(|v| v.balancer().disk_rates())
+            .unwrap_or_default();
+        let holder = assign(&resolved, me, &rates);
 
         for (r, host) in rank_hosts.iter().enumerate() {
             self.send(
@@ -1095,6 +1129,7 @@ impl Push {
                 reported: 0,
                 free: Vec::new(),
                 granted: HashMap::new(),
+                next_seq: 0,
                 rdma: None,
                 token_id: 0,
                 sources: Vec::new(),
@@ -1194,12 +1229,14 @@ impl Push {
                 let Some(slot) = r.free.pop() else { break };
                 let s = r.sources[r.next % r.sources.len()];
                 r.next = r.next.wrapping_add(1);
-                r.granted.insert(slot, s);
+                let seq = r.next_seq;
+                r.next_seq += 1;
+                r.granted.insert(slot, (s, seq));
                 let target = r
                     .rdma
                     .as_ref()
                     .map(|ring| ring.target(slot as u64 * slot_bytes, r.token_id << 12 | slot));
-                let g = Grant { slot, target };
+                let g = Grant { slot, seq, target };
                 match out.iter_mut().find(|(n, _)| *n == s) {
                     Some((_, v)) => v.push(g),
                     None => out.push((s, vec![g])),
@@ -1229,12 +1266,17 @@ impl Push {
     }
 
     /// A slot sent by RPC for ring slot `slot`: written into the ring here.
+    /// A source sends by RPC when its RDMA write reported failure, but the
+    /// write may have landed all the same (the ack was lost, then the lane
+    /// failed): a fill for a grant already filled is a duplicate and is
+    /// dropped, never written over the slot's next fill.
     fn slot_rpc(
         self: &Arc<Self>,
         group: u64,
         rank: u32,
         source: NodeId,
         slot: u32,
+        seq: u64,
         bytes: &[u8],
     ) -> NestResult<()> {
         {
@@ -1243,7 +1285,11 @@ impl Push {
                 .ranks
                 .get(&(group, rank))
                 .ok_or_else(|| invalid("no such rank here"))?;
-            if r.granted.get(&slot) != Some(&source) {
+            if r.granted.get(&slot) != Some(&(source, seq)) {
+                if seq < r.next_seq {
+                    tracing::debug!(group, rank, slot, seq, "push slot already landed by RDMA");
+                    return Ok(());
+                }
                 return Err(invalid("a slot without a credit"));
             }
             r.ring
@@ -1934,7 +1980,18 @@ impl Stream {
                 && bytes.len() <= pool.slot_bytes()
                 && let Some(f) = push.vfs().ok().and_then(|v| v.fabric())
             {
-                match f.push_write(to, pool, &bytes, t).await {
+                // A test hook: the lock only guards its counter.
+                let lose = |r: NestResult<()>| {
+                    let mut n = push.lose_acks.lock();
+                    match r {
+                        Ok(()) if *n > 0 => {
+                            *n -= 1;
+                            Err(NestError::Unavailable("ack lost (test)".into()))
+                        }
+                        r => r,
+                    }
+                };
+                match lose(f.push_write(to, pool, &bytes, t).await) {
                     Ok(()) => {
                         push.rdma_slots.fetch_add(1, Ordering::Relaxed);
                         c.rdma.fetch_add(1, Ordering::Relaxed);
@@ -1953,6 +2010,7 @@ impl Stream {
                     rank: r,
                     source: me,
                     slot: grant.slot,
+                    seq: grant.seq,
                     bytes,
                 },
             )
@@ -2039,4 +2097,59 @@ pub fn listen(push: Arc<Push>, path: &str) -> std::io::Result<()> {
             }
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn files(n: usize, size: u64, holders: &[u64]) -> Vec<Resolved> {
+        (0..n)
+            .map(|i| Resolved {
+                file: FileId(i as u64 + 1),
+                generation: Generation(1),
+                size,
+                holders: holders.iter().map(|h| NodeId(*h)).collect(),
+            })
+            .collect()
+    }
+
+    fn bytes(files: &[Resolved], to: &[NodeId]) -> HashMap<u64, u64> {
+        let mut b = HashMap::new();
+        for (f, h) in files.iter().zip(to) {
+            *b.entry(h.0).or_default() += f.size;
+        }
+        b
+    }
+
+    #[test]
+    fn without_rates_bytes_balance() {
+        let f = files(12, 10, &[1, 2, 3]);
+        let b = bytes(&f, &assign(&f, NodeId(1), &HashMap::new()));
+        assert_eq!(b, HashMap::from([(1, 40), (2, 40), (3, 40)]));
+    }
+
+    #[test]
+    fn faster_disks_carry_more_and_finish_together() {
+        // Two disks twice as fast as the other four (rhea and moa against
+        // the 5.6 GB/s Sparks).
+        let rates: HashMap<NodeId, u64> = [(1, 6), (2, 6), (3, 6), (4, 6), (5, 12), (6, 12)]
+            .into_iter()
+            .map(|(n, r)| (NodeId(n), r))
+            .collect();
+        let f = files(80, 1, &[1, 2, 3, 4, 5, 6]);
+        let b = bytes(&f, &assign(&f, NodeId(1), &rates));
+        for n in 1..=4 {
+            assert_eq!(b[&n], 10, "{b:?}");
+        }
+        assert_eq!(b[&5], 20, "{b:?}");
+        assert_eq!(b[&6], 20, "{b:?}");
+    }
+
+    #[test]
+    fn unknown_rates_count_at_the_median_and_own_copy_wins_ties() {
+        let rates = HashMap::from([(NodeId(2), 10), (NodeId(3), 0)]);
+        let f = files(1, 5, &[2, 1, 3]);
+        assert_eq!(assign(&f, NodeId(1), &rates), vec![NodeId(1)]);
+    }
 }

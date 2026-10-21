@@ -19,6 +19,7 @@
   let store = $state("");
   let keepLive = $state(false);
   let factor = $state(1);
+  let bySpeed = $state(false);
   let plan = $state<Plan | null>(null);
   let err = $state("");
   let busy = $state(false);
@@ -40,6 +41,7 @@
     return r ? r.bytes - r.missing_bytes : 0;
   };
   const free = (h: string) => app.status?.nodes.find((n) => n.name === h)?.info?.free_bytes ?? 0;
+  const disk = (h: string) => app.status?.nodes.find((n) => n.name === h)?.info?.disk_read_bps ?? 0;
   // Relative use of this selection: the most-reading host a full bar, the
   // least an empty one.
   const useBar = $derived.by(() => {
@@ -59,6 +61,7 @@
     multi = [...hosts];
     picked = [];
     factor = 1;
+    bySpeed = false;
     plan = null;
     err = "";
     stats = null;
@@ -103,6 +106,7 @@
               selector: placing.selector,
               hosts: targets,
               factor: mode === "multi" ? k / H : 1,
+              by_speed: mode === "multi" && bySpeed && k < H,
             },
       );
       err = "";
@@ -118,6 +122,7 @@
     void picked.length;
     void single;
     void k;
+    void bySpeed;
     if (!placing.open) return;
     clearTimeout(timer);
     timer = setTimeout(makeOnce, 300);
@@ -184,6 +189,7 @@
               <div class="row"><b>{h}</b>{#if mode === "single" && h === best}<span class="badge spark">best</span>{/if}</div>
               <span class="tiny muted mono">{held(h) ? `holds ${human(held(h))}` : "holds none"}</span>
               <span class="tiny muted mono">{human(free(h))} free</span>
+              {#if mode === "multi" && disk(h)}<span class="tiny muted mono">disk {human(disk(h))}/s</span>{/if}
               <span class="use" title="{human(read(h))} read here in 30 days"><i style="width:{useBar(h) * 100}%"></i></span>
             </button>
           {/each}
@@ -198,6 +204,11 @@
             </div>
             <input type="range" min={1 / H} max="1" step={1 / H} bind:value={factor} disabled={H < 2} aria-label="replica factor" />
             <div class="row tiny muted ends"><span>1/{H} · spread</span><span class="spacer"></span><span>1 · everywhere</span></div>
+            <label class="check small" class:off={k === H}>
+              <input type="checkbox" bind:checked={bySpeed} disabled={k === H} />
+              share by disk speed
+              <span class="tiny muted">{k === H ? "every host holds everything" : "faster disks hold more, so a push load finishes on every host together"}</span>
+            </label>
           </div>
         {/if}
         {#if err}<div class="small" style="color:var(--bad)">{err}</div>{/if}
@@ -238,9 +249,9 @@
 {/if}
 
 <style>
-  .bg { position: fixed; inset: 0; z-index: 75; background: rgba(1, 4, 12, 0.5); display: grid; place-items: center; padding: 16px; backdrop-filter: blur(2px); }
+  .bg { position: fixed; inset: 0; z-index: 75; grid-template-columns: minmax(0, 1fr); background: rgba(1, 4, 12, 0.5); display: grid; place-items: center; padding: 16px; backdrop-filter: blur(2px); }
   .dlg { width: min(860px, 100%); max-height: calc(100vh - 32px); overflow: auto; scrollbar-gutter: stable; padding: 20px; display: flex; flex-direction: column; gap: 14px; background: rgba(8, 16, 34, 0.82); animation: rise 0.2s ease-out; }
-  h3 { margin: 0; }
+  h3 { margin: 0; overflow-wrap: anywhere; }
   .spark { color: var(--spark); }
   .modes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
   .mode { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; padding: 10px 14px; border-radius: 12px; border: 1px solid var(--line); background: rgba(12, 26, 52, 0.45); cursor: pointer; text-align: left; }
@@ -259,6 +270,8 @@
   .factor { display: flex; flex-direction: column; gap: 6px; }
   .factor input { width: 100%; accent-color: var(--spark); }
   .ends { gap: 0; }
+  .factor .check { flex-wrap: wrap; }
+  .check.off { opacity: 0.5; }
   .preview { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--line); padding-top: 12px; }
   .dim { opacity: 0.6; transition: opacity 0.2s; }
   .end { justify-content: flex-end; }

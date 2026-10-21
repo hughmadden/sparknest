@@ -489,6 +489,12 @@ impl Vfs {
         self.disk_bps.load(Ordering::Relaxed)
     }
 
+    /// Set the measured disk read rate (tests: in-process nodes share one
+    /// disk, so their measured rates are alike).
+    pub fn set_disk_read_bps(&self, bps: u64) {
+        self.disk_bps.store(bps, Ordering::Relaxed);
+    }
+
     /// Members that do not vote: off-grid hosts, on the LAN only (ADR-047).
     pub fn offgrid_hosts(&self) -> std::collections::HashSet<NodeId> {
         let m = self.d.meta().metrics().membership_config;

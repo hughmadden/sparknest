@@ -444,6 +444,7 @@ async fn place_spreads_a_selection_evenly_and_honors_skips() {
         selector: "/m".into(),
         hosts: vec![],
         factor: 1.0 / 3.0,
+        by_speed: false,
         hub: "/hub".into(),
     };
     let mut plan = p.plan(goal.clone()).await.unwrap();
@@ -499,4 +500,72 @@ async fn place_spreads_a_selection_evenly_and_honors_skips() {
         per_host[h[0] as usize - 1] += 1;
     }
     assert_eq!(per_host, [2, 2, 2]);
+}
+
+/// Place by speed: one copy of each file, each host's share of the bytes
+/// sized by its disk read rate (n3 twice as fast as n1 and n2 holds half).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn place_by_speed_sizes_shares_by_disk_rate() {
+    let c = ready(3).await;
+    for (n, bps) in [
+        (1, 5_000_000_000u64),
+        (2, 5_000_000_000),
+        (3, 10_000_000_000),
+    ] {
+        c.node(n).vfs.set_disk_read_bps(bps);
+    }
+    let p = c.node(1).placer.clone();
+    let v = c.node(1).vfs.clone();
+    let dir = v.mkdir(FileId::ROOT, b"m", 0o755).await.unwrap().id;
+    let mut files = Vec::new();
+    for i in 0..8 {
+        let (a, fh, _) = v
+            .create(dir, format!("part{i}").as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        v.write(fh, 0, vec![i as u8; MIB as usize]).await.unwrap();
+        v.release(fh, None).await;
+        files.push(a.id);
+    }
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        files.iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    let place = |by_speed| Goal::Place {
+        selector: "/m".into(),
+        hosts: vec![],
+        factor: 1.0 / 3.0,
+        by_speed,
+        hub: "/hub".into(),
+    };
+    let adds = |plan: &nest_place::plan::Plan| -> Vec<(String, usize)> {
+        plan.steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Replicate { host, copies, .. } => Some((host.clone(), copies.len())),
+                _ => None,
+            })
+            .collect()
+    };
+    let plan = p.plan(place(true)).await.unwrap();
+    assert!(plan.feasible, "{plan:?}");
+    // n1 keeps 2 of 8, n2 takes 2, n3 takes 4.
+    assert_eq!(
+        adds(&plan),
+        [("n2".to_string(), 2), ("n3".to_string(), 4)],
+        "{plan:?}"
+    );
+    assert!(
+        plan.notes.iter().any(|n| n.contains("by disk speed")),
+        "{:?}",
+        plan.notes
+    );
+    // Evenly, the same selection splits 3/3/2.
+    let even = p.plan(place(false)).await.unwrap();
+    let mut counts: Vec<usize> = adds(&even).iter().map(|a| a.1).collect();
+    counts.sort();
+    assert_eq!(counts, [2, 3], "{even:?}");
 }

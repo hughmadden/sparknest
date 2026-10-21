@@ -29,7 +29,9 @@
 //!   then those already holding it. Copies outside the assignment are
 //!   removed once a host it assigns holds the file (checked when applying).
 //!   Factor 1 copies everything everywhere; 1/hosts spreads it; one host
-//!   gathers it there.
+//!   gathers it there. By speed, each host's share is sized by its measured
+//!   disk read rate instead, so a push load reading one copy of each file
+//!   keeps every disk busy to the end.
 //!
 //! A plan can be edited before it is applied: any copy can be skipped (and
 //! taken back), by host, by model or file (`select`). Skipping a copy a
@@ -219,6 +221,11 @@ pub enum Goal {
         /// (everywhere).
         #[serde(default = "default_factor")]
         factor: f64,
+        /// Size each host's share of the bytes by its measured disk read
+        /// rate instead of evenly, so a push load that reads one copy of
+        /// each file finishes on every host together.
+        #[serde(default)]
+        by_speed: bool,
         #[serde(default)]
         hub: String,
     },
@@ -320,6 +327,8 @@ struct World {
     name_of: HashMap<NodeId, String>,
     free_now: HashMap<NodeId, u64>,
     total: HashMap<NodeId, u64>,
+    /// Measured disk read rate per host (bytes/s; 0 when unknown).
+    disk: HashMap<NodeId, u64>,
     required_by: HashMap<(FileId, NodeId), String>,
     /// Live copies per node.
     copies_on: HashMap<NodeId, Vec<Copy>>,
@@ -349,6 +358,10 @@ impl World {
             .iter()
             .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.total_bytes)))
             .collect();
+        let disk = status
+            .iter()
+            .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.disk_read_bps)))
+            .collect();
         let required_by = requirements(placer).await?;
         let (copies_on, count, created_ms) = collect_copies(placer)?;
         let usage = if usage_days > 0 {
@@ -364,6 +377,7 @@ impl World {
             projected: free_now.clone(),
             free_now,
             total,
+            disk,
             required_by,
             copies_on,
             count,
@@ -591,6 +605,7 @@ pub async fn make(placer: &Placer, goal: Goal) -> NestResult<Plan> {
             selector,
             hosts,
             factor,
+            by_speed,
             hub,
         } => {
             let sel = Selector::parse(selector, hub).map_err(NestError::Invalid)?;
@@ -603,7 +618,7 @@ pub async fn make(placer: &Placer, goal: Goal) -> NestResult<Plan> {
                     w.host(*n)
                 )));
             }
-            make_place(w, goal.clone(), &m, targets, *factor)
+            make_place(w, goal.clone(), &m, targets, *factor, *by_speed)
         }
         Goal::Offgrid {
             selector,
@@ -1133,6 +1148,7 @@ fn make_place(
     m: &crate::selector::Manifest,
     mut targets: Vec<NodeId>,
     factor: f64,
+    by_speed: bool,
 ) -> NestResult<Plan> {
     targets.sort();
     targets.dedup();
@@ -1156,8 +1172,34 @@ fn make_place(
     }
     entries.sort_by(|a, b| b.size.cmp(&a.size).then(a.file.cmp(&b.file)));
     let total: u64 = entries.iter().map(|e| e.size).sum();
-    // Each host's even share of the bytes to hold.
-    let share = ((total as u128 * k as u128) / h as u128) as u64;
+    // Each host's share of the bytes to hold: even, or by disk read rate
+    // (a host with no rate counts at the median). A host holds each file at
+    // most once, so no share exceeds the total.
+    let weight: HashMap<NodeId, u64> = {
+        let known: Vec<u64> = targets
+            .iter()
+            .filter_map(|n| w.disk.get(n).copied().filter(|b| *b > 0))
+            .collect();
+        let mut sorted = known.clone();
+        sorted.sort_unstable();
+        let median = sorted.get(sorted.len() / 2).copied().unwrap_or(1);
+        targets
+            .iter()
+            .map(|n| {
+                let r = w.disk.get(n).copied().filter(|b| *b > 0);
+                (*n, if by_speed { r.unwrap_or(median) } else { 1 })
+            })
+            .collect()
+    };
+    let weights: u128 = weight.values().map(|v| *v as u128).sum::<u128>().max(1);
+    let shares: HashMap<NodeId, u64> = targets
+        .iter()
+        .map(|n| {
+            let s = total as u128 * k as u128 * weight[n] as u128 / weights;
+            (*n, (s as u64).min(total))
+        })
+        .collect();
+    let share = |n: &NodeId| shares.get(n).copied().unwrap_or(0);
     // Who holds which generation now (live stores; off-grid copies are
     // neither counted nor removed here, like archive copies).
     let mut holders: HashMap<(FileId, Generation), Vec<NodeId>> = HashMap::new();
@@ -1187,14 +1229,15 @@ fn make_place(
             .unwrap_or_default();
         let mut cands = targets.clone();
         // Hosts still below their share first; among them, those that read
-        // this file most, then those holding it, then the emptiest.
+        // this file most, then those holding it, then the emptiest (by
+        // how much of its share is filled).
         cands.sort_by_key(|n| {
             let a = assigned.get(n).copied().unwrap_or(0);
             (
-                a >= share,
+                a >= share(n),
                 std::cmp::Reverse(read(&w, *n, e.file)),
                 !held.contains(n),
-                a,
+                (a as u128) * 1_000_000 / share(n).max(1) as u128,
                 *n,
             )
         });
@@ -1258,13 +1301,24 @@ fn make_place(
         }
     }
     let names: Vec<String> = targets.iter().map(|n| w.host(*n)).collect();
-    w.notes.push(if k == h && h > 1 {
+    let even = shares.get(&targets[0]).copied().unwrap_or(0);
+    w.notes.push(if by_speed && k < h {
+        let each: Vec<String> = targets
+            .iter()
+            .map(|n| format!("{} {}", w.host(*n), human(share(n))))
+            .collect();
+        format!(
+            "{k} {} of each file, shared by disk speed: {}",
+            if k == 1 { "copy" } else { "copies" },
+            each.join(", ")
+        )
+    } else if k == h && h > 1 {
         format!("every file on each of {}", names.join(", "))
     } else if k == 1 && h > 1 {
         format!(
             "one copy of each file, spread over {}: about {} each",
             names.join(", "),
-            human(share)
+            human(even)
         )
     } else if h == 1 {
         format!("everything on {}", names[0])
@@ -1272,7 +1326,7 @@ fn make_place(
         format!(
             "{k} copies of each file over {}: about {} each",
             names.join(", "),
-            human(share)
+            human(even)
         )
     });
     if short_files > 0 {

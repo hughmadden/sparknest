@@ -215,6 +215,11 @@ impl Balancer {
         *self.capacity.lock() = (disks, link);
     }
 
+    /// Holders' disk read rates as last shared (bytes/s; 0 for unknown).
+    pub fn disk_rates(&self) -> HashMap<NodeId, u64> {
+        self.capacity.lock().0.clone()
+    }
+
     /// The prefix of `ranked` whose disks can fill the links with headroom
     /// (all of them when rates are unknown).
     fn cap(&self, ranked: &mut Vec<NodeId>) {
