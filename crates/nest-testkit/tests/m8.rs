@@ -69,9 +69,13 @@ async fn data_reserve_refuses_data_but_not_metadata() {
         .unwrap();
     v2.write(fh, 0, vec![2u8; 300 << 20]).await.unwrap();
     v2.release(fh, None).await;
+    // Node 1 replicates it: wait until node 1 too sees it stable (else the
+    // job may find nothing to copy yet).
     c.eventually("stable", Duration::from_secs(10), |c| {
-        c.attr(2, b.id)
-            .is_some_and(|x| x.gen_state == GenState::Stable)
+        [1, 2].iter().all(|n| {
+            c.attr(*n, b.id)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
     })
     .await;
     let p = &c.node(1).placer;
@@ -357,10 +361,14 @@ async fn crashed_minority_host_recovers_against_the_quorum() {
     let v3 = c.node(3).vfs.clone();
     let only3 = write_file(&v3, b"only-on-3", 2000).await;
     let copied = write_file(&v1, b"copied", 3000).await;
+    // Host 3 replicates `copied`: it must see it stable too, or the job
+    // finds nothing to copy yet.
     c.eventually("stable", Duration::from_secs(5), |c| {
         [only3, copied].iter().all(|f| {
-            c.attr(1, *f)
-                .is_some_and(|a| a.gen_state == GenState::Stable)
+            [1, 3].iter().all(|n| {
+                c.attr(*n, *f)
+                    .is_some_and(|a| a.gen_state == GenState::Stable)
+            })
         })
     })
     .await;
@@ -376,6 +384,8 @@ async fn crashed_minority_host_recovers_against_the_quorum() {
         c.node(1).placer.job(j).is_some_and(|x| x.finished)
     })
     .await;
+    let k = nest_store::ObjectKey::new(copied, Generation(1));
+    assert!(c.node(3).data.store().exists(k), "copied onto host 3");
     v1.unlink(FileId::ROOT, b"doomed").await.unwrap();
     c.converge().await;
 
