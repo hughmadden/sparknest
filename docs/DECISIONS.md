@@ -2097,6 +2097,25 @@ host may be a source and a rank host at once, and slots from a host's own
 store to its own ranks are handed over in memory. A test covers two ranks
 on the hub's host beside ranks elsewhere.
 
+**Amendment (2026-10-21): the order a rank's slots come in.** Engines
+that hold slots until a band of rows is whole (the coordinator's GPUs
+quantize per 128-row band) size their rings on this, so it is a contract;
+changing it needs a new amendment and notice to the engine.
+- **One source:** it streams its files one at a time, in plan order, and
+  each file's reads in rising offset order. For each rank it packs one
+  open slot at a time, in the order its bytes are read. Several files
+  are never interleaved into one rank's slots. A slot may hold the end
+  of one file and the start of the next, because the open slot carries
+  over the file boundary.
+- **Arrival:** a source keeps up to `in_flight` sends in flight (32 for
+  1 MiB slots) over RDMA and lanes, and they may land out of order. For
+  one rank, the window is never more than that source's grants for that
+  rank. Fragments carry their arena offsets, so engines place by offset,
+  never by arrival order.
+- **Several sources:** slots from different sources interleave in a rank's
+  ring (grants go round robin). A file, and so any tensor inside it,
+  comes from one source.
+
 ## ADR-064 — Placement readable through the mount (2026-10-21)
 
 **Context.** The engine's containers see the hub only through the mount;
