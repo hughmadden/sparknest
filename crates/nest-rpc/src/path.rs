@@ -105,6 +105,10 @@ pub struct PathState {
     pub standby_addr: Option<SocketAddr>,
     /// Why requests last moved.
     pub reason: Option<String>,
+    /// Requests are on the fallback path: the standby when the fabric is
+    /// preferred, the fabric when the LAN is (ADR-068). A degraded peer is
+    /// not handed leadership.
+    pub degraded: bool,
 }
 
 #[derive(Default)]
@@ -289,13 +293,22 @@ impl Paths {
     }
 
     pub(crate) fn state(&self, peer: NodeId, fresh: Duration) -> Option<PathState> {
+        let prefer = self
+            .prefer_standby
+            .load(std::sync::atomic::Ordering::Relaxed);
         let g = self.peers.lock();
-        g.get(&peer).map(|p| snapshot(p, fresh))
+        g.get(&peer).map(|p| snapshot(p, fresh, prefer))
     }
 
     pub(crate) fn all(&self, fresh: Duration) -> Vec<(NodeId, PathState)> {
+        let prefer = self
+            .prefer_standby
+            .load(std::sync::atomic::Ordering::Relaxed);
         let g = self.peers.lock();
-        let mut v: Vec<_> = g.iter().map(|(n, p)| (*n, snapshot(p, fresh))).collect();
+        let mut v: Vec<_> = g
+            .iter()
+            .map(|(n, p)| (*n, snapshot(p, fresh, prefer)))
+            .collect();
         v.sort_by_key(|(n, _)| *n);
         v
     }
@@ -309,8 +322,9 @@ impl Paths {
     }
 }
 
-fn snapshot(p: &Peer, fresh: Duration) -> PathState {
+fn snapshot(p: &Peer, fresh: Duration, prefer: bool) -> PathState {
     PathState {
+        degraded: p.on_standby != prefer,
         on_standby: p.on_standby,
         since: p.since,
         failovers: p.failovers,

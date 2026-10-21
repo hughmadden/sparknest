@@ -2266,6 +2266,13 @@ no RDMA.
 3. **Off**, ADR-057 as before.
 4. Bulk data is unchanged: RDMA, and TCP lanes when RDMA is down.
 
+**Amendment (2026-10-21, 0.6.2).** The preferred-leader handoff
+(ADR-057) skips a peer whose link is degraded, and 0.6.0 took "requests on
+the standby" to mean degraded. With the LAN preferred every peer is on the
+standby, so the preferred leader never got leadership back after its
+restart. Degraded now means on the fallback path: the standby when the
+fabric is preferred, the fabric when the LAN is.
+
 **Consequences.** Control latency rises by the LAN's round trip
 (≈0.1 ms more), irrelevant at Raft's 150 ms heartbeat. A fabric outage no
 longer moves control traffic at all. Traffic classes on the fabric switch

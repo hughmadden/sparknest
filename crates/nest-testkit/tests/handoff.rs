@@ -243,3 +243,32 @@ async fn a_flapping_preferred_leader_is_not_readopted_within_the_cooldown() {
     .await;
     assert!(took_over.elapsed() >= Duration::from_secs(8));
 }
+
+/// With control traffic on the LAN by preference (ADR-068, the default),
+/// every peer's requests are on the standby connection, and that is not a
+/// degraded link: the preferred leader still takes over. (0.6.0 counted any
+/// peer on the standby as degraded, so production's preferred leader never
+/// got leadership back after its restart.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_preferred_leader_takes_over_with_control_on_the_lan() {
+    let c = TestCluster::start_with_standby(3, fast_tuning()).await;
+    let old = c.wait_leader().await;
+    let want = c.running().into_iter().find(|i| *i != old).unwrap();
+    // Every pair on the LAN, by preference.
+    c.eventually("control on the LAN", Duration::from_secs(10), |c| {
+        c.running().iter().all(|a| {
+            c.running().iter().filter(|b| *b != a).all(|b| {
+                c.node(*a)
+                    .rpc
+                    .path(NodeId(*b))
+                    .is_some_and(|p| p.on_standby && !p.degraded)
+            })
+        })
+    })
+    .await;
+    set_preferred(&c, old, Some(want)).await;
+    c.eventually("the preferred host leads", Duration::from_secs(15), |c| {
+        agreed_leader(c) == Some(want)
+    })
+    .await;
+}

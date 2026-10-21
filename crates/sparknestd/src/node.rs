@@ -214,7 +214,7 @@ impl Node {
         {
             let rpc = rpc.clone();
             meta.set_peer_health(Arc::new(move |peer| {
-                !rpc.path(peer).is_some_and(|p| p.on_standby)
+                !rpc.path(peer).is_some_and(|p| p.degraded)
             }));
         }
         let voters: BTreeMap<u64, BasicNode> = cfg
