@@ -99,3 +99,26 @@ not the switch. Steady state was about 2.6 GB/s per source with 8 slots
 in flight; the disks read 5.6–13 GB/s. Run 4 (all fixes, disk-speed
 assignment) is next.
 
+## First production push loads (0.6.x, 2026-10-21)
+
+`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3-v1@1e4abd26` from the production
+hub, sources on all six Sparks, two ranks (dodo, emu) plus the RTX
+coordinator on raptor; 128-slot rings of 1 MiB per rank.
+
+| Release | Group | Result |
+|---|---|---|
+| 0.6.0 | 4092384301547520 | 69.2 GiB of 107.7 in 9 s (peak 18.4 GB/s), then stalled: kiwi finished first and rank hosts kept granting it slots (fixed in 0.6.1) |
+| 0.6.2 | 120235912134656 | **107.7 GiB in 7.20 s: 16.1 GB/s overall, 23.0 GB/s peak (1 s), ~20 GB/s sustained**; 100% RDMA over the network, 0 fallbacks; both ranks done at 7.20 s |
+
+Engine side (cuteafd, 0.6.2 run): launch to ready **47.0 s against 71.3 s
+through the mount (−34%)**; push committed 42 layers per rank ~23 s after
+the workers came up (transfer plus the engine's own setup); the four
+greedy outputs are byte-identical to the mount reference. What remains is
+mostly the coordinator's own load, graph capture and container start.
+
+Per source (0.6.2): ostrich 21.4, rhea 21.8, emu 19.9, dodo 19.0, moa 14.2,
+kiwi 11.4 GiB; finished between 4.9 s (kiwi) and 7.2 s (rhea). Two ranks
+took ~10 GB/s each, so this load was bound by the ranks' intake rather
+than the six disks (~48 GB/s together): a load over more ranks is the
+next measurement.
+

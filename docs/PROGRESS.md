@@ -3,6 +3,24 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-21 — 0.6.0, 0.6.1, 0.6.2 released and deployed; first production push loads
+
+- 0.6.0 on all ten hosts (cassowary joined as an off-grid host, node 10),
+  then 0.6.1 and 0.6.2, each from published bottles, rolled host by host
+  inside a cuteafd drain window; with bottles installed ahead, each
+  restart took ~4 s.
+- First production push load (0.6.0) stalled after 9 s: a finished source
+  kept collecting ring-slot grants. Fixed in 0.6.1, with ring state in the
+  load record and stall reasons. 0.6.2: the preferred-leader handoff
+  counted control-on-the-LAN as a degraded link; leadership now returns
+  to raptor (~2 min after its restart in production).
+- 0.6.2 push of GLM-5.3-Flash EXL3 K3 to two ranks: 107.7 GiB in 7.2 s,
+  16.1 GB/s overall, 23 GB/s peak, all RDMA. cuteafd: launch to ready
+  47.0 s against 71.3 s through the mount, outputs identical
+  (`benchmarks/M13-MODEL-LOAD.md`).
+- Control traffic on the LAN: zero heartbeat timeouts since (hundreds per
+  link per day before).
+
 ## 2026-10-21 — Bulk off the control connection; control on the LAN; hf share (0.6.0 in progress)
 
 - Trial run 2 (6×6, 8 GiB each) stalled 11 s on a simultaneous-dial race
