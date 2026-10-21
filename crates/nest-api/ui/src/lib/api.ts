@@ -1,12 +1,23 @@
 // The daemon's HTTP API, with the bearer token from `nest ui`'s link.
 
 let token = "";
+
+/** `hash` without its `token=` parameter (`#token=…` alone: nothing). */
+export function withoutToken(hash: string): string {
+  const h = hash.replace(/^#/, "");
+  const [path, q = ""] = h.startsWith("token=") ? ["", h] : h.split("?");
+  const p = new URLSearchParams(q);
+  p.delete("token");
+  const qs = p.toString();
+  return path || qs ? `#${path}${qs ? "?" + qs : ""}` : "";
+}
 try {
   const m = location.hash.match(/token=([0-9a-f]+)/);
   if (m) {
     token = m[1];
     sessionStorage.setItem("nest-token", token);
-    history.replaceState(null, "", location.pathname + location.search);
+    // Drop the token from the address, keeping any route (#/loads?token=…).
+    history.replaceState(null, "", location.pathname + location.search + withoutToken(location.hash));
   } else token = sessionStorage.getItem("nest-token") || "";
 } catch {
   /* storage blocked: the login form still works for this page view */
