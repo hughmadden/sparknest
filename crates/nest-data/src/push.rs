@@ -17,11 +17,11 @@
 //! direct call on the same host). RDMA writes straight into the ring
 //! replace that where both ends have a fabric link.
 
-use crate::vfs::Vfs;
+use crate::vfs::{PushRead, Vfs};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use nest_push::client::Conn;
-use nest_push::plan::{Entry, Pattern, Plan, RunWalk};
+use nest_push::plan::{Entry, FileEntries, Pattern, Plan, RunWalk};
 use nest_push::proto::{Event, Forecast, Missing, RankSpec, Request, StreamForecast};
 use nest_push::slot;
 use nest_types::{FileId, Generation, NestError, NestResult, NodeId};
@@ -2129,18 +2129,12 @@ impl Stream {
                     .map_err(|e| e.to_string())?,
             )
         };
+        // The file's entries by offset: each read visits only those that
+        // read it.
+        let index = FileEntries::new(&f.entries, extents);
         // The file's ranges, merged across small gaps: one pass in order.
-        let mut spans: Vec<(u64, u64)> = f
-            .entries
-            .iter()
-            .filter_map(|e| {
-                let x = (*extents.get(e.pattern as usize)?)?;
-                (x.bytes > 0).then(|| (e.src_base, e.src_base + x.src_len))
-            })
-            .collect();
-        spans.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::new();
-        for (a, b) in spans {
+        for (a, b) in index.ranges() {
             match merged.last_mut() {
                 Some(last) if a <= last.1.saturating_add(GAP) => last.1 = last.1.max(b),
                 _ => merged.push((a, b)),
@@ -2156,7 +2150,7 @@ impl Stream {
                     .map(move |at| (at, (at + READ_CHUNK).min(b)))
             })
             .collect();
-        let mut ahead: VecDeque<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>> =
+        let mut ahead: VecDeque<tokio::task::JoinHandle<std::io::Result<PushRead>>> =
             VecDeque::new();
         let mut next = 0;
         for &(at, end) in &reads {
@@ -2173,7 +2167,7 @@ impl Stream {
                 .await
                 .map_err(|e| e.to_string())?
                 .map_err(|e| format!("reading: {e}"))?;
-            for e in f.entries.iter() {
+            for e in index.overlapping(at, end) {
                 let p = &patterns[e.pattern as usize];
                 for (s, d, n) in RunWalk::new(p, e, at, end) {
                     let off = (s - at) as usize;

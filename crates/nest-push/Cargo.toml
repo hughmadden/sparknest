@@ -13,4 +13,5 @@ libc.workspace = true
 nix = { workspace = true, features = ["socket", "uio", "fs", "user"] }
 
 [dev-dependencies]
+serde_json.workspace = true
 proptest.workspace = true

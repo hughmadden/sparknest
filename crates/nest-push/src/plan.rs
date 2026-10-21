@@ -284,6 +284,58 @@ impl Plan {
     }
 }
 
+/// One file's entries, ordered so a source visits only those that read
+/// each window: per window, the entries whose extent overlaps it, without
+/// scanning the rest (a file of a TP plan holds tens of thousands of
+/// entries; a 16 MiB window touches about a hundred).
+pub struct FileEntries {
+    /// (src start, src end, entry), by start.
+    spans: Vec<(u64, u64, Entry)>,
+    /// `max_end[i]`: the largest end among `spans[..=i]`.
+    max_end: Vec<u64>,
+}
+
+impl FileEntries {
+    /// Index `entries` (all of one file) by their extents; entries that
+    /// read nothing or name a bad pattern are left out.
+    pub fn new(entries: &[Entry], extents: &[Option<Extent>]) -> FileEntries {
+        let mut spans: Vec<(u64, u64, Entry)> = entries
+            .iter()
+            .filter_map(|e| {
+                let x = (*extents.get(e.pattern as usize)?)?;
+                (x.bytes > 0).then(|| (e.src_base, e.src_base + x.src_len, e.clone()))
+            })
+            .collect();
+        spans.sort_by_key(|s| s.0);
+        let mut m = 0;
+        let max_end = spans
+            .iter()
+            .map(|s| {
+                m = m.max(s.1);
+                m
+            })
+            .collect();
+        FileEntries { spans, max_end }
+    }
+
+    /// Every entry's source range, by start.
+    pub fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.spans.iter().map(|s| (s.0, s.1))
+    }
+
+    /// The entries overlapping `[from, to)`, in index order. Windows asked
+    /// in rising order cost O(log n + entries overlapping).
+    pub fn overlapping(&self, from: u64, to: u64) -> impl Iterator<Item = &Entry> + '_ {
+        // Skip the prefix that ends at or before `from` (max_end rises).
+        let lo = self.max_end.partition_point(|&m| m <= from);
+        self.spans[lo..]
+            .iter()
+            .take_while(move |s| s.0 < to)
+            .filter(move |s| s.1 > from)
+            .map(|s| &s.2)
+    }
+}
+
 /// The runs of one entry that fall in `[from, to)` of its file, in file
 /// order: (file offset, arena offset, length), each run clipped to the
 /// window on both ends. Jumps to the first run at or after `from` without walking the
@@ -637,6 +689,49 @@ mod tests {
                 .collect();
             let got: Vec<(u64, u32)> = RunWalk::new(&p, &e, from, to).map(|(s, _, n)| (s, n)).collect();
             proptest::prop_assert_eq!(got, want);
+        }
+
+        /// The index yields exactly the entries a full scan finds
+        /// overlapping each window, in any order of windows.
+        #[test]
+        fn file_entries_match_a_scan(
+            ents in proptest::collection::vec((0u64..50_000, 0u32..3), 0..60),
+            windows in proptest::collection::vec((0u64..60_000, 1u64..20_000), 1..10),
+        ) {
+            // Patterns of different extents: 1 KiB, 10 KiB, and empty.
+            let ps = [
+                Pattern { run: 1024, dims: vec![] },
+                Pattern { run: 1024, dims: vec![Dim { steps: Steps::Count(10), src_stride: 1024, dst_stride: 1024 }] },
+                Pattern { run: 1024, dims: vec![Dim { steps: Steps::Count(0), src_stride: 1024, dst_stride: 1024 }] },
+            ];
+            let extents: Vec<Option<Extent>> = ps.iter().map(|p| p.check().ok()).collect();
+            let entries: Vec<Entry> = ents
+                .iter()
+                .enumerate()
+                .map(|(i, &(src_base, pattern))| Entry {
+                    file: 0,
+                    pattern,
+                    src_base,
+                    dst_base: i as u64 * 20_000,
+                    rank: 0,
+                })
+                .collect();
+            let idx = FileEntries::new(&entries, &extents);
+            for (from, len) in windows {
+                let to = from + len;
+                let mut want: Vec<u64> = entries
+                    .iter()
+                    .filter(|e| {
+                        let x = extents[e.pattern as usize].unwrap();
+                        x.bytes > 0 && e.src_base < to && e.src_base + x.src_len > from
+                    })
+                    .map(|e| e.dst_base)
+                    .collect();
+                let mut got: Vec<u64> = idx.overlapping(from, to).map(|e| e.dst_base).collect();
+                want.sort();
+                got.sort();
+                proptest::prop_assert_eq!(got, want);
+            }
         }
     }
 }

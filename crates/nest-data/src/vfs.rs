@@ -98,10 +98,33 @@ pub struct PushObject {
     size: u64,
 }
 
+/// Bytes a push source read: the aligned buffer a direct read filled
+/// (the wanted bytes start `lo` into it), or a plain one. Packing reads
+/// them in place, so a direct read costs no copy out.
+pub enum PushRead {
+    Direct {
+        buf: nest_store::uring::AlignedBuf,
+        lo: usize,
+        len: usize,
+    },
+    Buffered(Vec<u8>),
+}
+
+impl std::ops::Deref for PushRead {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            PushRead::Direct { buf, lo, len } => &buf.as_slice()[*lo..*lo + *len],
+            PushRead::Buffered(b) => b,
+        }
+    }
+}
+
 impl PushObject {
-    /// Read `[off, off+len)` into a new buffer (blocking). Direct reads are
-    /// aligned outward and the extra bytes trimmed.
-    pub fn read(&self, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    /// Read `[off, off+len)` (blocking). Direct reads are aligned outward;
+    /// the result covers exactly the bytes asked for.
+    pub fn read(&self, off: u64, len: usize) -> std::io::Result<PushRead> {
         use std::os::unix::fs::FileExt;
         if let Some(f) = &self.direct {
             let a = nest_store::uring::ALIGN as u64;
@@ -129,16 +152,16 @@ impl PushObject {
                     "object shorter than its size",
                 ));
             }
-            return Ok(buf.as_slice()[lo..lo + len].to_vec());
+            return Ok(PushRead::Direct { buf, lo, len });
         }
         self.read_buffered(off, len)
     }
 
-    fn read_buffered(&self, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    fn read_buffered(&self, off: u64, len: usize) -> std::io::Result<PushRead> {
         use std::os::unix::fs::FileExt;
         let mut b = vec![0u8; len];
         self.buffered.read_exact_at(&mut b, off)?;
-        Ok(b)
+        Ok(PushRead::Buffered(b))
     }
 
     pub fn is_direct(&self) -> bool {
@@ -182,8 +205,8 @@ mod push_object_tests {
             (12345, 2 << 20),
         ] {
             assert_eq!(
-                o.read(off, len).unwrap(),
-                data[off as usize..off as usize + len],
+                &*o.read(off, len).unwrap(),
+                &data[off as usize..off as usize + len],
                 "{off}+{len}"
             );
         }

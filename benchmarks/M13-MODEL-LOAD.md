@@ -122,3 +122,31 @@ took ~10 GB/s each, so this load was bound by the ranks' intake rather
 than the six disks (~48 GB/s together): a load over more ranks is the
 next measurement.
 
+
+## Source packing on real plans (2026-10-22)
+
+`crates/nest-push/examples/pack_bench.rs` replays one source's packing loop
+on one core against synthetic bytes (no disk, no network) for a real
+engine plan (`{plan, file_sizes, arenas}` from cuteafd's builder): files
+dealt to 6 sources by size, source 0 packs 20 GB into 1 MiB slots,
+including the copy into RDMA staging. `0.6.2` is the loop as released:
+every 16 MiB read walked all of its file's entries, and direct reads were
+copied out of their aligned buffer. Now a read visits only the entries
+overlapping it (`plan::FileEntries`) and packs from the aligned buffer
+in place (`PushRead`).
+
+| Plan | Entries | Runs (avg) | Host | 0.6.2 | now |
+|---|---|---|---|---|---|
+| GLM-5.3 K4 TP6 | 1,963,008 | 13.2 M in 20 GB (1.5 KB) | Spark (ostrich) | 5.5 GB/s | **10.7 GB/s** |
+| | | | raptor | 5.6 GB/s | 13.4 GB/s |
+| Kimi K3 TP6 | 8,902,656 | 6.7 M in 20 GB (3.0 KB) | Spark (ostrich) | 5.4 GB/s | **11.3 GB/s** |
+| | | | raptor | 6.2 GB/s | 19.8 GB/s |
+
+Entries visited per 16 MiB read: 46,745 → 101 (K4), 96,909 → 223 (Kimi).
+On a Spark, 20 GB of K4 took 2.41 s walking and packing + 0.79 s copying
+reads + 0.41 s into staging under 0.6.2; now 1.38 + 0 + 0.48 s.
+
+Production sources ran at 3.8–4.0 GB/s (K4, load 120235912134657), so
+packing at 5.5 GB/s was most of a source's time per byte; grant waits are
+the rest. EXLR8 (load 120235912134668, 2.0 GB/s per source) has ~100×
+fewer, longer runs and stalls on every source at once: not packing.

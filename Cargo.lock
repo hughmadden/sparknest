@@ -1155,6 +1155,7 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
