@@ -95,6 +95,108 @@ pub enum OpenMode {
     Direct,
 }
 
+/// An object a push source reads (ADR-063): direct I/O where the store
+/// allows it, so a load does not fill the page cache (on the Sparks that
+/// memory is the GPU's), else buffered.
+pub struct PushObject {
+    buffered: Arc<std::fs::File>,
+    direct: Option<std::fs::File>,
+    size: u64,
+}
+
+impl PushObject {
+    /// Read `[off, off+len)` into a new buffer (blocking). Direct reads are
+    /// aligned outward and the extra bytes trimmed.
+    pub fn read(&self, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        if let Some(f) = &self.direct {
+            let a = nest_store::uring::ALIGN as u64;
+            let start = off / a * a;
+            let end = (off + len as u64).div_ceil(a) * a;
+            let mut buf = nest_store::uring::AlignedBuf::new((end - start) as usize);
+            let mut got = 0usize;
+            let want = (self.size.min(end) - start) as usize;
+            while got < want {
+                match f.read_at(&mut buf.as_mut_slice()[got..], start + got as u64) {
+                    Ok(0) => break,
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    // A filesystem that took the open but not the read.
+                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                        return self.read_buffered(off, len);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let lo = (off - start) as usize;
+            if got < lo + len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "object shorter than its size",
+                ));
+            }
+            return Ok(buf.as_slice()[lo..lo + len].to_vec());
+        }
+        self.read_buffered(off, len)
+    }
+
+    fn read_buffered(&self, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut b = vec![0u8; len];
+        self.buffered.read_exact_at(&mut b, off)?;
+        Ok(b)
+    }
+
+    pub fn is_direct(&self) -> bool {
+        self.direct.is_some()
+    }
+}
+
+#[cfg(test)]
+mod push_object_tests {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    /// Direct reads at unaligned offsets and lengths give the same bytes
+    /// as buffered ones (where the filesystem takes O_DIRECT).
+    #[test]
+    fn direct_reads_match_buffered() {
+        let dir =
+            tempfile::tempdir_in(std::env::var("NEST_DISK_DIR").unwrap_or_else(|_| ".".into()))
+                .unwrap();
+        let p = dir.path().join("obj");
+        let size = (3 << 20) + 12345;
+        let data: Vec<u8> = (0..size).map(|i| (i * 31 % 253) as u8).collect();
+        std::fs::write(&p, &data).unwrap();
+        let direct = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&p)
+            .ok();
+        let o = PushObject {
+            buffered: Arc::new(std::fs::File::open(&p).unwrap()),
+            direct,
+            size: size as u64,
+        };
+        eprintln!("direct: {}", o.is_direct());
+        for (off, len) in [
+            (0, 4096),
+            (1, 100),
+            (4095, 2),
+            (1 << 20, 1 << 20),
+            (size as u64 - 7, 7),
+            (12345, 2 << 20),
+        ] {
+            assert_eq!(
+                o.read(off, len).unwrap(),
+                data[off as usize..off as usize + len],
+                "{off}+{len}"
+            );
+        }
+        assert!(o.read(size as u64 - 1, 2).is_err());
+    }
+}
+
 /// A live copy of a file's current generation (`Vfs::copies`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Copy {
@@ -1394,12 +1496,18 @@ impl Vfs {
     /// Open `generation` of `file` for a push source to read (ADR-063): the
     /// same checks as serving a read, and the object stays open for later
     /// reads of it. Blocking.
-    pub fn push_open(
-        &self,
-        file: FileId,
-        generation: Generation,
-    ) -> NestResult<Arc<std::fs::File>> {
-        self.serve_file(file, generation)
+    pub fn push_open(&self, file: FileId, generation: Generation) -> NestResult<PushObject> {
+        let buffered = self.serve_file(file, generation)?;
+        // The same object, direct, where the store's filesystem allows it.
+        let direct = self.raw_attr(file).ok().and_then(|a| {
+            let src = self.local_source(&a)?;
+            src.open_read_direct(ObjectKey::new(file, generation)).ok()
+        });
+        Ok(PushObject {
+            buffered,
+            direct,
+            size: self.raw_attr(file)?.size,
+        })
     }
 
     /// Whether this host's own store holds a live copy of `a`'s generation.

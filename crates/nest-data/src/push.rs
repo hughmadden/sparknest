@@ -34,6 +34,8 @@ use std::time::Duration;
 
 /// Bytes read from a file at once.
 const READ_CHUNK: u64 = 16 << 20;
+/// Reads a source keeps in flight ahead of packing (`READ_CHUNK` each).
+const READ_AHEAD: usize = 4;
 /// Gaps between a file's runs shorter than this are read through.
 const GAP: u64 = 1 << 20;
 /// A group, or a source waiting for a credit, with no progress this long
@@ -1557,10 +1559,12 @@ impl Stream {
     ) -> Result<(), String> {
         let obj = {
             let (v, file, generation) = (vfs.clone(), f.file, f.generation);
-            tokio::task::spawn_blocking(move || v.push_open(file, generation))
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?
+            Arc::new(
+                tokio::task::spawn_blocking(move || v.push_open(file, generation))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?,
+            )
         };
         // The file's ranges, merged across small gaps: one pass in order.
         let mut spans: Vec<(u64, u64)> = f
@@ -1579,29 +1583,39 @@ impl Stream {
                 _ => merged.push((a, b)),
             }
         }
-        for (a, b) in merged {
-            let mut at = a;
-            while at < b {
-                let end = (at + READ_CHUNK).min(b);
-                let buf = {
-                    let (o, len) = (obj.clone(), (end - at) as usize);
-                    tokio::task::spawn_blocking(move || {
-                        use std::os::unix::fs::FileExt;
-                        let mut b = vec![0u8; len];
-                        o.read_exact_at(&mut b, at).map(|_| b)
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .map_err(|e| format!("reading: {e}"))?
-                };
-                for e in f.entries.iter() {
-                    let p = &patterns[e.pattern as usize];
-                    for (s, d, n) in RunWalk::new(p, e, at, end) {
-                        let off = (s - at) as usize;
-                        self.put(e.rank, d, &buf[off..off + n as usize]).await?;
-                    }
+        // Every read of the file, in order, with `READ_AHEAD` in flight while
+        // earlier ones are packed: the disk never waits for the packing.
+        let reads: Vec<(u64, u64)> = merged
+            .iter()
+            .flat_map(|&(a, b)| {
+                (a..b)
+                    .step_by(READ_CHUNK as usize)
+                    .map(move |at| (at, (at + READ_CHUNK).min(b)))
+            })
+            .collect();
+        let mut ahead: VecDeque<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>> =
+            VecDeque::new();
+        let mut next = 0;
+        for &(at, end) in &reads {
+            while next < reads.len() && ahead.len() < READ_AHEAD {
+                let (o, (a, b)) = (obj.clone(), reads[next]);
+                ahead.push_back(tokio::task::spawn_blocking(move || {
+                    o.read(a, (b - a) as usize)
+                }));
+                next += 1;
+            }
+            let buf = ahead
+                .pop_front()
+                .expect("a read in flight")
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("reading: {e}"))?;
+            for e in f.entries.iter() {
+                let p = &patterns[e.pattern as usize];
+                for (s, d, n) in RunWalk::new(p, e, at, end) {
+                    let off = (s - at) as usize;
+                    self.put(e.rank, d, &buf[off..off + n as usize]).await?;
                 }
-                at = end;
             }
         }
         Ok(())

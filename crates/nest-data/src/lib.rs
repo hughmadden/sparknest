@@ -31,4 +31,4 @@ pub mod vfs;
 pub use local::{
     ARCHIVE_STORE_BASE, Archive, ArchiveConfig, DataNode, ReconcileReport, is_archive,
 };
-pub use vfs::{Copy, CopyKind, FenceHook, OpenMode, Passthrough, Vfs, VfsConfig};
+pub use vfs::{Copy, CopyKind, FenceHook, OpenMode, Passthrough, PushObject, Vfs, VfsConfig};

@@ -174,6 +174,16 @@ impl ObjectStore {
         File::open(self.path(k))
     }
 
+    /// The object opened for reading with `O_DIRECT` (bulk reads that must
+    /// not fill the page cache: push loads, ADR-063). Errors where the
+    /// filesystem refuses direct I/O; read it with `open_read` then.
+    pub fn open_read_direct(&self, k: ObjectKey) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(self.path(k))
+    }
+
     pub fn open_write(&self, k: ObjectKey) -> io::Result<File> {
         OpenOptions::new().read(true).write(true).open(self.path(k))
     }
