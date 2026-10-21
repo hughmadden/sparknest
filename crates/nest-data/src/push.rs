@@ -344,7 +344,9 @@ impl Push {
         let p = Arc::new(Push {
             vfs: Arc::downgrade(vfs),
             state: Mutex::new(State::default()),
-            next_group: AtomicU64::new(rand::random::<u64>() >> 16 << 16),
+            // Below 2^53, so ids stay exact as JSON numbers in the web UI;
+            // random high bits keep hubs' ids apart.
+            next_group: AtomicU64::new((rand::random::<u64>() >> 28) << 16),
             landings: std::sync::OnceLock::new(),
             rdma_slots: AtomicU64::new(0),
             rpc_slots: AtomicU64::new(0),

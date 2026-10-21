@@ -119,8 +119,9 @@
 
   // Flow graph geometry.
   const W = 760, PAD = 34, NODE_W = 130;
-  const H = $derived(Math.max(220, 46 * Math.max(S, R) + 40));
-  const ys = (n: number, i: number) => (n <= 1 ? H / 2 : 30 + (i * (H - 60)) / (n - 1));
+  const TOP = 50;
+  const H = $derived(Math.max(220, 46 * Math.max(S, R) + TOP + 24));
+  const ys = (n: number, i: number) => (n <= 1 ? (H + TOP) / 2 : TOP + (i * (H - TOP - 24)) / (n - 1));
   const hue = (s: number) => 186 + ((s * 47) % 120); // cyan → violet
   const ribbon = (s: number, r: number) => {
     const x1 = PAD + NODE_W, x2 = W - PAD - NODE_W;
@@ -129,6 +130,9 @@
     return `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
   };
   const width = (b: number) => (b <= 0 ? 0 : 1.2 + 16 * Math.sqrt(b / pairMax));
+  // A host's finish time, once the replay has passed it.
+  const doneBy = (ms: number | null | undefined) =>
+    ms != null && (at == null || (at + 1) * (full?.bin_ms ?? 250) >= ms) ? ` · ${duration(ms)}` : "";
 
   const heatColor = (b: number) => {
     const k = Math.min(1, b / heatMax);
@@ -210,7 +214,7 @@
               <rect width={NODE_W} height="32" rx="9" class="node" />
               <rect width={NODE_W * k} height="32" rx="9" class="fill" style="fill: hsl({hue(s)} 100% 60% / 0.28)" />
               <text x="10" y="14" class="nm">{name}</text>
-              <text x="10" y="27" class="nb">{human(srcSum[s])}{full.source_done_ms[s] != null ? ` · ${duration(full.source_done_ms[s] ?? 0)}` : ""}</text>
+              <text x="10" y="27" class="nb">{human(srcSum[s])}{doneBy(full.source_done_ms[s])}</text>
             </g>
           {/each}
           {#each full.ranks as name, r}
@@ -220,17 +224,17 @@
               <rect width={NODE_W} height="32" rx="9" class="node" />
               <rect width={NODE_W * k} height="32" rx="9" class="fill" />
               <text x="10" y="14" class="nm">{name} <tspan class="faintt">#{r}</tspan></text>
-              <text x="10" y="27" class="nb">{human(rankSum[r])}{full.rank_done_ms[r] != null ? ` · ${duration(full.rank_done_ms[r] ?? 0)}` : ""}</text>
+              <text x="10" y="27" class="nb">{human(rankSum[r])}{doneBy(full.rank_done_ms[r])}</text>
             </g>
           {/each}
-          <text x={PAD} y="14" class="axis">sources</text>
-          <text x={W - PAD - NODE_W} y="14" class="axis">ranks</text>
+          <text x={PAD} y="16" class="axis">sources</text>
+          <text x={W - PAD - NODE_W} y="16" class="axis">ranks</text>
         </svg>
       </div>
 
       <div class="panel pad">
         <h3 class="sec">Over time</h3>
-        <div class="small muted">each row a host, each column {Math.round(full.bin_ms)} ms; brighter is faster (peak {gbps(heatMax, binS)})</div>
+        <div class="small muted">each row a host, each column {Math.round(full.bin_ms)} ms; brighter is faster (brightest: {gbps(heatMax, binS)} for one host)</div>
         <div class="heat" style="--n: {full.bins.length}">
           <div class="hl caps">sent</div><div></div>
           {#each full.sources as name, s}

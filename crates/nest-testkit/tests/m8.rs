@@ -33,9 +33,11 @@ async fn data_reserve_refuses_data_but_not_metadata() {
     let c = ready(2).await;
     let v1 = &c.node(1).vfs;
     let store = c.node(1).vfs.data().store().clone();
-    let free = store.capacity().unwrap().free;
-    // Leave 256 MiB of room above the reserve.
-    store.set_reserve(free - (256 << 20));
+    // Node 1's disk reports 64 GiB free (its real free space is shared with
+    // the rest of the machine and moves), with 256 MiB of room above the
+    // reserve.
+    store.set_free(Some(64 << 30));
+    store.set_reserve((64 << 30) - (256 << 20));
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let (a, fh, _) = v1
@@ -67,12 +69,7 @@ async fn data_reserve_refuses_data_but_not_metadata() {
         .create(FileId::ROOT, b"big", 0o644, oflags::WRONLY)
         .await
         .unwrap();
-    // Four times the room left on node 1: the disk is shared with the rest
-    // of the machine and btrfs free space moves (300 MiB against 256 MiB of
-    // room fitted 1 run in 8).
-    for i in 0..4u64 {
-        v2.write(fh, i << 28, vec![2u8; 256 << 20]).await.unwrap();
-    }
+    v2.write(fh, 0, vec![2u8; 300 << 20]).await.unwrap();
     v2.release(fh, None).await;
     // Node 1 replicates it: wait until node 1 too sees it stable (else the
     // job may find nothing to copy yet).
@@ -105,6 +102,7 @@ async fn data_reserve_refuses_data_but_not_metadata() {
 
     // Space comes back: writes and replication work again.
     store.set_reserve(0);
+    store.set_free(None);
     let (fh, _) = v1.open(a.id, oflags::WRONLY).await.unwrap();
     assert_eq!(
         v1.write(fh, 1 << 20, vec![1u8; 4 << 20]).await.unwrap(),

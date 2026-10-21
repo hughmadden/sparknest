@@ -60,6 +60,9 @@ pub struct ObjectStore {
     room: std::sync::Mutex<(std::time::Instant, u64)>,
     /// Direct writes each transfer keeps in flight (see `Staging::write`).
     window: usize,
+    /// Free bytes to report instead of statvfs's (tests on a shared disk,
+    /// whose real free space moves under them). 0: statvfs.
+    fixed_free: std::sync::atomic::AtomicU64,
 }
 
 /// Direct writes a transfer keeps in flight unless a store says otherwise.
@@ -102,6 +105,7 @@ impl ObjectStore {
             objects,
             staging: root.join("staging"),
             reserve: std::sync::atomic::AtomicU64::new(0),
+            fixed_free: std::sync::atomic::AtomicU64::new(0),
             room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
             window: DEFAULT_WINDOW,
         })
@@ -128,6 +132,7 @@ impl ObjectStore {
             objects,
             staging,
             reserve: std::sync::atomic::AtomicU64::new(0),
+            fixed_free: std::sync::atomic::AtomicU64::new(0),
             room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
             window: DEFAULT_WINDOW,
         })
@@ -344,12 +349,29 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// Report `free` bytes free from now on instead of the filesystem's
+    /// (`None`: the filesystem's again). For tests.
+    pub fn set_free(&self, free: Option<u64>) {
+        self.fixed_free
+            .store(free.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        // The next reservation samples afresh.
+        *self.room.lock().unwrap_or_else(|e| e.into_inner()) = (
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            0,
+        );
+    }
+
     pub fn capacity(&self) -> io::Result<Capacity> {
         let s = nix::sys::statvfs::statvfs(&self.root).map_err(io::Error::from)?;
         let frag = s.fragment_size() as u64;
+        let fixed = self.fixed_free.load(std::sync::atomic::Ordering::Relaxed);
         Ok(Capacity {
             total: s.blocks() as u64 * frag,
-            free: s.blocks_available() as u64 * frag,
+            free: if fixed > 0 {
+                fixed
+            } else {
+                s.blocks_available() as u64 * frag
+            },
         })
     }
 }
