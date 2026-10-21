@@ -3,7 +3,6 @@ name = "nest-meta"
 description = "Replicated namespace schema, semantic commands and deterministic apply over SQLite"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

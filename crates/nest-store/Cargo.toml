@@ -3,7 +3,6 @@ name = "nest-store"
 description = "Local object store: objects by (file id, generation), staging, deletion, adoption"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

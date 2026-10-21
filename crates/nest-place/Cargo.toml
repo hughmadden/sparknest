@@ -3,7 +3,6 @@ name = "nest-place"
 description = "Placement: selectors, manifests, HF resolver, rules, replication jobs, eviction"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

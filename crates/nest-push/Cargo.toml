@@ -3,7 +3,6 @@ name = "nest-push"
 description = "Push loads (ADR-063): the plan, its checks, the slot format, and the engine-side client"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

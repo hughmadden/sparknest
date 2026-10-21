@@ -316,7 +316,7 @@ pub struct Push {
     /// Tests: report this many RDMA writes that landed as failed, as when
     /// a completion is lost to a lane failure (the slot then also goes by
     /// RPC).
-    lose_acks: Mutex<u64>,
+    lose_acks: AtomicU64,
 }
 
 /// A file resolved at start: its current sealed generation, pinned for the
@@ -372,7 +372,7 @@ impl Push {
             landings: std::sync::OnceLock::new(),
             rdma_slots: AtomicU64::new(0),
             rpc_slots: AtomicU64::new(0),
-            lose_acks: Mutex::new(0),
+            lose_acks: AtomicU64::new(0),
         });
         vfs.rpc().register(
             nest_rpc::service::PUSH,
@@ -394,7 +394,7 @@ impl Push {
     /// Tests: treat the next `n` RDMA slot writes from this host as failed
     /// although they landed (each is then sent again by RPC).
     pub fn lose_rdma_acks(&self, n: u64) {
-        *self.lose_acks.lock() = n;
+        self.lose_acks.store(n, Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> PushStats {
@@ -1980,16 +1980,16 @@ impl Stream {
                 && bytes.len() <= pool.slot_bytes()
                 && let Some(f) = push.vfs().ok().and_then(|v| v.fabric())
             {
-                // A test hook: the lock only guards its counter.
-                let lose = |r: NestResult<()>| {
-                    let mut n = push.lose_acks.lock();
-                    match r {
-                        Ok(()) if *n > 0 => {
-                            *n -= 1;
-                            Err(NestError::Unavailable("ack lost (test)".into()))
-                        }
-                        r => r,
+                let lose = |r: NestResult<()>| match r {
+                    Ok(())
+                        if push
+                            .lose_acks
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                            .is_ok() =>
+                    {
+                        Err(NestError::Unavailable("ack lost (test)".into()))
                     }
+                    r => r,
                 };
                 match lose(f.push_write(to, pool, &bytes, t).await) {
                     Ok(()) => {

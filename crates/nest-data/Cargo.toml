@@ -3,7 +3,6 @@ name = "nest-data"
 description = "Node-local data service: replica lifecycle, sessions, orphans, reads/writes, transfers"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

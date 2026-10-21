@@ -3,7 +3,6 @@ name = "nest-rpc"
 description = "Authenticated, multiplexed request/response RPC between sparknest nodes"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
