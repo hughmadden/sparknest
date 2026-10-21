@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod push_bench;
+
 #[derive(Parser, Debug)]
 #[command(name = "nest", version, about = "sparknest management CLI")]
 struct Cli {
@@ -294,6 +296,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: HfCmd,
     },
+    /// Push loads (ADR-063): a benchmark that plays the engine's part
+    Push {
+        #[command(subcommand)]
+        cmd: PushCmd,
+    },
     /// Import a local directory without copying (hard links into the store)
     ///
     /// The source must be on the same filesystem as this node's store, or
@@ -365,6 +372,53 @@ Examples:
   Into the archive store `scratch` (on one of its gateways; hard links when
   the cache is on the archive's disk):
     nest hf import /mnt/scratch/hf --archive scratch --wait";
+
+#[derive(Subcommand, Debug)]
+enum PushCmd {
+    /// Load files into ranks by push, as an engine would, and time it
+    ///
+    /// Run on the coordinator's host. Every rank takes a strided 1/N share
+    /// of every file (`--run` bytes of every N·run), packed into its arena,
+    /// like a TP split of expert weights. Prints a `nest push rank` command
+    /// line per rank, waits for each rank to join (run those on the rank
+    /// hosts, or pass --local-ranks to run them all here), then reports
+    /// the time and the rate.
+    Bench {
+        /// Files (paths under the mount or in the namespace).
+        #[arg(required = true)]
+        files: Vec<String>,
+        /// The rank hosts, in rank order.
+        #[arg(long, value_delimiter = ',', required = true)]
+        hosts: Vec<String>,
+        /// Bytes per run of a rank's share.
+        #[arg(long, default_value_t = 4096)]
+        run: u32,
+        /// Run every rank's consumer in this process (ranks on this host).
+        #[arg(long)]
+        local_ranks: bool,
+        /// Ring slots per rank and their size.
+        #[arg(long, default_value_t = 128)]
+        slots: u32,
+        #[arg(long, default_value_t = 1 << 20)]
+        slot_bytes: u32,
+    },
+    /// Consume one rank of a push group (copy slots out, release them)
+    Rank {
+        #[arg(long)]
+        group: u64,
+        #[arg(long)]
+        token: u64,
+        #[arg(long)]
+        rank: u32,
+        /// The rank's arena size in bytes.
+        #[arg(long)]
+        arena: u64,
+        #[arg(long, default_value_t = 128)]
+        slots: u32,
+        #[arg(long, default_value_t = 1 << 20)]
+        slot_bytes: u32,
+    },
+}
 
 #[derive(Subcommand, Debug)]
 enum HfCmd {
@@ -721,6 +775,36 @@ enum RuleCmd {
     Rm {
         name: String,
     },
+}
+
+/// This host's push socket, from the same node.toml the API socket comes
+/// from (`[push] socket`), else the default.
+fn push_socket(cli: &Cli) -> Result<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates: Vec<PathBuf> = match &cli.config {
+        Some(c) => vec![c.clone()],
+        None => vec![
+            PathBuf::from("/srv/sparknest/node.toml"),
+            PathBuf::from(format!("{home}/sparknest-test/state/node.toml")),
+            PathBuf::from("/srv/sparknest-test/node.toml"),
+        ],
+    };
+    for c in candidates {
+        if let Ok(text) = std::fs::read_to_string(&c) {
+            let v: toml::Value =
+                toml::from_str(&text).with_context(|| format!("parsing {}", c.display()))?;
+            if v.get("node").is_none() {
+                continue;
+            }
+            return Ok(v
+                .get("push")
+                .and_then(|p| p.get("socket"))
+                .and_then(|s| s.as_str())
+                .unwrap_or(nest_push::proto::SOCKET)
+                .to_string());
+        }
+    }
+    Ok(nest_push::proto::SOCKET.to_string())
 }
 
 fn find_socket(cli: &Cli) -> Result<PathBuf> {
@@ -1883,6 +1967,58 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             v
+        }
+        Cmd::Push { cmd } => {
+            let sock = push_socket(&cli)?;
+            match cmd {
+                PushCmd::Bench {
+                    files,
+                    hosts,
+                    run,
+                    local_ranks,
+                    slots,
+                    slot_bytes,
+                } => {
+                    // Sizes through the mount (symlinks followed, as the
+                    // hub resolves them); the namespace path for the plan.
+                    let st = c.get("/v1/status").await?;
+                    let mnt = st["mountpoint"].as_str().unwrap_or("").to_string();
+                    let mut sizes = Vec::new();
+                    let mut names = Vec::new();
+                    for f in files {
+                        let ns = f.strip_prefix(mnt.as_str()).filter(|_| !mnt.is_empty()).unwrap_or(f);
+                        let local = format!("{}/{}", mnt.trim_end_matches('/'), ns.trim_start_matches('/'));
+                        let size = std::fs::metadata(&local)
+                            .with_context(|| format!("{local}: not readable through the mount"))?
+                            .len();
+                        sizes.push(size);
+                        names.push(ns.to_string());
+                    }
+                    let b = push_bench::Bench {
+                        socket: sock,
+                        files: names,
+                        sizes,
+                        hosts: hosts.clone(),
+                        run: *run,
+                        local_ranks: *local_ranks,
+                        slots: *slots,
+                        slot_bytes: *slot_bytes,
+                    };
+                    tokio::task::spawn_blocking(move || b.run()).await??
+                }
+                PushCmd::Rank {
+                    group,
+                    token,
+                    rank,
+                    arena,
+                    slots,
+                    slot_bytes,
+                } => {
+                    let (g, t, r, a, n, b) = (*group, *token, *rank, *arena, *slots, *slot_bytes);
+                    tokio::task::spawn_blocking(move || push_bench::consume(&sock, g, t, r, a, n, b))
+                        .await??
+                }
+            }
         }
         Cmd::Io => {
             let v = c.get("/v1/status").await?;

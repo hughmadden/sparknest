@@ -383,7 +383,9 @@ impl Node {
             .map(|p| p.to_string_lossy().into_owned());
         let placer =
             nest_place::Placer::start(vfs.clone(), cfg.node.name.clone(), mountpoint.clone());
+        let push = nest_data::push::Push::new(&vfs);
         let api = nest_api::Api {
+            push: Some(push.clone()),
             vfs: vfs.clone(),
             placer: placer.clone(),
             mountpoint,
@@ -436,7 +438,6 @@ impl Node {
             };
             tokio::join!(unix, tcp, counters);
         });
-        let push = nest_data::push::Push::new(&vfs);
         if !cfg.push.socket.is_empty()
             && let Err(e) = nest_data::push::listen(push.clone(), &cfg.push.socket)
         {

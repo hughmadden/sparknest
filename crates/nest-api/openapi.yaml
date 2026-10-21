@@ -1827,6 +1827,42 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 
+  /v1/push:
+    get:
+      tags: [cluster]
+      summary: Push loads on this host (ADR-063)
+      description: >-
+        The push groups this host takes part in (as hub, source or rank
+        host), and how many slots it has sent as a source, by RDMA and by
+        RPC.
+      operationId: push
+      responses:
+        "200":
+          description: This host's push state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groups, rdma_slots, rpc_slots]
+                properties:
+                  groups:
+                    type: array
+                    items:
+                      type: object
+                      required: [group, role]
+                      properties:
+                        group:
+                          type: integer
+                        role:
+                          type: string
+                          enum: [hub, source, rank]
+                  rdma_slots:
+                    type: integer
+                  rpc_slots:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
   /v1/cluster/remove:
     post:
       tags: [cluster]

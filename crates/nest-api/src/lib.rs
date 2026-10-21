@@ -28,6 +28,8 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct Api {
     pub vfs: Arc<Vfs>,
+    /// Push loads (ADR-063), for status.
+    pub push: Option<Arc<nest_data::push::Push>>,
     pub placer: Arc<Placer>,
     pub mountpoint: Option<String>,
     pub hub: String,
@@ -209,6 +211,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/cluster", get(cluster))
         .route("/v1/cluster/raft", get(cluster_raft))
         .route("/v1/net", get(net))
+        .route("/v1/push", get(push_status))
         .route("/v1/cluster/remove", post(cluster_remove))
         .route("/v1/cluster/role", post(cluster_role))
         .route("/v1/cluster/add", post(cluster_add))
@@ -264,6 +267,23 @@ pub async fn serve_unix(api: Api, path: std::path::PathBuf) -> anyhow::Result<()
     tracing::info!(socket = %path.display(), "management API listening");
     axum::serve(listener, router(api)).await?;
     Ok(())
+}
+
+/// Push loads this host takes part in, and what it has sent (ADR-063).
+async fn push_status(State(api): State<Api>) -> R<serde_json::Value> {
+    let Some(p) = &api.push else {
+        return Ok(Json(json!({"groups": [], "rdma_slots": 0, "rpc_slots": 0})));
+    };
+    let st = p.stats();
+    Ok(Json(json!({
+        "groups": p
+            .groups()
+            .into_iter()
+            .map(|(g, role)| json!({"group": g, "role": role}))
+            .collect::<Vec<_>>(),
+        "rdma_slots": st.rdma_slots,
+        "rpc_slots": st.rpc_slots,
+    })))
 }
 
 async fn status(State(api): State<Api>) -> R<serde_json::Value> {
