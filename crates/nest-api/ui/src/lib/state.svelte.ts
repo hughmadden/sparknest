@@ -1,7 +1,7 @@
 // Cluster state shared by every view, refreshed every 2 s while the page is
 // visible, plus routing and toasts.
 
-import { post, hasToken, ApiError, net, wsUrl, setTransport, type Status, type Store, type Job, type LogLine } from "./api";
+import { post, hasToken, tokenRefused, ApiError, net, wsUrl, setTransport, type Status, type Store, type Job, type LogLine } from "./api";
 
 /** One run of `fn` at a time: a slow server gets one request of each kind,
  * never a growing pile. A call made meanwhile is not lost: it runs once
@@ -172,14 +172,23 @@ function connect() {
       p.reject(new ApiError("connection to the node was lost", 0));
       pending.delete(id);
     }
-    // Refused before ever opening: most likely a wrong or old token.
+    app.error = "reconnecting…";
+    const again = () => {
+      setTimeout(() => socket === ws && connect(), retry);
+      retry = Math.min(retry * 2, 15_000);
+    };
+    // Refused before ever opening: ask over HTTP whether the token is the
+    // reason (a phone that killed and reloaded the tab, a proxy dropping
+    // the socket, or a node restarting is not a reason to log out).
     if (!everOpen && ++failures >= 2) {
-      app.authed = false;
+      tokenRefused().then((refused) => {
+        if (socket !== ws) return;
+        if (refused) app.authed = false;
+        else again();
+      });
       return;
     }
-    app.error = "reconnecting…";
-    setTimeout(() => socket === ws && connect(), retry);
-    retry = Math.min(retry * 2, 15_000);
+    again();
   };
 }
 

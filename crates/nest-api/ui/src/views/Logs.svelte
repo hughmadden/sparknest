@@ -2,7 +2,11 @@
   import { type LogLine } from "../lib/api";
   import { app, route, followLogs } from "../lib/state.svelte";
 
-  const KEEP = 5000;
+  // A phone's tab is killed for memory long before a desktop's: fewer
+  // lines there (thousands of rows at once crashed Safari on reload).
+  const small = typeof matchMedia !== "undefined" && matchMedia("(max-width: 899px), (pointer: coarse)").matches;
+  const KEEP = small ? 1500 : 5000;
+  const FIRST = small ? 300 : 1000;
   let host = $state(route.params.get("host") ?? "");
   let level = $state("info");
   let q = $state(route.params.get("q") ?? "");
@@ -13,7 +17,7 @@
 
   // Live: over the page's socket, recent lines first, then each new one.
   $effect(() => {
-    const q: Record<string, unknown> = { level, limit: 1000 };
+    const q: Record<string, unknown> = { level, limit: FIRST };
     if (host) q.host = host;
     if (applied.trim()) q.q = applied.trim();
     if (!follow) return;

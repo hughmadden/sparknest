@@ -24,6 +24,9 @@
 use crate::Api;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+
+/// Log lines per WebSocket frame.
+const LINES_PER_FRAME: usize = 200;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -304,10 +307,20 @@ async fn follow_logs(api: Api, host: Option<String>, q: nest_place::logs::LogQue
                 }
             }
             if first || !fresh.is_empty() {
+                // In frames of a few hundred lines: one frame of the whole
+                // first burst (a quarter MB) was more than a phone's tab or
+                // a proxy liked. Oldest first, so the page's order holds.
                 let body: Vec<_> = fresh.iter().map(|(h, l)| line_json(h, l)).collect();
-                let m = json!({ "type": "lines", "lines": body }).to_string();
-                if tx.send(m).await.is_err() {
-                    return;
+                let chunks: Vec<&[serde_json::Value]> = if body.is_empty() {
+                    vec![&[]]
+                } else {
+                    body.chunks(LINES_PER_FRAME).collect()
+                };
+                for c in chunks {
+                    let m = json!({ "type": "lines", "lines": c }).to_string();
+                    if tx.send(m).await.is_err() {
+                        return;
+                    }
                 }
             }
         }

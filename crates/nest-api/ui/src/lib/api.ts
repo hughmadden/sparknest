@@ -24,6 +24,18 @@ try {
 }
 
 export const hasToken = () => token !== "";
+
+/** Whether the node refuses this token (401) over plain HTTP, which can see
+ * the status a WebSocket handshake hides. Unknown (a network error, the
+ * node restarting) counts as not refused. */
+export async function tokenRefused(): Promise<boolean> {
+  try {
+    const r = await fetch("/v1/status", { headers: { authorization: `Bearer ${token}` } });
+    return r.status === 401;
+  } catch {
+    return false;
+  }
+}
 /** A link that downloads `path` (a file, or a directory as .tar). */
 export const downloadUrl = (path: string) =>
   `/v1/download?path=${encodeURIComponent(path)}&token=${encodeURIComponent(token)}`;
