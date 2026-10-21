@@ -2082,8 +2082,12 @@ impl Stream {
             Ok(v) => v,
             Err(e) => return files.iter().map(|f| (f.index, e.to_string())).collect(),
         };
+        // Each pattern's extent, checked once (plans hold millions of
+        // entries over a few patterns).
+        let extents: Vec<Option<nest_push::plan::Extent>> =
+            patterns.iter().map(|p| p.check().ok()).collect();
         for f in files {
-            if let Err(e) = self.file(&vfs, patterns, &f).await {
+            if let Err(e) = self.file(&vfs, patterns, &extents, &f).await {
                 failed.push((f.index, e));
                 if self.cancelled() {
                     return failed;
@@ -2113,6 +2117,7 @@ impl Stream {
         &mut self,
         vfs: &Arc<Vfs>,
         patterns: &[Pattern],
+        extents: &[Option<nest_push::plan::Extent>],
         f: &SourceFile,
     ) -> Result<(), String> {
         let obj = {
@@ -2129,7 +2134,7 @@ impl Stream {
             .entries
             .iter()
             .filter_map(|e| {
-                let x = patterns.get(e.pattern as usize)?.check().ok()?;
+                let x = (*extents.get(e.pattern as usize)?)?;
                 (x.bytes > 0).then(|| (e.src_base, e.src_base + x.src_len))
             })
             .collect();

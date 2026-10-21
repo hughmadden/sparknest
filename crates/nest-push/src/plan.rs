@@ -149,14 +149,17 @@ impl Pattern {
                     d.src_stride, d.dst_stride
                 ));
             }
-            let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(format!("dim {k}: overflow"));
+            // The message is built only on failure: plans run to millions
+            // of entries.
+            let overflow = || format!("dim {k}: overflow");
+            let mul = |a: u64, b: u64| a.checked_mul(b).ok_or_else(overflow);
             src_inner = mul(last, d.src_stride)?
                 .checked_add(src_inner)
-                .ok_or(format!("dim {k}: overflow"))?;
+                .ok_or_else(overflow)?;
             // The destination steps by position, not by index value.
             dst_inner = mul(d.steps.len() - 1, d.dst_stride)?
                 .checked_add(dst_inner)
-                .ok_or(format!("dim {k}: overflow"))?;
+                .ok_or_else(overflow)?;
             bytes = mul(bytes, d.steps.len())?;
         }
         Ok(Extent {
