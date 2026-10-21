@@ -163,7 +163,6 @@ type EngineTx = tokio::sync::mpsc::UnboundedSender<Event>;
 
 /// A group as the hub holds it.
 struct HubGroup {
-    token: u64,
     ranks: Vec<RankSpec>,
     rank_hosts: Vec<NodeId>,
     files: Vec<String>,
@@ -584,8 +583,11 @@ impl Push {
 
     // ---------------------------------------------------------------- hub
 
-    fn create(
-        &self,
+    /// Open a group, and tell every rank host to expect its ranks before
+    /// answering: ranks may join as soon as the coordinator hands them the
+    /// group and token, before or after `Start` (ADR-063).
+    async fn create(
+        self: &Arc<Self>,
         ranks: Vec<RankSpec>,
         files: Vec<String>,
         engine: EngineTx,
@@ -618,7 +620,6 @@ impl Push {
         self.state.lock().hub.insert(
             group,
             HubGroup {
-                token,
                 ranks,
                 rank_hosts,
                 files,
@@ -640,6 +641,37 @@ impl Push {
                 last_sent: HashMap::new(),
             },
         );
+        let (me, expect) = {
+            let st = self.state.lock();
+            let g = &st.hub[&group];
+            (
+                self.me()?,
+                g.rank_hosts
+                    .iter()
+                    .zip(&g.ranks)
+                    .map(|(h, r)| (*h, r.rank, r.arena_bytes))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for (host, rank, arena) in expect {
+            let sent = self
+                .send(
+                    host,
+                    PushMsg::Expect {
+                        group,
+                        token,
+                        hub: me,
+                        rank,
+                        arena,
+                    },
+                )
+                .await;
+            if let Err(e) = sent {
+                self.fail(group, format!("rank {rank}'s host: {e}"), Vec::new())
+                    .await;
+                return Err(e);
+            }
+        }
         Ok((group, token))
     }
 
@@ -693,7 +725,7 @@ impl Push {
     /// every rank to join, then start the sources.
     async fn start(self: &Arc<Self>, group: u64) -> NestResult<Forecast> {
         let me = self.me()?;
-        let (plan, ranks, rank_hosts, token, notify) = {
+        let (plan, ranks, rank_hosts, notify) = {
             let mut st = self.state.lock();
             let g = st
                 .hub
@@ -712,7 +744,6 @@ impl Push {
                 plan,
                 g.ranks.clone(),
                 g.rank_hosts.clone(),
-                g.token,
                 g.joined_notify.clone(),
             )
         };
@@ -734,19 +765,8 @@ impl Push {
             .unwrap_or_default();
         let holder = assign(&resolved, me, &rates);
 
-        for (r, host) in rank_hosts.iter().enumerate() {
-            self.send(
-                *host,
-                PushMsg::Expect {
-                    group,
-                    token,
-                    hub: me,
-                    rank: r as u32,
-                    arena: ranks[r].arena_bytes,
-                },
-            )
-            .await?;
-        }
+        // Rank hosts were told to expect their ranks at Create; wait for
+        // every rank's Join (some may have joined already).
         let deadline = tokio::time::Instant::now() + JOIN_WAIT;
         let slot_bytes = loop {
             let n = notify.notified();
@@ -1681,7 +1701,7 @@ impl Push {
                     version: _,
                     ranks,
                     files,
-                } if fresh => match self.create(ranks, files, tx.clone()) {
+                } if fresh => match rt.block_on(self.create(ranks, files, tx.clone())) {
                     Ok((group, token)) => {
                         owns_group = Some(group);
                         Some(Event::Created { group, token })

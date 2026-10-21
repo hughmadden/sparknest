@@ -2064,6 +2064,15 @@ their NIC.
 - **Reusing the read lanes:** it would mix credits into the read
   protocol's windows and immediates, and starve FUSE reads during a load.
 
+**Amendment (2026-10-21): ranks may join before Start.** The hub tells
+each rank's host to expect it when the group is created, before answering
+`Created`, so a rank may `Join` any time after the coordinator hands it
+the group and token: before `Start` (the engine's order, which lets it
+know every ring is registered before it commits to the load) or after.
+`Start` still waits, bounded, for the ranks that have not joined. A rank
+host that cannot be told fails `Create`. (The first build sent the
+expectation only at `Start`, refusing an earlier `Join`.)
+
 ## ADR-064 — Placement readable through the mount (2026-10-21)
 
 **Context.** The engine's containers see the hub only through the mount;

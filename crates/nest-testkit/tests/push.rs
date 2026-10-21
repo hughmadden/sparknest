@@ -716,3 +716,98 @@ async fn over_rdma(lost_acks: u64) {
         (2 * share) as f64 / dt.as_secs_f64() / 1e9
     );
 }
+
+/// The engine's order (ADR-063): Create, the plan, every rank's Join
+/// returning, and only then Start. Rank hosts expect their ranks from
+/// Create on, so a Join before Start is taken; the load completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn ranks_may_join_before_start() {
+    let c = ready(3).await;
+    let len = 4 << 20;
+    let data: Vec<u8> = (0..len).map(|i| (i * 11 % 239) as u8).collect();
+    sealed(&c, 2, "early.bin", data.clone()).await;
+    let half = (len / 2) as u64;
+    let (hub, socks) = (c.push_socket(1), [c.push_socket(3), c.push_socket(1)]);
+    let (slots, slot_bytes) = (8u32, 256u32 << 10);
+    let arenas = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(20));
+        let g = Coordinator::create(
+            &hub,
+            vec![
+                RankSpec {
+                    rank: 0,
+                    host: "n3".into(),
+                    arena_bytes: half,
+                },
+                RankSpec {
+                    rank: 1,
+                    host: "n1".into(),
+                    arena_bytes: half,
+                },
+            ],
+            vec!["/early.bin".into()],
+            t,
+        )
+        .unwrap();
+        g.patterns(vec![Pattern {
+            run: half as u32,
+            dims: vec![],
+        }])
+        .unwrap();
+        g.entries(
+            (0..2u32)
+                .map(|r| Entry {
+                    file: 0,
+                    pattern: 0,
+                    src_base: r as u64 * half,
+                    dst_base: 0,
+                    rank: r,
+                })
+                .collect(),
+        )
+        .unwrap();
+        // Every Join returns before Start is sent: no retrying.
+        let joined: Vec<_> = (0..2u32)
+            .map(|r| {
+                let ring = memfd(slots as usize * slot_bytes as usize);
+                let rank = Rank::join(
+                    &socks[r as usize],
+                    JoinArgs {
+                        group: g.group,
+                        token: g.token,
+                        rank: r,
+                        ring_fd: ring.as_raw_fd(),
+                        slots,
+                        slot_bytes,
+                    },
+                    t,
+                )
+                .unwrap_or_else(|e| panic!("rank {r} joining before Start: {e}"));
+                (rank, ring)
+            })
+            .collect();
+        let ranks: Vec<_> = joined
+            .into_iter()
+            .map(|(rank, ring)| {
+                std::thread::spawn(move || run_rank(rank, ring, slots, slot_bytes, half as usize))
+            })
+            .collect();
+        g.start().unwrap();
+        let out: Vec<Vec<u8>> = ranks
+            .into_iter()
+            .map(|h| h.join().unwrap().expect("rank"))
+            .collect();
+        loop {
+            match g.next().unwrap() {
+                Some(Event::Done) => break,
+                Some(Event::Progress { .. }) => {}
+                other => panic!("coordinator got {other:?}"),
+            }
+        }
+        out
+    })
+    .await
+    .unwrap();
+    assert!(arenas[0] == data[..len / 2]);
+    assert!(arenas[1] == data[len / 2..]);
+}
