@@ -2097,3 +2097,51 @@ file that tree walkers may still reach. Live serving state in the
 cluster attribute: needs an RPC per host, so a hung host would hang a
 getxattr; `nest status` and `/v1/status` keep that.
 
+## ADR-065 — The kernel reads ahead; the daemon's readahead is gone (2026-10-21)
+
+**Context.** The daemon read files with copies elsewhere through its own
+readahead (ADR-030): 4 MiB chunks kept in flight per handle, spread over
+the copies, learning when a file is read randomly and stopping (ADR-031,
+033). It was built for model weights. Two of its main users read in ways
+it fits badly: the engine's tensor reads (33–35% of fetched bytes unused,
+`benchmarks/M13-MODEL-LOAD.md`), and Engram lookups (a 4 MiB chunk per
+4 KiB row until the file is judged random). Weights now load by push
+(ADR-063). The kernel already reads ahead for FUSE files, follows
+`madvise`/`fadvise`, and production mounts set `read_ahead_kb` to 16 MiB.
+
+Measured over RDMA loopback on raptor, a remote sealed file read cold
+through a real mount with `read_ahead_kb` = 16384:
+
+| Daemon readahead | 1 GiB sequential | 2 GiB sequential | random 4 KiB |
+|---|---|---|---|
+| on | 2.39 GB/s | 2.32 GB/s | 66–71 µs |
+| off | 2.40 GB/s | 2.67 GB/s | 58–59 µs |
+
+With the kernel's default 128 KiB window the daemon's readahead was
+faster (2.89 against 1.74 GB/s): the window, not the daemon, is what
+matters, and every production mount has 16 MiB.
+
+**Decision.** The daemon's readahead is removed, with everything that
+existed for it:
+- **Reads go out as asked.** A local copy is read from local disk (the
+  fast path, or passthrough); a remote one is fetched exactly as asked
+  from whichever copy is least busy (small reads on the completion thread,
+  ADR-034), and the kernel's readahead decides what to fetch ahead.
+- **The read-pattern detector goes** (it only judged when to stop reading
+  ahead). Files' stored scattered flag stays in metadata (ADR-018) but no
+  longer changes how they are read, and nothing sets it.
+- **`passthrough = "sole"` behaves as `"always"`:** it kept local files
+  away from the kernel only so their reads could be spread over other
+  copies. `balance_reads` is accepted and ignored.
+- **Status fields** that travel between hosts (`scattered_files`,
+  `readahead_*_bytes`) stay, always 0, so hosts on either side of an
+  upgrade read each other.
+
+What is lost: a file on this host and others is read from the local disk
+alone, not spread over every copy (one NVMe is 5–9 GB/s; weights load by
+push). A remote-only file is still spread over its copies, per request.
+
+**Alternatives.** A cluster setting to keep the readahead switchable:
+measured and rejected, as it would keep 1,000 lines for a mode no workload
+here wants. Raising the kernel's `max_pages` instead: needs a sysctl on
+every host and helps only reads larger than 1 MiB.

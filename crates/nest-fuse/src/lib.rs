@@ -726,10 +726,10 @@ impl Filesystem for Fs {
             Some(Err(e)) => return reply.error(errno_for("read", eino, &e)),
             None => {}
         }
-        // A scattered file with no copy here (page faults on a lookup
-        // table): send the fabric read and return; the fabric's completion
-        // thread replies. On an error, retry the ordinary way.
-        if let Some(r) = self.vfs.prepare_scattered(fh.0, offset, size) {
+        // A small read with no copy here: send the fabric read and return;
+        // the fabric's completion thread replies. On an error, retry the
+        // ordinary way.
+        if let Some(r) = self.vfs.prepare_remote(fh.0, offset, size) {
             let (vfs, rt) = (self.vfs.clone(), self.rt.clone());
             r.start(Box::new(move |res| match res {
                 Ok(b) => reply.data(b),

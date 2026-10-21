@@ -254,33 +254,6 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 
-  /v1/read-pattern:
-    post:
-      tags: [files]
-      summary: Record how files are read (ADR-031), overriding what hosts learned
-      operationId: readPattern
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [path, scattered]
-              properties:
-                path:
-                  type: string
-                recursive:
-                  type: boolean
-                  default: false
-                scattered:
-                  type: boolean
-                  description: true reads directly (scattered), false reads ahead (stream).
-      responses:
-        "200":
-          $ref: "#/components/responses/Changed"
-        default:
-          $ref: "#/components/responses/Error"
-
   /v1/passthrough:
     get:
       tags: [files]

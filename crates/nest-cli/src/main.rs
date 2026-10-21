@@ -46,21 +46,6 @@ enum Cmd {
         #[arg(long)]
         unseal: bool,
     },
-    /// Say how files are read: scattered (read directly) or stream (read ahead)
-    ///
-    /// Hosts learn this on their own when readahead goes unused (small reads
-    /// at random offsets, e.g. a lookup table mapped with MADV_RANDOM) and
-    /// record it with the file; this overrides that. Scattered files are
-    /// read exactly as asked, from this host's copy when it has one
-    /// (passthrough for new opens where allowed) or from the least busy
-    /// copy.
-    ReadPattern {
-        path: String,
-        #[arg(value_parser = ["scattered", "stream"])]
-        pattern: String,
-        #[arg(short, long)]
-        recursive: bool,
-    },
     /// Always hand a file, tree or model to the kernel where a host has it all
     ///
     /// Hosts with a complete local copy of a marked file give it to the
@@ -1263,17 +1248,6 @@ async fn main() -> Result<()> {
             )
             .await?
         }
-        Cmd::ReadPattern {
-            path,
-            pattern,
-            recursive,
-        } => {
-            c.post(
-                "/v1/read-pattern",
-                json!({ "path": abspath(path), "recursive": recursive, "scattered": pattern == "scattered" }),
-            )
-            .await?
-        }
         Cmd::Passthrough { selector, mode } => {
             let selector = abspath(selector);
             match mode.as_deref() {
@@ -1562,22 +1536,16 @@ async fn main() -> Result<()> {
             v
         }
         Cmd::Plan {
-            cmd:
-                Some(
-                    PlanCmd::Skip {
-                        id,
-                        host,
-                        matches,
-                    }
-                    | PlanCmd::Unskip {
-                        id,
-                        host,
-                        matches,
-                    },
-                ),
+            cmd: Some(PlanCmd::Skip { id, host, matches } | PlanCmd::Unskip { id, host, matches }),
             ..
         } => {
-            let on = matches!(cli.cmd, Cmd::Plan { cmd: Some(PlanCmd::Unskip { .. }), .. });
+            let on = matches!(
+                cli.cmd,
+                Cmd::Plan {
+                    cmd: Some(PlanCmd::Unskip { .. }),
+                    ..
+                }
+            );
             let v = c
                 .post(
                     &format!("/v1/plans/{id}/select"),
@@ -1743,9 +1711,9 @@ async fn main() -> Result<()> {
             };
             let only = match cmd {
                 ConfigCmd::Ls => None,
-                ConfigCmd::Get { name } | ConfigCmd::Set { name, .. } | ConfigCmd::Reset { name } => {
-                    Some(name.as_str())
-                }
+                ConfigCmd::Get { name }
+                | ConfigCmd::Set { name, .. }
+                | ConfigCmd::Reset { name } => Some(name.as_str()),
             };
             let all: Vec<&Value> = v["settings"].as_array().into_iter().flatten().collect();
             let shown: Vec<&Value> = all
@@ -1986,8 +1954,15 @@ async fn main() -> Result<()> {
                     let mut sizes = Vec::new();
                     let mut names = Vec::new();
                     for f in files {
-                        let ns = f.strip_prefix(mnt.as_str()).filter(|_| !mnt.is_empty()).unwrap_or(f);
-                        let local = format!("{}/{}", mnt.trim_end_matches('/'), ns.trim_start_matches('/'));
+                        let ns = f
+                            .strip_prefix(mnt.as_str())
+                            .filter(|_| !mnt.is_empty())
+                            .unwrap_or(f);
+                        let local = format!(
+                            "{}/{}",
+                            mnt.trim_end_matches('/'),
+                            ns.trim_start_matches('/')
+                        );
                         let size = std::fs::metadata(&local)
                             .with_context(|| format!("{local}: not readable through the mount"))?
                             .len();
@@ -2015,8 +1990,10 @@ async fn main() -> Result<()> {
                     slot_bytes,
                 } => {
                     let (g, t, r, a, n, b) = (*group, *token, *rank, *arena, *slots, *slot_bytes);
-                    tokio::task::spawn_blocking(move || push_bench::consume(&sock, g, t, r, a, n, b))
-                        .await??
+                    tokio::task::spawn_blocking(move || {
+                        push_bench::consume(&sock, g, t, r, a, n, b)
+                    })
+                    .await??
                 }
             }
         }
@@ -2041,24 +2018,11 @@ async fn main() -> Result<()> {
                         0 => "?".to_string(),
                         b => format!("{}/s", human(b)),
                     };
-                    let mut caps = format!(
+                    let caps = format!(
                         "disk {} · links {}",
                         rate("disk_read_bps"),
                         rate("link_bps")
                     );
-                    let dropped = n["info"]["readahead_dropped_bytes"].as_u64().unwrap_or(0);
-                    if dropped > 0 {
-                        let used = n["info"]["readahead_used_bytes"].as_u64().unwrap_or(0);
-                        caps += &format!(
-                            " · readahead waste {:.0}% of {}",
-                            100.0 * (1.0 - used as f64 / dropped as f64),
-                            human(dropped)
-                        );
-                    }
-                    match n["info"]["scattered_files"].as_u64().unwrap_or(0) {
-                        0 => {}
-                        k => caps += &format!(" · {k} file{} read directly (scattered)", if k == 1 { "" } else { "s" }),
-                    }
                     if io.is_empty() {
                         println!("{host}: {caps}; no spread reads yet");
                         io_window_table(&n["info"]["io_windows"][1]);
@@ -2511,15 +2475,6 @@ fn io_window_table(w: &Value) {
             us(&c["p50_us"]),
             us(&c["p90_us"]),
             us(&c["p99_us"])
-        );
-    }
-    let dropped = w["readahead_dropped"].as_u64().unwrap_or(0);
-    if dropped > 0 {
-        let used = w["readahead_used"].as_u64().unwrap_or(0);
-        println!(
-            "    readahead: dropped {} of chunks, {:.0}% unused",
-            human(dropped),
-            100.0 * (1.0 - used as f64 / dropped as f64)
         );
     }
 }

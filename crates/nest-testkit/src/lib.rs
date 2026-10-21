@@ -35,9 +35,7 @@ pub fn fast_tuning() -> Tuning {
             finalize_linger: Duration::from_millis(50),
             catch_up_wait: Duration::from_secs(5),
             rpc_timeout: Duration::from_secs(3),
-            readahead_chunks: 8,
             passthrough: nest_data::Passthrough::Always,
-            balance_reads: true,
         },
         lease: Duration::from_millis(800),
         mount: false,
@@ -229,7 +227,7 @@ impl TestCluster {
                 allow_nonempty: false,
                 rescue_unmounted: true,
                 passthrough: self.tuning.vfs.passthrough,
-                balance_reads: self.tuning.vfs.balance_reads,
+                balance_reads: true,
             },
             hf: Default::default(),
             push: sparknestd::config::PushSection {

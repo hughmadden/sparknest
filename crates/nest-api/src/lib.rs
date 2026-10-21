@@ -157,7 +157,6 @@ pub fn router(api: Api) -> Router {
         .route("/v1/rm", post(remove))
         .route("/v1/fsck", post(fsck))
         .route("/v1/seal-policy", post(seal_policy))
-        .route("/v1/read-pattern", post(read_pattern))
         .route(
             "/v1/passthrough",
             get(get_passthrough).post(set_passthrough),
@@ -497,50 +496,6 @@ async fn seal(State(api): State<Api>, Json(r): Json<SealReq>) -> R<serde_json::V
         match api.vfs.seal(e.file, r.sealed).await {
             Ok(_) => changed += 1,
             Err(err) => errors.push(format!("{}: {err}", e.path)),
-        }
-    }
-    Ok(Json(json!({ "changed": changed, "errors": errors })))
-}
-
-#[derive(Deserialize)]
-struct ReadPatternReq {
-    path: String,
-    #[serde(default)]
-    recursive: bool,
-    /// Reads are scattered (read directly) or stream (read ahead).
-    scattered: bool,
-}
-
-/// Record how files are read (ADR-031), overriding what hosts learned.
-async fn read_pattern(
-    State(api): State<Api>,
-    Json(r): Json<ReadPatternReq>,
-) -> R<serde_json::Value> {
-    let path = api.ns(&r.path);
-    let files: Vec<(nest_types::FileId, String)> = if r.recursive {
-        selector::resolve_tree(&api.conn()?, &path)?
-            .entries
-            .into_iter()
-            .map(|e| (e.file, e.path))
-            .collect()
-    } else {
-        vec![(selector::resolve_path(&api.conn()?, &path)?.0, path.clone())]
-    };
-    let mut changed = 0;
-    let mut errors = Vec::new();
-    for (file, p) in files {
-        match api
-            .vfs
-            .data()
-            .meta()
-            .propose(nest_meta::Command::SetReadPattern {
-                file,
-                scattered: r.scattered,
-            })
-            .await
-        {
-            Ok(_) => changed += 1,
-            Err(e) => errors.push(format!("{p}: {e}")),
         }
     }
     Ok(Json(json!({ "changed": changed, "errors": errors })))

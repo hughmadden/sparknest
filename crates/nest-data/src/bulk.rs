@@ -1,7 +1,7 @@
 //! Transports for remote reads in whole chunks: the RDMA fabric between
 //! fabric hosts, TCP lanes when either end is off the fabric (ADR-048),
 //! and between fabric hosts RDMA with the standby lanes on the LAN behind
-//! it (ADR-057). Readahead works over any of them.
+//! it (ADR-057).
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -11,9 +11,6 @@ use std::sync::Arc;
 pub(crate) trait Bulk: Send + Sync + 'static {
     /// Largest single read.
     fn chunk(&self) -> usize;
-    /// Whether a speculative read may start now: it must never take what a
-    /// demanded read needs (PROPOSAL invariant 9).
-    fn speculate(&self) -> bool;
     /// Read `len` bytes (≤ chunk) of exactly `generation` from `peer`.
     fn fetch(
         self: Arc<Self>,
@@ -28,12 +25,6 @@ pub(crate) trait Bulk: Send + Sync + 'static {
 impl Bulk for nest_fabric::Fabric {
     fn chunk(&self) -> usize {
         nest_fabric::Fabric::chunk(self)
-    }
-
-    /// Fetched chunks hold a landing slot until copied out: speculate only
-    /// while a quarter of them are spare.
-    fn speculate(&self) -> bool {
-        self.spare_landing() > self.landing_slots() / 4
     }
 
     fn fetch(
@@ -77,10 +68,6 @@ impl Bulk for Standby {
         nest_fabric::Fabric::chunk(&self.fabric).min(self.lanes.chunk())
     }
 
-    fn speculate(&self) -> bool {
-        self.fabric.speculate()
-    }
-
     fn fetch(
         self: Arc<Self>,
         peer: NodeId,
@@ -111,10 +98,6 @@ impl Bulk for nest_fabric::tcp::Lanes {
 
     /// Lanes land in ordinary memory under a byte budget that every read,
     /// speculative or not, waits its turn for.
-    fn speculate(&self) -> bool {
-        true
-    }
-
     fn fetch(
         self: Arc<Self>,
         peer: NodeId,

@@ -3,6 +3,24 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-21 — Push loads built; the daemon's readahead removed (0.6.0 in progress)
+
+- Push loads (ADR-063): the plan crate (`nest-push`), the hub, sources and
+  rank hosts, slots written by the source's NIC straight into the engine's
+  ring, O_DIRECT source reads four ahead. Over RDMA loopback on raptor,
+  2 GiB from NVMe to two ranks at 4.7 GB/s. First run across the trial
+  cluster (6 sources, 6 ranks, 8 GiB each): 6.2 GB/s in all, about
+  1.1 GB/s per rank, below target; being worked on.
+- Placement readable through the mount (ADR-064): `user.sparknest.hosts`,
+  `.where`, `.cluster`.
+- The daemon's readahead and read-pattern detector are gone (ADR-065):
+  with the mount's 16 MiB kernel window, reading as asked was as fast
+  sequentially (2.40–2.67 against 2.32–2.39 GB/s) and 12–17% faster at
+  random 4 KiB. `nest read-pattern` and `/v1/read-pattern` removed;
+  `passthrough = "sole"` now behaves as `"always"`.
+- Fixed three flaky tests (two m8 races replicating before the target
+  host saw the file stable; a data-reserve margin on a shared disk).
+
 ## 2026-10-21 — Model-load baseline; push loads designed (ADR-063)
 
 - Measured the engine's model loads through the mount with a 1 Hz

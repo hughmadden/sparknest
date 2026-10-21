@@ -67,7 +67,12 @@ async fn data_reserve_refuses_data_but_not_metadata() {
         .create(FileId::ROOT, b"big", 0o644, oflags::WRONLY)
         .await
         .unwrap();
-    v2.write(fh, 0, vec![2u8; 300 << 20]).await.unwrap();
+    // Four times the room left on node 1: the disk is shared with the rest
+    // of the machine and btrfs free space moves (300 MiB against 256 MiB of
+    // room fitted 1 run in 8).
+    for i in 0..4u64 {
+        v2.write(fh, i << 28, vec![2u8; 256 << 20]).await.unwrap();
+    }
     v2.release(fh, None).await;
     // Node 1 replicates it: wait until node 1 too sees it stable (else the
     // job may find nothing to copy yet).

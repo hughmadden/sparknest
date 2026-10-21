@@ -271,13 +271,11 @@ impl Node {
                 // Its own copy first, always; never spread over others.
                 VfsConfig {
                     passthrough: nest_data::vfs::Passthrough::Always,
-                    balance_reads: false,
                     ..tuning.vfs.clone()
                 }
             } else {
                 VfsConfig {
                     passthrough: cfg.fuse.passthrough,
-                    balance_reads: cfg.fuse.balance_reads,
                     ..tuning.vfs.clone()
                 }
             },

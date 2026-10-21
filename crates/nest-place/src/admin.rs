@@ -43,10 +43,10 @@ pub struct NodeInfo {
     #[serde(default)]
     pub local_read_bytes: u64,
     /// Files this host reads directly because reads are scattered (ADR-031).
+    /// Retired with the daemon's readahead (ADR-065): always 0, kept so
+    /// hosts on either side of an upgrade read each other's replies.
     #[serde(default)]
     pub scattered_files: u64,
-    /// Readahead chunks this host fetched and dropped, and bytes of them
-    /// readers used: the rest was wasted reading (ADR-031).
     #[serde(default)]
     pub readahead_dropped_bytes: u64,
     #[serde(default)]
@@ -432,10 +432,10 @@ impl Admin {
                 f.stats.read_now.load(std::sync::atomic::Ordering::Relaxed)
             }),
             local_read_bytes: self.vfs.local_read_bytes(),
-            scattered_files: self.vfs.scattered_files() as u64,
+            scattered_files: 0,
             io_windows: self.vfs.io_windows(),
-            readahead_dropped_bytes: self.vfs.readahead_totals().0,
-            readahead_used_bytes: self.vfs.readahead_totals().1,
+            readahead_dropped_bytes: 0,
+            readahead_used_bytes: 0,
             io: self.vfs.io_report(),
             disk_read_bps: self.vfs.disk_read_bps(),
             fabric_timing: fab

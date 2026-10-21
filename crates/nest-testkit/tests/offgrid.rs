@@ -463,8 +463,9 @@ async fn mark(c: &TestCluster, f: FileId, always: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn passthrough_gives_way_to_fabric_copies_unless_the_file_is_marked() {
-    // Every host on the `sole` policy (ADR-053).
+async fn every_local_copy_goes_to_the_kernel() {
+    // `sole` keeps no file from the kernel any more (ADR-065): the daemon
+    // reads a local copy from local disk either way.
     let mut t = nest_testkit::fast_tuning();
     t.vfs.passthrough = nest_data::Passthrough::Sole;
     let mut c = TestCluster::start_with(3, t).await;
@@ -490,28 +491,20 @@ async fn passthrough_gives_way_to_fabric_copies_unless_the_file_is_marked() {
     c.converge().await;
 
     assert!(passthrough(&c, 1, f).await, "the only copy");
-    // An off-grid copy is never read from by fabric hosts: no reason to
-    // give up the kernel's path.
     replicate(&c, f, 1, 4).await;
-    assert!(passthrough(&c, 1, f).await, "gave way to an off-grid copy");
-    // A second fabric copy: the daemon spreads reads over both.
     replicate(&c, f, 1, 2).await;
-    assert!(
-        !passthrough(&c, 1, f).await,
-        "kept passthrough beside a fabric copy"
-    );
-
-    // Marked: every host with a complete copy hands it to the kernel.
-    mark(&c, f, true).await;
-    assert!(passthrough(&c, 1, f).await);
-    assert!(passthrough(&c, 2, f).await);
+    assert!(passthrough(&c, 1, f).await, "beside other copies");
+    assert!(passthrough(&c, 2, f).await, "a second fabric copy");
     assert!(
         !passthrough(&c, 3, f).await,
         "passthrough without a local copy"
     );
-    // Unmarked: back to the host's policy.
+    // Marked always passthrough (ADR-053): still every host with a copy.
+    mark(&c, f, true).await;
+    assert!(passthrough(&c, 1, f).await);
+    assert!(!passthrough(&c, 3, f).await);
     mark(&c, f, false).await;
-    assert!(!passthrough(&c, 1, f).await);
+    assert!(passthrough(&c, 1, f).await);
 }
 
 fn lane_writes(c: &TestCluster, id: u64) -> (u64, u64) {

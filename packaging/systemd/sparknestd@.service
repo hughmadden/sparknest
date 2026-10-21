@@ -24,8 +24,9 @@ NotifyAccess=main
 User=@USER@
 Group=@GROUP@
 ExecStart=@BIN_DIR@/sparknestd --config @STATE_DIR@/node.toml
-# Raise kernel readahead for the FUSE mount (default 128 KiB caps cold
-# reads of sealed files); '+' runs this one step with full privileges.
+# Raise kernel readahead for the FUSE mount: the kernel is the only
+# readahead (ADR-065), and its default 128 KiB caps cold remote reads near
+# 1.7 GB/s; '+' runs this one step with full privileges.
 # In the background: after a crash the mount can take a while (recovery).
 ExecStartPost=+/bin/sh -c '( for i in $(seq 3600); do d=$(mountpoint -d @MOUNT@ 2>/dev/null) && echo 16384 > /sys/class/bdi/$d/read_ahead_kb && exit 0; sleep 1; done ) >/dev/null 2>&1 &'
 ExecStopPost=-/usr/bin/fusermount3 -uz @MOUNT@

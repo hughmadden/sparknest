@@ -129,10 +129,6 @@ mode = "auto"
 [fuse]
 allow_other = true
 io_uring = true
-# Passthrough where this host holds the only copy, or reads are scattered;
-# files with several copies are read through sparknest, spread over them.
-passthrough = "sole"
-balance_reads = true
 
 [hf]
 home = "/hf-home"

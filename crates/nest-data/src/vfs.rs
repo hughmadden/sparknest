@@ -48,12 +48,8 @@ pub struct VfsConfig {
     pub catch_up_wait: Duration,
     /// Timeout for data requests to other nodes.
     pub rpc_timeout: Duration,
-    /// Largest readahead window, in fabric chunks.
-    pub readahead_chunks: usize,
     /// When a sealed file with a local copy is handed to the kernel.
     pub passthrough: Passthrough,
-    /// Read files with several copies from several of them (ADR-030).
-    pub balance_reads: bool,
 }
 
 /// When a sealed file with a local copy is served by the kernel directly
@@ -77,9 +73,7 @@ impl Default for VfsConfig {
             finalize_linger: Duration::from_millis(250),
             catch_up_wait: Duration::from_secs(10),
             rpc_timeout: Duration::from_secs(10),
-            readahead_chunks: 16,
             passthrough: Passthrough::Always,
-            balance_reads: true,
         }
     }
 }
@@ -243,18 +237,11 @@ struct Handle {
     lock_owners: Mutex<HashSet<u64>>,
     /// A remote owner this handle wrote through, to leave on close.
     remote: Mutex<Option<(NodeId, Epoch)>>,
-    /// Sequential readahead state for remote reads over the fabric.
-    readahead: tokio::sync::Mutex<Option<crate::readahead::Readahead>>,
     /// Bytes read through this handle not yet folded into usage: local,
     /// remote, archive.
     read_bytes: [AtomicU64; 3],
-    /// How reads of a generation are served, decided on its first read:
-    /// `Some(sources)` when spread over several copies.
+    /// The copies reads of a generation go to, decided on its first read.
     route: Mutex<Option<(Generation, Option<Route>)>>,
-    /// Where this handle's previous direct read ended (u64::MAX: none), and
-    /// the bytes of the sequential run it continued.
-    last_end: AtomicU64,
-    run: AtomicU64,
     /// The file's attributes for fast-path reads of a STABLE generation,
     /// trusted for `ATTR_TTL`: every read names its exact generation, so a
     /// rewrite in between fails as Stale and the slow path refreshes.
@@ -264,8 +251,8 @@ struct Handle {
 /// A generation readable from several copies.
 #[derive(Clone)]
 struct Route {
+    /// Other fabric hosts holding a live copy.
     sources: Vec<crate::balance::Source>,
-    local: Option<Arc<nest_store::ObjectStore>>,
 }
 
 impl Handle {
@@ -309,8 +296,6 @@ pub struct Vfs {
     owned: Mutex<HashMap<FileId, Arc<Owned>>>,
     usage: Arc<crate::usage::Usage>,
     balancer: Arc<crate::balance::Balancer>,
-    /// Which files are read in scattered pieces (read directly).
-    patterns: Arc<crate::pattern::Patterns>,
     /// Read latencies by kind and size, over recent windows.
     io: Arc<nest_fabric::iostats::IoStats>,
     /// This host's measured disk read rate (bytes/s; 0 until measured).
@@ -447,7 +432,6 @@ impl Vfs {
             owned: Mutex::new(HashMap::new()),
             usage: Arc::new(crate::usage::Usage::open(d.store().root())),
             balancer: Arc::new(crate::balance::Balancer::default()),
-            patterns: Arc::default(),
             io: Arc::default(),
             disk_bps: Arc::new(AtomicU64::new(
                 crate::diskprobe::load(d.store().root()).map_or(0, |b| b.bytes_per_s),
@@ -475,20 +459,6 @@ impl Vfs {
                 v.on_effect(index, e);
             }
         }));
-        // A verdict on how a file is read goes into its metadata, so other
-        // hosts and restarts start from it (ADR-031).
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let weak = Arc::downgrade(&vfs);
-            vfs.patterns.set_on_change(Box::new(move |file, scattered| {
-                let weak = weak.clone();
-                rt.spawn(async move {
-                    let Some(v) = weak.upgrade() else { return };
-                    if let Err(e) = v.propose(Command::SetReadPattern { file, scattered }).await {
-                        tracing::debug!(file = file.0, error = %e, "could not record the read pattern");
-                    }
-                });
-            }));
-        }
         // Ownerships granted before this VFS existed (startup) are finalized
         // by the data node; nothing to adopt here.
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -535,18 +505,16 @@ impl Vfs {
         self.fabric().map_or(0, |f| f.link_bytes_per_s())
     }
 
-    /// The copies a STABLE generation can be read from, when there are
-    /// several: this host's live copy and every other host's.
+    /// The other fabric hosts a STABLE generation can be read from over
+    /// RDMA (`None`: none, or no fabric).
     fn route_for(&self, a: &FileAttr) -> Option<Route> {
         use crate::balance::Source;
-        if !self.cfg.balance_reads || a.gen_state != GenState::Stable || self.fabric().is_none() {
+        if a.gen_state != GenState::Stable || self.fabric().is_none() {
             return None;
         }
-        let key = ObjectKey::new(a.id, a.generation);
-        let local = self.d.servable(key).then(|| self.d.store().clone());
         let me = self.me();
         let offgrid = self.offgrid_hosts();
-        let mut sources: Vec<Source> = self
+        let sources: Vec<Source> = self
             .q(|c| query::replicas(c, a.id))
             .ok()?
             .into_iter()
@@ -561,10 +529,7 @@ impl Vfs {
             .filter(|n| !offgrid.contains(n))
             .map(Source::Peer)
             .collect();
-        if local.is_some() {
-            sources.insert(0, Source::Local);
-        }
-        (sources.len() >= 2).then_some(Route { sources, local })
+        (!sources.is_empty()).then_some(Route { sources })
     }
 
     /// The handle's route for `a`'s generation, deciding it on first use.
@@ -595,17 +560,14 @@ impl Vfs {
         h.count(src, n);
     }
 
-    /// A scattered read with no copy here, ready to send without waiting:
+    /// A read with no copy here, ready to send without waiting:
     /// the frontend starts it and replies from `done`, which runs on the
     /// fabric's completion thread (no thread waits for the answer, and no
     /// trip through the runtime). `None`: use `read`.
-    pub fn prepare_scattered(&self, fh: u64, offset: u64, size: u32) -> Option<ScatteredRead> {
+    pub fn prepare_remote(&self, fh: u64, offset: u64, size: u32) -> Option<ScatteredRead> {
         let h = self.handle(fh).ok()?;
         let a = self.fast_attr(&h)?;
-        if a.gen_state != GenState::Stable
-            || !self.patterns.is_random(h.file)
-            || self.own_read_source(&a).is_some()
-        {
+        if a.gen_state != GenState::Stable || self.own_read_source(&a).is_some() {
             return None;
         }
         let fab = self.fabric()?;
@@ -652,32 +614,9 @@ impl Vfs {
         Some(a)
     }
 
-    /// A direct read of a scattered file: note whether it continued the
-    /// handle's previous one (streams switch back to readahead).
-    fn note_direct(&self, h: &Handle, offset: u64, n: u64) {
-        if h.last_end.swap(offset + n, Ordering::Relaxed) == offset {
-            h.run.fetch_add(n, Ordering::Relaxed);
-        } else {
-            let run = h.run.swap(n, Ordering::Relaxed);
-            if run > 0 {
-                self.patterns.run_ended(h.file, run);
-            }
-        }
-    }
-
-    /// Readahead chunks dropped on this host, and bytes of them consumed.
-    pub fn readahead_totals(&self) -> (u64, u64) {
-        self.patterns.readahead_totals()
-    }
-
-    /// Read latencies and readahead waste over the last 10 s, 1 min, 10 min.
+    /// Read latencies over the last 10 s, 1 min, 10 min.
     pub fn io_windows(&self) -> Vec<nest_fabric::iostats::Window> {
         self.io.windows()
-    }
-
-    /// Files this host currently reads directly (scattered reads).
-    pub fn scattered_files(&self) -> usize {
-        self.patterns.random_files()
     }
 
     /// Bytes read from this host's own disk through sparknest so far.
@@ -1972,25 +1911,6 @@ impl Vfs {
             .unwrap_or(false)
     }
 
-    /// Whether reads of `a` could be spread: another fabric host holds a
-    /// live copy. Off-grid hosts' copies never take part (ADR-047), so they
-    /// do not cost this host its passthrough (ADR-053).
-    fn spreadable_elsewhere(&self, a: &FileAttr) -> bool {
-        let me = self.me();
-        let offgrid = self.offgrid_hosts();
-        self.q(|c| query::replicas(c, a.id))
-            .map(|rs| {
-                rs.iter().any(|r| {
-                    r.generation == a.generation
-                        && r.state == nest_types::ReplicaState::Live
-                        && !crate::is_archive(r.store)
-                        && NodeId(r.store.0) != me
-                        && !offgrid.contains(&NodeId(r.store.0))
-                })
-            })
-            .unwrap_or(false)
-    }
-
     /// The open object to serve `generation` of `file` from, cached for
     /// STABLE generations (a remote read used to cost two queries, a stat
     /// and an open per request).
@@ -2098,11 +2018,8 @@ impl Vfs {
             reader: Mutex::new(None),
             lock_owners: Mutex::new(HashSet::new()),
             remote: Mutex::new(None),
-            readahead: tokio::sync::Mutex::new(None),
             read_bytes: Default::default(),
             route: Mutex::new(None),
-            last_end: AtomicU64::new(u64::MAX),
-            run: AtomicU64::new(0),
             stable_attr: Mutex::new(None),
         });
         self.handles.lock().insert(fh, h);
@@ -2124,13 +2041,9 @@ impl Vfs {
             let key = ObjectKey::new(a.id, a.generation);
             let allowed = pinned
                 || match self.cfg.passthrough {
-                    Passthrough::Always => true,
-                    // Other fabric hosts hold copies: let the daemon spread
-                    // the reads, unless they are scattered (the local disk
-                    // answers those fastest).
-                    Passthrough::Sole => {
-                        !self.spreadable_elsewhere(a) || self.patterns.is_random(a.id)
-                    }
+                    // The daemon reads a local copy from local disk anyway
+                    // (ADR-065): the kernel does it best.
+                    Passthrough::Always | Passthrough::Sole => true,
                     Passthrough::Never => false,
                 };
             if allowed
@@ -2162,8 +2075,7 @@ impl Vfs {
         self.d.wait_caught_up(self.cfg.catch_up_wait).await;
         self.usage.record_open(file);
         let mut pinned = false;
-        if !writable && let Ok((scattered, always)) = self.q(|c| query::read_hints(c, file)) {
-            self.patterns.seed(file, scattered);
+        if !writable && let Ok((_, always)) = self.q(|c| query::read_hints(c, file)) {
             pinned = always;
         }
         let mode = self.choose_mode(&a, writable, pinned);
@@ -2216,10 +2128,6 @@ impl Vfs {
             return;
         };
         self.fold_handle(&h);
-        let run = h.run.swap(0, Ordering::Relaxed);
-        if run > 0 {
-            self.patterns.run_ended(h.file, run);
-        }
         let owners: Vec<u64> = h.lock_owners.lock().drain().chain(lock_owner).collect();
         for owner in owners {
             self.release_locks(h.file, owner).await;
@@ -2367,51 +2275,6 @@ impl Vfs {
             }
             let a = self.raw_attr(h.file)?;
             let key = ObjectKey::new(h.file, a.generation);
-            // Read in scattered pieces: exactly what is asked, no readahead
-            // (ADR-031).
-            let scattered = self.patterns.is_random(h.file);
-            // Several copies: spread chunks over them (ADR-030).
-            if !scattered
-                && let Some(route) = self.route(&h, &a)
-                && let Some(fab) = self.fabric()
-            {
-                let _t = self.track(h.file);
-                let mut ra = h.readahead.lock().await;
-                if !ra.as_ref().is_some_and(|r| r.matches(h.file, a.generation)) {
-                    let bulk: Arc<dyn crate::bulk::Bulk> = match self.standby() {
-                        Some(s) => s,
-                        None => fab.clone(),
-                    };
-                    *ra = Some(crate::readahead::Readahead::new(
-                        bulk,
-                        self.balancer.clone(),
-                        self.patterns.clone(),
-                        self.io.clone(),
-                        h.file,
-                        a.generation,
-                        route.sources.clone(),
-                        route.local.clone(),
-                        self.cfg.readahead_chunks,
-                        Some(a.size),
-                    ));
-                }
-                let r = ra.as_mut().expect("just set");
-                match r.read(offset, size).await {
-                    Ok(b) => {
-                        let (l, rem) = r.take_served();
-                        self.count_read(&h, crate::usage::Source::Local, l);
-                        self.count_read(&h, crate::usage::Source::Remote, rem);
-                        return Ok(b);
-                    }
-                    Err(e) => {
-                        // No copy could serve it: decide afresh.
-                        *ra = None;
-                        *h.route.lock() = None;
-                        last = e;
-                        continue;
-                    }
-                }
-            }
             if let Some(src) = self.own_read_source(&a) {
                 let _t = self.track(h.file);
                 let f = {
@@ -2447,15 +2310,12 @@ impl Vfs {
                             .record(nest_fabric::iostats::Kind::Disk, size as u64, took);
                     }
                     self.count_read(&h, kind, b.len() as u64);
-                    if scattered {
-                        self.note_direct(&h, offset, b.len() as u64);
-                    }
                 }
                 return r;
             }
-            // Scattered, no local copy: each read from whichever copy is
-            // least busy, over every copy (no stripes, no cap).
-            if scattered
+            // No local copy: each read exactly as asked (the kernel reads
+            // ahead, ADR-065), from whichever copy is least busy.
+            if a.gen_state == GenState::Stable
                 && let Some(route) = self.route(&h, &a)
                 && let Some(fab) = self.fabric()
             {
@@ -2480,7 +2340,6 @@ impl Vfs {
                         Ok(b) => {
                             ticket.finish(b.len() as u64);
                             self.count_read(&h, crate::usage::Source::Remote, b.len() as u64);
-                            self.note_direct(&h, offset, b.len() as u64);
                             return Ok(b);
                         }
                         // Fall through to the one-holder-at-a-time path.
@@ -2503,29 +2362,7 @@ impl Vfs {
             }
             for s in sources {
                 if let Some(bulk) = self.bulk_to(s) {
-                    let r = if a.gen_state == GenState::Stable && !scattered {
-                        // Immutable generation: read ahead in whole chunks.
-                        let mut ra = h.readahead.lock().await;
-                        if !ra.as_ref().is_some_and(|r| r.matches(h.file, a.generation)) {
-                            *ra = Some(crate::readahead::Readahead::new(
-                                bulk.clone(),
-                                self.balancer.clone(),
-                                self.patterns.clone(),
-                                self.io.clone(),
-                                h.file,
-                                a.generation,
-                                vec![crate::balance::Source::Peer(s)],
-                                None,
-                                self.cfg.readahead_chunks,
-                                Some(a.size),
-                            ));
-                        }
-                        ra.as_mut().expect("just set").read(offset, size).await
-                    } else {
-                        // Being written by its owner: fetch exactly this
-                        // range, keep nothing.
-                        bulk_exact(&bulk, s, h.file, a.generation, offset, size).await
-                    };
+                    let r = bulk_exact(&bulk, s, h.file, a.generation, offset, size).await;
                     match r {
                         Ok(b) => {
                             self.count_read(&h, crate::usage::Source::Remote, b.len() as u64);
@@ -2543,7 +2380,6 @@ impl Vfs {
                             // Bulk trouble: fall back to the control
                             // connection for this read.
                             tracing::debug!(peer = %s, error = %e, "bulk read failed; using one request");
-                            *h.readahead.lock().await = None;
                         }
                     }
                 }
@@ -2614,33 +2450,21 @@ impl Vfs {
     }
 
     /// Complete a read without waiting, if possible: a local copy (pread
-    /// from the page cache) or bytes readahead already holds. Returns `None`
+    /// from the page cache). Returns `None`
     /// when the read needs I/O across the network or a state change.
     ///
     /// Frontends call this on the thread that received the request: on the
     /// Sparks every thread hand-off can cost a deep-idle wake (hundreds of
     /// microseconds), which dominated small-request latency.
     pub fn try_read_now(&self, fh: u64, offset: u64, size: u32) -> Option<NestResult<Vec<u8>>> {
-        self.try_read_now_with(fh, offset, size, |f| pread(f, offset, size), Ok)
+        self.try_read_now_with(fh, offset, size, |f| pread(f, offset, size))
     }
 
     /// `try_read_now` into a caller's buffer (FUSE over io_uring reads
     /// straight into the ring entry the kernel copies from).
     pub fn try_read_into(&self, fh: u64, offset: u64, buf: &mut [u8]) -> Option<NestResult<usize>> {
         let size = buf.len() as u32;
-        // Exactly one of the two closures runs; both need the buffer.
-        let local = std::cell::RefCell::new(buf);
-        self.try_read_now_with(
-            fh,
-            offset,
-            size,
-            |f| pread_into(f, offset, &mut local.borrow_mut()),
-            |v| {
-                let mut b = local.borrow_mut();
-                b[..v.len()].copy_from_slice(&v);
-                Ok(v.len())
-            },
-        )
+        self.try_read_now_with(fh, offset, size, |f| pread_into(f, offset, buf))
     }
 
     fn try_read_now_with<R>(
@@ -2649,26 +2473,13 @@ impl Vfs {
         offset: u64,
         size: u32,
         from_file: impl FnOnce(&std::fs::File) -> NestResult<R>,
-        from_readahead: impl FnOnce(Vec<u8>) -> NestResult<R>,
     ) -> Option<NestResult<R>> {
         let h = self.handle(fh).ok()?;
         let a = self.fast_attr(&h)?;
         let key = ObjectKey::new(h.file, a.generation);
-        // Until the first read has decided how this generation is served,
-        // the slow path decides; a spread read only serves ready chunks here.
-        // Scattered reads go straight to a local copy (ADR-031).
-        let scattered = self.patterns.is_random(h.file);
-        let spread = if scattered {
-            false
-        } else if self.cfg.balance_reads && a.gen_state == GenState::Stable {
-            match h.route.lock().as_ref() {
-                Some((g, r)) if *g == a.generation => r.is_some(),
-                _ => return None,
-            }
-        } else {
-            false
-        };
-        if !spread && let Some(src) = self.own_read_source(&a) {
+        // A local copy answers at once; remote reads take the slow path or
+        // `prepare_remote`.
+        if let Some(src) = self.own_read_source(&a) {
             let _t = self.track(h.file);
             let f = {
                 let mut r = h.reader.lock();
@@ -2698,27 +2509,10 @@ impl Vfs {
                 // the caller's result type for its length.
                 let n = a.size.saturating_sub(offset).min(size as u64);
                 self.count_read(&h, self.source_kind(&src), n);
-                if scattered {
-                    self.note_direct(&h, offset, n);
-                }
             }
             return Some(r);
         }
-        // Only STABLE generations are cached ahead: their bytes never change.
-        if a.gen_state != GenState::Stable || scattered {
-            return None;
-        }
-        let mut ra = h.readahead.try_lock().ok()?;
-        let r = ra.as_mut()?;
-        if !r.matches(h.file, a.generation) {
-            return None;
-        }
-        let out = r.try_ready(offset, size)?;
-        r.advance(offset, size);
-        let (l, rem) = r.take_served();
-        self.count_read(&h, crate::usage::Source::Local, l);
-        self.count_read(&h, crate::usage::Source::Remote, rem);
-        Some(from_readahead(out))
+        None
     }
 
     /// Complete a write without waiting, if this node already owns the file
@@ -3669,7 +3463,7 @@ fn region_key(file: FileId, offset: u64) -> u64 {
 }
 
 /// A scattered read from another host, reserved and ready to send (see
-/// `Vfs::prepare_scattered`).
+/// `Vfs::prepare_remote`).
 pub struct ScatteredRead {
     vfs: Arc<Vfs>,
     h: Arc<Handle>,
@@ -3701,7 +3495,6 @@ impl ScatteredRead {
                     Ok(b) => {
                         ticket.finish(b.len() as u64);
                         vfs.count_read(&h, crate::usage::Source::Remote, b.len() as u64);
-                        vfs.note_direct(&h, offset, b.len() as u64);
                     }
                     Err(_) => {
                         ticket.fail();

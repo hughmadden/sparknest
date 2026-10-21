@@ -17,12 +17,10 @@ pub mod balance;
 pub mod diskprobe;
 pub mod fsck;
 mod local;
-pub mod pattern;
 pub mod push;
 /// Read latencies by kind and size (recorded by the fabric and the VFS).
 pub use nest_fabric::iostats;
 mod bulk;
-mod readahead;
 mod remote;
 mod session;
 pub mod usage;

@@ -4,8 +4,7 @@
 #   scripts/deploy-cluster.sh              build + push to all hosts
 #   scripts/deploy-cluster.sh --no-build   push existing dist/ only
 #   scripts/deploy-cluster.sh --restart    also restart the user service
-# SPARKNEST_PASSTHROUGH=always|sole|never and SPARKNEST_BALANCE_READS=true|false
-# set the trial's read policy (ADR-030) for benchmark runs.
+# SPARKNEST_PASSTHROUGH=always|never sets the trial's passthrough policy.
 # Never touches real data: trial layout only (scripts/cluster.env).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -75,7 +74,6 @@ $members]
 [fuse]
 allow_other = $allow_other
 passthrough = "${SPARKNEST_PASSTHROUGH:-always}"
-balance_reads = ${SPARKNEST_BALANCE_READS:-true}
 
 # Beside a production daemon on @sparknest-push (ADR-063).
 [push]
