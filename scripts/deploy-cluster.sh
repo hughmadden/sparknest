@@ -76,6 +76,10 @@ $members]
 allow_other = $allow_other
 passthrough = "${SPARKNEST_PASSTHROUGH:-always}"
 balance_reads = ${SPARKNEST_BALANCE_READS:-true}
+
+# Beside a production daemon on @sparknest-push (ADR-063).
+[push]
+socket = "@sparknest-push-$SPARKNEST_CLUSTER"
 CFG
   rsync -a "dist/$arch/" "$name:$bin/"
   # The page-cache helper's wrapper and source (installed per host with
