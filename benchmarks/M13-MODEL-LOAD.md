@@ -82,3 +82,20 @@ Each rank requested 248.47 GB.
 - **What push should reach:** each source reading its share once, about
   133 GB at 5–9 GB/s (Kimi) or about 64 GB (GLM), so 10–30 s instead of
   74–315 s.
+
+## Push trials on the trial cluster (synthetic shards, `benchmarks/tools/push-trial.sh`)
+
+Six sources (one 8 GiB shard each), six ranks (one per Spark), 1 MiB
+slots, ranks' arenas in memfd rings.
+
+| Run | Change | Result |
+|---|---|---|
+| 1 | first build | 6.2 GB/s overall; RDMA lanes failing (status 12) |
+| 2 | per-host incast budget | 48 GiB in 14.3 s: an 11 s stall, then 15–19 GB/s |
+| 3 | dial race fixed, 32 slots in flight | all-sources run failed (duplicate slot after a lost ack); one source alone 2.9 GB/s over RPC |
+
+The stall in run 2 was two RDMA links per pair from simultaneous dials,
+not the switch. Steady state was about 2.6 GB/s per source with 8 slots
+in flight; the disks read 5.6–13 GB/s. Run 4 (all fixes, disk-speed
+assignment) is next.
+

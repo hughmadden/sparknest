@@ -3,6 +3,33 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-21 — Bulk off the control connection; control on the LAN; hf share (0.6.0 in progress)
+
+- Trial run 2 (6×6, 8 GiB each) stalled 11 s on a simultaneous-dial race
+  (two RDMA links per pair; fixed: the lower id's link wins), then ran
+  15–19 GB/s at 8 slots in flight per source; now 32. Trial run 3 failed
+  outright: a slot whose RDMA write landed but reported failure was sent
+  again by RPC and refused. Grants now carry a sequence number and a
+  duplicate is dropped (tested with lost acks over real RDMA).
+- Push assignment and Place follow disk speed (ADR-066): rhea, moa and
+  raptor read 12–13 GB/s, the other Sparks 5.6; an even split left the
+  slow disks to finish alone. `nest plan --place … --by-speed`.
+- A burst of hand-applied placement plans (2026-10-21 05:12 UTC) starved
+  Raft heartbeats on the lossy fabric switch for two minutes; leases
+  lapsed cluster-wide and 109 copies were skipped. Now: copies wait out
+  a source that cannot serve (up to 2 min), hosts log serving changes,
+  push slots without RDMA travel on TCP lanes (ADR-067), and control
+  traffic goes on the 10G LAN with the fabric as fallback (ADR-068,
+  cluster setting `control-on-lan`, default on).
+- Job progress moves within files (`partial_bytes`); the UI shows
+  percent, recent rate and time left.
+- `nest hf share` converts repos written by huggingface_hub < 1.32 to the
+  hub's shared blob store in place: dry run on production finds 57 repos,
+  2,361 blobs, 11.6 TiB, no data moved. Homebrew `hf` 2.2.0 on every host;
+  cuteafd pinned `huggingface_hub>=2.2`.
+- UI: dialogs stay on screen on phones; logs no longer log out on a
+  dropped socket; the Logs page no longer crashes Safari.
+
 ## 2026-10-21 — Push loads built; the daemon's readahead removed (0.6.0 in progress)
 
 - Push loads (ADR-063): the plan crate (`nest-push`), the hub, sources and
