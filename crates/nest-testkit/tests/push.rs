@@ -234,6 +234,24 @@ async fn ranks_receive_exactly_their_strided_shares() {
     .await
     .unwrap();
     let (forecast, arenas) = res.unwrap();
+    // The hub kept a record of the load: who sent whom how much, over time.
+    let recs = c.node(1).push.history(None);
+    let rec = recs.last().expect("a record");
+    assert_eq!(rec.outcome, nest_data::push_record::Outcome::Done);
+    let full = c.node(1).push.history(Some(rec.group));
+    let full = full.iter().find(|r| r.group == rec.group).unwrap();
+    let totals = full.totals();
+    let mut sources = full.sources.clone();
+    sources.sort();
+    assert_eq!(sources, vec!["n2", "n3"]);
+    assert_eq!(full.ranks, vec!["n1", "n3"]);
+    let sum: u64 = totals.iter().flatten().sum();
+    assert_eq!(sum, 2 * arena, "{totals:?}");
+    for r in 0..2 {
+        assert_eq!(totals.iter().map(|row| row[r]).sum::<u64>(), arena);
+    }
+    assert!(full.source_done_ms.iter().all(|d| d.is_some()));
+    assert!(full.rank_done_ms.iter().all(|d| d.is_some()));
     assert_eq!(forecast.rank_bytes, vec![arena, arena]);
     // Each file was streamed by the host holding it.
     let mut stores: Vec<_> = forecast.streams.iter().map(|s| s.store.clone()).collect();

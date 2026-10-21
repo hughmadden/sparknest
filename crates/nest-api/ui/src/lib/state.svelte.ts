@@ -36,18 +36,6 @@ export interface Rates {
   served: number;
   /** From its own disk, tracked by sparknest. */
   local: number;
-  /** Share of readahead dropped unused over the last ~10 s (null: none). */
-  waste: number | null;
-}
-
-/** Recent readahead totals per host, for a windowed waste share. */
-const raHist: Record<string, { t: number; d: number; u: number }[]> = {};
-function waste(name: string, now: number, d: number, u: number): number | null {
-  const h = (raHist[name] ??= []);
-  h.push({ t: now, d, u });
-  while (h.length > 2 && now - h[0].t > 10_000) h.shift();
-  const dd = d - h[0].d;
-  return dd > 0 ? Math.max(0, Math.min(1, 1 - (u - h[0].u) / dd)) : null;
 }
 
 export const app = $state({
@@ -91,7 +79,6 @@ function apply(status: Status, stores: Store[], jobs: Job[], groups: { name: str
           read: Math.max(0, (i.fabric_read_bytes - p.r) / dt),
           served: Math.max(0, (i.fabric_served_bytes - p.s) / dt),
           local: Math.max(0, ((i.local_read_bytes ?? 0) - p.l) / dt),
-          waste: waste(n.name, now, i.readahead_dropped_bytes ?? 0, i.readahead_used_bytes ?? 0),
         };
       }
       prev[n.name] = { t: now, r: i.fabric_read_bytes, s: i.fabric_served_bytes, l: i.local_read_bytes ?? 0 };
@@ -277,8 +264,8 @@ export async function cancelJob(id: number) {
 
 // ---------------------------------------------------------------- routing
 
-export type View = "overview" | "models" | "space" | "plans" | "io" | "jobs" | "rules" | "files" | "logs";
-export const VIEWS: View[] = ["overview", "models", "space", "plans", "io", "jobs", "rules", "files", "logs"];
+export type View = "overview" | "models" | "space" | "plans" | "io" | "loads" | "jobs" | "rules" | "files" | "logs";
+export const VIEWS: View[] = ["overview", "models", "space", "plans", "io", "loads", "jobs", "rules", "files", "logs"];
 
 function parse() {
   const h = location.hash.replace(/^#\/?/, "");

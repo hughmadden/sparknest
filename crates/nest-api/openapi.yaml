@@ -1836,6 +1836,53 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 
+  /v1/push/loads:
+    get:
+      tags: [cluster]
+      summary: Recent push loads on every host (ADR-063), without their time bins
+      description: >-
+        Each hub keeps its last 16 loads in memory. Hosts that do not answer
+        (down, or older than 0.6.0) are left out. Newest first.
+      operationId: pushLoads
+      responses:
+        "200":
+          description: The loads.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [loads]
+                properties:
+                  loads:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PushLoad"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/push/loads/{group}:
+    get:
+      tags: [cluster]
+      summary: One push load with its time bins
+      operationId: pushLoad
+      parameters:
+        - name: group
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The load; `bins[t][s][r]` is bytes from source s to rank r in bin t.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushLoad"
+        "404":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+
   /v1/cluster/remove:
     post:
       tags: [cluster]
@@ -2052,6 +2099,68 @@ components:
                 type: string
 
   schemas:
+    PushLoad:
+      type: object
+      description: What a push load did, as its hub recorded it (ADR-063).
+      required: [group, hub, started_ms, elapsed_ms, outcome, sources, ranks, total_bytes, bin_ms, bins, rdma_slots, rpc_slots, source_done_ms, rank_done_ms]
+      properties:
+        group:
+          type: integer
+        hub:
+          type: string
+        started_ms:
+          type: integer
+          description: Wall clock at start, Unix milliseconds.
+        elapsed_ms:
+          type: integer
+          description: From start to the end, or to now while running.
+        outcome:
+          type: string
+          enum: [running, done, failed]
+        reason:
+          type: string
+          nullable: true
+        sources:
+          type: array
+          description: Source hosts, in the order of `bins`' second index.
+          items:
+            type: string
+        ranks:
+          type: array
+          description: Each rank's host, by rank.
+          items:
+            type: string
+        total_bytes:
+          type: integer
+        bin_ms:
+          type: integer
+        bins:
+          type: array
+          description: Empty in listings; per bin, per source, per rank, bytes.
+          items:
+            type: array
+            items:
+              type: array
+              items:
+                type: integer
+        rdma_slots:
+          type: array
+          items:
+            type: integer
+        rpc_slots:
+          type: array
+          items:
+            type: integer
+        source_done_ms:
+          type: array
+          items:
+            type: integer
+            nullable: true
+        rank_done_ms:
+          type: array
+          items:
+            type: integer
+            nullable: true
     Error:
       type: object
       required: [error]

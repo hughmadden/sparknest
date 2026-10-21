@@ -199,6 +199,11 @@ pub(crate) enum AdminReq {
     /// How this host reaches each peer (`nest net`, ADR-057). Older hosts
     /// cannot decode it and answer with an error.
     Net,
+    /// The push loads this host was the hub of (ADR-063), with the time
+    /// bins of `group` only. Older hosts answer with an error.
+    PushLoads {
+        group: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,6 +241,7 @@ pub(crate) enum AdminResp {
     JobStarted(u64),
     HfFetch(crate::hfimport::FetchProgress),
     Net(Box<nest_types::NetReport>),
+    PushLoads(Vec<nest_data::push_record::Record>),
 }
 
 /// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
@@ -279,9 +285,19 @@ pub struct Admin {
     jobs: Mutex<HashMap<u64, Arc<Mutex<JobProgress>>>>,
     /// The node's placer, for the requests about its own jobs.
     pub(crate) placer: std::sync::OnceLock<std::sync::Weak<crate::placer::Placer>>,
+    /// The host's push service, for its loads' records.
+    pub(crate) push: std::sync::OnceLock<std::sync::Weak<nest_data::push::Push>>,
 }
 
 impl Admin {
+    /// This host's push records (none without a push service).
+    pub(crate) fn push_loads(&self, group: Option<u64>) -> Vec<nest_data::push_record::Record> {
+        self.push
+            .get()
+            .and_then(|w| w.upgrade())
+            .map_or_else(Vec::new, |p| p.history(group))
+    }
+
     pub fn register(
         rpc: &Rpc,
         vfs: Arc<Vfs>,
@@ -294,6 +310,7 @@ impl Admin {
             mountpoint,
             jobs: Mutex::new(HashMap::new()),
             placer: std::sync::OnceLock::new(),
+            push: std::sync::OnceLock::new(),
         });
         rpc.register(service::ADMIN, Arc::new(AdminService(Arc::downgrade(&a))));
         a
@@ -575,6 +592,7 @@ impl Handler for AdminService {
             let resp = match req {
                 AdminReq::Info => AdminResp::Info(Box::new(a.info())),
                 AdminReq::Net => AdminResp::Net(Box::new(a.net())),
+                AdminReq::PushLoads { group } => AdminResp::PushLoads(a.push_loads(group)),
                 AdminReq::StartReplicate {
                     job,
                     files,

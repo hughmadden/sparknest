@@ -113,6 +113,16 @@ pub(crate) enum PushMsg {
         bytes: u64,
         complete: bool,
     },
+    /// Source → hub, every `push_record::TICK` and once at the end: payload
+    /// bytes sent to each rank so far, and slots by RDMA and by RPC (for the
+    /// load's record).
+    Sent {
+        group: u64,
+        source: NodeId,
+        bytes: Vec<u64>,
+        rdma: u64,
+        rpc: u64,
+    },
     /// Hub → rank host: everything for `rank` is `slots` slots in all.
     RankDone { group: u64, rank: u32, slots: u64 },
     /// Any → any: the group ended (cancelled or failed).
@@ -169,6 +179,10 @@ struct HubGroup {
     complete: Vec<bool>,
     progress_at: tokio::time::Instant,
     started: bool,
+    /// When streaming started, and each source's last report (bytes per
+    /// rank) for the record.
+    t0: tokio::time::Instant,
+    last_sent: HashMap<NodeId, Vec<u64>>,
 }
 
 /// A rank this host receives for.
@@ -263,6 +277,8 @@ struct State {
     /// Credits that came before their group's `Stream` (rank hosts start
     /// granting as soon as they learn their sources): (group, rank) → n.
     early: HashMap<(u64, u32), Vec<Grant>>,
+    /// Loads this host was the hub of, for status (`push_record`).
+    history: crate::push_record::History,
     /// Landing tokens' rank ids → the rank they belong to.
     tokens: HashMap<u32, (u64, u32)>,
     next_token: u32,
@@ -478,6 +494,16 @@ impl Push {
                     me.delivered(group, rank, bytes, complete);
                     Ok(())
                 }
+                PushMsg::Sent {
+                    group,
+                    source,
+                    bytes,
+                    rdma,
+                    rpc,
+                } => {
+                    me.sent(group, source, &bytes, rdma, rpc);
+                    Ok(())
+                }
                 PushMsg::RankDone { group, rank, slots } => {
                     me.rank_done(group, rank, slots);
                     Ok(())
@@ -545,6 +571,8 @@ impl Push {
                 complete: vec![false; n],
                 progress_at: tokio::time::Instant::now(),
                 started: false,
+                t0: tokio::time::Instant::now(),
+                last_sent: HashMap::new(),
             },
         );
         Ok((group, token))
@@ -724,6 +752,23 @@ impl Push {
             g.streaming = by_source.keys().copied().collect();
             g.sources = g.streaming.clone();
             g.progress_at = tokio::time::Instant::now();
+            g.t0 = tokio::time::Instant::now();
+        }
+        {
+            let names_s: Vec<String> = by_source.keys().map(|n| self.name_of(*n)).collect();
+            let names_r: Vec<String> = rank_hosts.iter().map(|n| self.name_of(*n)).collect();
+            let started = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let rec = crate::push_record::Record::new(
+                group,
+                self.name_of(me),
+                started,
+                names_s,
+                names_r,
+                totals.rank_bytes.iter().sum(),
+            );
+            self.state.lock().history.push(rec);
         }
         for (r, host) in rank_hosts.iter().enumerate() {
             self.send(
@@ -777,6 +822,73 @@ impl Push {
             .unwrap_or_else(|| format!("node{}", n.0))
     }
 
+    /// Milliseconds since the group started streaming, and the index of
+    /// `source` among its sources.
+    fn rec_at(g: &HubGroup, source: NodeId) -> (u64, Option<usize>) {
+        (
+            g.t0.elapsed().as_millis() as u64,
+            g.sources.iter().position(|s| *s == source),
+        )
+    }
+
+    /// A source's report: into the load's record.
+    fn sent(&self, group: u64, source: NodeId, bytes: &[u64], rdma: u64, rpc: u64) {
+        let mut st = self.state.lock();
+        let State { hub, history, .. } = &mut *st;
+        let Some(g) = hub.get_mut(&group) else { return };
+        let (at, Some(i)) = Self::rec_at(g, source) else {
+            return;
+        };
+        let last = g.last_sent.entry(source).or_default();
+        if let Some(r) = history.get_mut(group) {
+            r.report(i, at, bytes, last);
+            r.rdma_slots[i] = r.rdma_slots[i].max(rdma);
+            r.rpc_slots[i] = r.rpc_slots[i].max(rpc);
+        }
+    }
+
+    /// End the load's record.
+    fn record_end(&self, group: u64, outcome: crate::push_record::Outcome, reason: Option<String>) {
+        let mut st = self.state.lock();
+        let at = st
+            .hub
+            .get(&group)
+            .map(|g| g.t0.elapsed().as_millis() as u64);
+        if let Some(r) = st.history.get_mut(group)
+            && r.outcome == crate::push_record::Outcome::Running
+        {
+            if let Some(at) = at {
+                r.elapsed_ms = r.elapsed_ms.max(at);
+            }
+            r.outcome = outcome;
+            r.reason = reason;
+        }
+    }
+
+    /// This hub's recent loads, newest last; `bins` only for `group`.
+    pub fn history(&self, group: Option<u64>) -> Vec<crate::push_record::Record> {
+        let mut st = self.state.lock();
+        let State { hub, history, .. } = &mut *st;
+        // Running loads: their elapsed time is now.
+        for (id, g) in hub.iter() {
+            if let Some(r) = history.get_mut(*id)
+                && r.outcome == crate::push_record::Outcome::Running
+            {
+                r.elapsed_ms = r.elapsed_ms.max(g.t0.elapsed().as_millis() as u64);
+            }
+        }
+        history
+            .all()
+            .map(|r| {
+                if Some(r.group) == group {
+                    r.clone()
+                } else {
+                    r.summary()
+                }
+            })
+            .collect()
+    }
+
     fn joined(&self, group: u64, rank: u32, slot_bytes: u32) -> NestResult<()> {
         let mut st = self.state.lock();
         let g = st
@@ -798,9 +910,20 @@ impl Push {
         if let Some(d) = g.delivered.get_mut(rank as usize) {
             *d = (*d).max(bytes);
         }
+        let mut done_at = None;
         if complete && let Some(c) = g.complete.get_mut(rank as usize) {
             *c = true;
+            done_at = Some(g.t0.elapsed().as_millis() as u64);
         }
+        if let Some(at) = done_at
+            && let Some(r) = st.history.get_mut(group)
+            && let Some(d) = r.rank_done_ms.get_mut(rank as usize)
+        {
+            *d = Some(at);
+        }
+        let Some(g) = st.hub.get_mut(&group) else {
+            return;
+        };
         g.progress_at = tokio::time::Instant::now();
         let _ = g.engine.send(Event::Progress {
             done: g.delivered.iter().sum(),
@@ -808,7 +931,9 @@ impl Push {
         });
         if g.complete.iter().all(|c| *c) {
             let _ = g.engine.send(Event::Done);
-            st.hub.remove(&group);
+            drop(st);
+            self.record_end(group, crate::push_record::Outcome::Done, None);
+            self.state.lock().hub.remove(&group);
         }
     }
 
@@ -822,9 +947,14 @@ impl Push {
         tracing::trace!(group, %source, ?slots, ?failed, "push source done");
         let all_done = {
             let mut st = self.state.lock();
-            let Some(g) = st.hub.get_mut(&group) else {
+            let State { hub, history, .. } = &mut *st;
+            let Some(g) = hub.get_mut(&group) else {
                 return;
             };
+            let (at, i) = Self::rec_at(g, source);
+            if let (Some(i), Some(r)) = (i, history.get_mut(group)) {
+                r.source_done_ms[i] = Some(at);
+            }
             g.streaming.retain(|s| *s != source);
             for (i, n) in slots.iter().enumerate() {
                 if let Some(t) = g.slots.get_mut(i) {
@@ -890,6 +1020,11 @@ impl Push {
 
     /// End the group everywhere with `reason`.
     async fn fail(self: &Arc<Self>, group: u64, reason: String, missing: Vec<Missing>) {
+        self.record_end(
+            group,
+            crate::push_record::Outcome::Failed,
+            Some(reason.clone()),
+        );
         let hosts: Vec<NodeId> = {
             let mut st = self.state.lock();
             let Some(g) = st.hub.remove(&group) else {
@@ -1347,6 +1482,7 @@ impl Push {
                 .and_then(|v| v.fabric())
                 .and_then(|f| f.push_pool(IN_FLIGHT as u32, slot_max).ok())
                 .map(Arc::new);
+            let counters = Arc::new(Counters::new(ranks.len()));
             let mut s = Stream {
                 push: me.clone(),
                 group,
@@ -1357,8 +1493,22 @@ impl Push {
                 sent: Vec::new(),
                 sends: tokio::task::JoinSet::new(),
                 pool,
+                counters: counters.clone(),
+            };
+            // What it has sent, to the hub every tick (the load's record).
+            let ticker = {
+                let (me2, c) = (me.clone(), counters.clone());
+                tokio::spawn(async move {
+                    let mut t = tokio::time::interval(crate::push_record::TICK);
+                    loop {
+                        t.tick().await;
+                        let _ = me2.send(hub, c.msg(group, src)).await;
+                    }
+                })
             };
             let failed = s.run(&patterns, files).await;
+            ticker.abort();
+            let _ = me.send(hub, counters.msg(group, src)).await;
             let slots = std::mem::take(&mut s.sent);
             me.state.lock().sources.remove(&group);
             let _ = me
@@ -1559,6 +1709,37 @@ impl Push {
 }
 
 /// One source's pass over its files for a group.
+/// A source's counters for one group, shared with its sends and ticker.
+#[derive(Default)]
+struct Counters {
+    bytes: Vec<AtomicU64>,
+    rdma: AtomicU64,
+    rpc: AtomicU64,
+}
+
+impl Counters {
+    fn new(ranks: usize) -> Counters {
+        Counters {
+            bytes: (0..ranks).map(|_| AtomicU64::new(0)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn msg(&self, group: u64, source: NodeId) -> PushMsg {
+        PushMsg::Sent {
+            group,
+            source,
+            bytes: self
+                .bytes
+                .iter()
+                .map(|b| b.load(Ordering::Relaxed))
+                .collect(),
+            rdma: self.rdma.load(Ordering::Relaxed),
+            rpc: self.rpc.load(Ordering::Relaxed),
+        }
+    }
+}
+
 struct Stream {
     push: Arc<Push>,
     group: u64,
@@ -1573,6 +1754,7 @@ struct Stream {
     sends: tokio::task::JoinSet<Result<(), String>>,
     /// Registered staging for RDMA sends, when this host has a fabric.
     pool: Option<Arc<nest_fabric::push::PushPool>>,
+    counters: Arc<Counters>,
 }
 
 /// Slot sends a source keeps in flight.
@@ -1724,6 +1906,10 @@ impl Stream {
         }
         let (push, group, me, to) = (self.push.clone(), self.group, self.me, self.ranks[ri].0);
         let pool = self.pool.clone();
+        let c = self.counters.clone();
+        // Payload bytes of this slot (its footer says), for the record.
+        let payload = slot::parse(&bytes, u64::MAX).map_or(0, |p| p.payload as u64);
+        c.bytes[ri].fetch_add(payload, Ordering::Relaxed);
         self.sends.spawn(async move {
             if let (Some(t), Some(pool)) = (&grant.target, &pool)
                 && to != me
@@ -1733,6 +1919,7 @@ impl Stream {
                 match f.push_write(to, pool, &bytes, t).await {
                     Ok(()) => {
                         push.rdma_slots.fetch_add(1, Ordering::Relaxed);
+                        c.rdma.fetch_add(1, Ordering::Relaxed);
                         return Ok(());
                     }
                     // Never landed: the slot is still ours to fill.
@@ -1740,6 +1927,7 @@ impl Stream {
                 }
             }
             push.rpc_slots.fetch_add(1, Ordering::Relaxed);
+            c.rpc.fetch_add(1, Ordering::Relaxed);
             push.send(
                 to,
                 PushMsg::Slot {

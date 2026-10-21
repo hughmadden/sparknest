@@ -18,6 +18,7 @@ pub mod diskprobe;
 pub mod fsck;
 mod local;
 pub mod push;
+pub mod push_record;
 /// Read latencies by kind and size (recorded by the fabric and the VFS).
 pub use nest_fabric::iostats;
 mod bulk;

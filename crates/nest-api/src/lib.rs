@@ -211,6 +211,8 @@ pub fn router(api: Api) -> Router {
         .route("/v1/cluster/raft", get(cluster_raft))
         .route("/v1/net", get(net))
         .route("/v1/push", get(push_status))
+        .route("/v1/push/loads", get(push_loads))
+        .route("/v1/push/loads/{group}", get(push_load))
         .route("/v1/cluster/remove", post(cluster_remove))
         .route("/v1/cluster/role", post(cluster_role))
         .route("/v1/cluster/add", post(cluster_add))
@@ -283,6 +285,27 @@ async fn push_status(State(api): State<Api>) -> R<serde_json::Value> {
         "rdma_slots": st.rdma_slots,
         "rpc_slots": st.rpc_slots,
     })))
+}
+
+/// Every host's recent push loads (ADR-063), newest first, without their
+/// time bins.
+async fn push_loads(State(api): State<Api>) -> R<serde_json::Value> {
+    let v = api.placer.push_loads(None).await?;
+    Ok(Json(json!({ "loads": v })))
+}
+
+/// One push load with its time bins: bytes from each source to each rank.
+async fn push_load(
+    State(api): State<Api>,
+    axum::extract::Path(group): axum::extract::Path<u64>,
+) -> R<serde_json::Value> {
+    let v = api.placer.push_loads(Some(group)).await?;
+    match v.into_iter().find(|r| r.group == group) {
+        Some(r) => Ok(Json(
+            serde_json::to_value(r).map_err(|e| bad(e.to_string()))?,
+        )),
+        None => Err(ApiError(StatusCode::NOT_FOUND, "no such load".into())),
+    }
 }
 
 async fn status(State(api): State<Api>) -> R<serde_json::Value> {

@@ -300,6 +300,41 @@ impl Placer {
     }
 
     /// Every member node with its registered name (id as fallback).
+    /// Link this host's push service, so its loads show in `push_loads`.
+    pub fn set_push(&self, push: &Arc<nest_data::push::Push>) {
+        let _ = self.admin.push.set(Arc::downgrade(push));
+    }
+
+    /// Every host's push loads (ADR-063), newest first; the time bins of
+    /// `group` only. Hosts that do not answer are left out.
+    pub async fn push_loads(
+        &self,
+        group: Option<u64>,
+    ) -> NestResult<Vec<nest_data::push_record::Record>> {
+        let me = self.vfs.data().id();
+        let nodes = self.nodes()?;
+        let got = futures::future::join_all(nodes.iter().map(|h| async move {
+            if h.node == me {
+                return self.admin.push_loads(group);
+            }
+            match admin::call(
+                self.rpc(),
+                h.node,
+                &AdminReq::PushLoads { group },
+                Duration::from_secs(3),
+            )
+            .await
+            {
+                Ok(AdminResp::PushLoads(v)) => v,
+                _ => Vec::new(),
+            }
+        }))
+        .await;
+        let mut all: Vec<_> = got.into_iter().flatten().collect();
+        all.sort_by_key(|r| std::cmp::Reverse(r.started_ms));
+        Ok(all)
+    }
+
     pub fn nodes(&self) -> NestResult<Vec<HostRef>> {
         let names: HashMap<NodeId, String> = query::stores(&self.conn()?)
             .map_err(sql)?

@@ -20,39 +20,25 @@
   const WINDOWS = ["10 s", "1 min", "10 min"];
   let win = $state(0);
   const winOf = (n: (typeof nodes)[number]): IoWindow | undefined => n.info?.io_windows?.[win];
-  const wasteOf = (w?: IoWindow) => (w && w.readahead_dropped > 0 ? 1 - w.readahead_used / w.readahead_dropped : null);
-  // Cluster-wide readahead waste over the chosen window.
-  const wasteAll = $derived.by(() => {
-    let d = 0;
-    let u = 0;
-    for (const n of nodes) {
-      const w = winOf(n);
-      d += w?.readahead_dropped ?? 0;
-      u += w?.readahead_used ?? 0;
-    }
-    return d > 0 ? 1 - u / d : null;
-  });
   const us = (u: number) => (u >= 10_000 ? `${(u / 1000).toFixed(0)} ms` : u >= 1000 ? `${(u / 1000).toFixed(1)} ms` : `${u} µs`);
   const sizeOf = (b: number) => (b === 0 ? ">128K" : `≤${b >> 10}K`);
   const kindOf = { Disk: "disk", Fabric: "fabric", Served: "served" } as const;
-  const pctOf = (x: number) => `${Math.round(100 * x)}%`;
 </script>
 
 <div class="stack">
   <div class="panel pad">
-    <div class="row"><h2>I/O</h2><span class="small muted">how each host reads files that have several copies: its own disk first while it is idle, then whichever copy answers fastest for what is in flight (ADR-030). Numbers are each host's own measurements over the last seconds.</span></div>
+    <div class="row"><h2>I/O</h2><span class="small muted">how each host reads: its own disk for a local copy, else whichever other copy answers fastest, each read exactly as asked while the kernel reads ahead (ADR-065). Numbers are each host's own measurements over the last seconds.</span></div>
   </div>
   <div class="tiles">
     <div class="tile panel"><div class="caps">From local disks</div><div class="big">{rate(fromDisk)}</div><div class="small muted">spread reads, last 10 s</div></div>
     <div class="tile panel" class:hot={fromNet > 1e8}><div class="caps">From other hosts</div><div class="big">{rate(fromNet)}</div><div class="small muted">over the fabric</div></div>
-    <div class="tile panel" class:bad={wasteAll != null && wasteAll > 0.5}><div class="caps">Readahead waste</div><div class="big">{wasteAll == null ? "—" : pctOf(wasteAll)}</div><div class="small muted">fetched ahead, never read (last {WINDOWS[win]})</div></div>
   </div>
 
   <div class="panel pad">
     <div class="row"><h3 class="sec" style="margin:0">Read latency by size</h3><span class="spacer"></span>
       <div class="seg">{#each WINDOWS as w, i}<button class:on={win === i} onclick={() => (win = i)}>{w}</button>{/each}</div>
     </div>
-    <div class="small muted">each read's time on this host: its own disk, a fabric read from request to bytes, or reading bytes it serves to others; by size (4 KiB rows and page faults, kernel requests up to 128 KiB, readahead chunks)</div>
+    <div class="small muted">each read's time on this host: its own disk, a fabric read from request to bytes, or reading bytes it serves to others; by size (4 KiB rows and page faults, kernel requests up to 128 KiB, larger reads)</div>
     <div class="scroll-x">
       <table class="lat">
         <thead><tr><th>host</th><th>kind</th><th>size</th><th class="n">per s</th><th class="n">rate</th><th class="n">mean</th><th class="n">p50</th><th class="n">p90</th><th class="n">p99</th></tr></thead>
@@ -67,9 +53,6 @@
                 <td class="n mono">{us(c.mean_us)}</td><td class="n mono">{us(c.p50_us)}</td><td class="n mono">{us(c.p90_us)}</td><td class="n mono" class:warn={c.p99_us >= 10_000}>{us(c.p99_us)}</td>
               </tr>
             {/each}
-            {#if wasteOf(w) != null}
-              <tr class:first={!(w?.classes?.length)}><td>{w?.classes?.length ? "" : n.name}</td><td class="muted" colspan="2">readahead</td><td class="n mono" colspan="2">{human(w?.readahead_dropped ?? 0)} dropped</td><td class="n mono" colspan="4" class:warn={(wasteOf(w) ?? 0) > 0.5}>{pctOf(wasteOf(w) ?? 0)} unused</td></tr>
-            {/if}
           {/each}
         </tbody>
       </table>
@@ -111,12 +94,6 @@
         <div class="tiny muted mono" title="measured disk read rate (idle, direct I/O) and RDMA link rate: a stripe uses only as many holders as fill the links, with 25% headroom">
           disk {n.info?.disk_read_bps ? rate(n.info.disk_read_bps) : "not measured yet"} · links {n.info?.link_bps ? rate(n.info.link_bps) : "?"}
         </div>
-        {#if app.rates[n.name]?.waste != null || n.info?.scattered_files}
-          {@const w = app.rates[n.name]?.waste}
-          <div class="tiny mono waste" class:bad={w != null && w > 0.5} title="share of readahead chunks dropped without being read, last ~10 s; files whose chunks go mostly unread are switched to direct reads (ADR-031)">
-            {#if w != null}readahead waste {pctOf(w)}{/if}{#if n.info?.scattered_files}{w != null ? " · " : ""}{n.info.scattered_files} file{n.info.scattered_files === 1 ? "" : "s"} read directly{/if}
-          </div>
-        {/if}
         {#each io as s}
           <div class="src">
             <span class="sn">{s.source === "Local" ? "disk" : srcName(s.source, n.name)}</span>
@@ -131,9 +108,7 @@
 </div>
 
 <style>
-  .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  .tile.bad { border-color: rgba(255, 79, 123, 0.5); box-shadow: 0 0 30px rgba(255, 79, 123, 0.15); }
-  .waste { color: var(--muted); }
+  .tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
   .seg { display: flex; gap: 2px; border: 1px solid var(--line); border-radius: 8px; padding: 2px; }
   .seg button { background: none; border: 0; color: var(--muted); font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer; }
   .seg button.on { background: rgba(56, 232, 255, 0.15); color: var(--spark); }
@@ -143,7 +118,6 @@
   .lat .n { text-align: right; }
   .lat tr.first td { border-top: 1px solid var(--line); }
   .lat .warn { color: #ffb3c5; }
-  .waste.bad { color: #ffb3c5; }
   .tile { padding: 14px 16px; }
   .tile.hot { border-color: rgba(56, 232, 255, 0.5); box-shadow: 0 0 30px rgba(56, 232, 255, 0.2); }
   .big { font-size: clamp(20px, 2.6vw, 30px); font-weight: 650; font-family: var(--mono); background: linear-gradient(90deg, #f1fbff, #8fe9ff); -webkit-background-clip: text; background-clip: text; color: transparent; }

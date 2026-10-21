@@ -382,6 +382,7 @@ impl Node {
         let placer =
             nest_place::Placer::start(vfs.clone(), cfg.node.name.clone(), mountpoint.clone());
         let push = nest_data::push::Push::new(&vfs);
+        placer.set_push(&push);
         let api = nest_api::Api {
             push: Some(push.clone()),
             vfs: vfs.clone(),
