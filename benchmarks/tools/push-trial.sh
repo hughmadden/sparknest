@@ -76,3 +76,11 @@ for h in "${ranks[@]}"; do grep -h '"rank"' "$out.$h" || cat "$out.$h"; done
 for h in "${sources[@]}"; do
   echo "$h: $(ssh "$h" "curl -s --unix-socket ~/sparknest-test/state/api.sock http://x/v1/push")"
 done
+# PUSH_TRIAL_HOLD=SECONDS keeps the trial cluster up afterwards (its web UI
+# on raptor:$SPARKNEST_API_PORT shows the load), still under the lock.
+if [ -n "${PUSH_TRIAL_HOLD:-}" ]; then
+  echo "== holding the trial cluster for ${PUSH_TRIAL_HOLD}s"
+  touch ~/build/push-trial-holding
+  sleep "$PUSH_TRIAL_HOLD"
+  rm -f ~/build/push-trial-holding
+fi
