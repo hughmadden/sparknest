@@ -245,6 +245,16 @@ impl Ring {
     }
 }
 
+impl State {
+    /// Return a departing rank's outstanding grants to the budget.
+    fn release_grants(&mut self, r: &RankSlot) {
+        let b = r.ring.as_ref().map_or(0, |x| x.slot_bytes as u64);
+        self.granted_bytes = self
+            .granted_bytes
+            .saturating_sub(b * r.granted.len() as u64);
+    }
+}
+
 #[derive(Default)]
 struct State {
     hub: HashMap<u64, HubGroup>,
@@ -256,6 +266,11 @@ struct State {
     /// Landing tokens' rank ids → the rank they belong to.
     tokens: HashMap<u32, (u64, u32)>,
     next_token: u32,
+    /// Bytes granted to sources and not yet landed, over every rank on this
+    /// host: kept within the incast budget, as reads are (ADR-032). Six
+    /// sources writing a whole ring at once overran the switch's buffers
+    /// (RC retries exhausted, lanes dropped).
+    granted_bytes: u64,
 }
 
 /// What this host's push service has done, for status and tests.
@@ -1021,11 +1036,14 @@ impl Push {
         self.grant(group, rank);
     }
 
-    /// Hand free ring slots to sources as grants, round robin.
+    /// Hand free ring slots to sources as grants, round robin, while this
+    /// host's grants outstanding stay within the incast budget.
     fn grant(self: &Arc<Self>, group: u64, rank: u32) {
         let mut out: Vec<(NodeId, Vec<Grant>)> = Vec::new();
         {
+            let budget = self.budget();
             let mut st = self.state.lock();
+            let mut granted = st.granted_bytes;
             let Some(r) = st.ranks.get_mut(&(group, rank)) else {
                 return;
             };
@@ -1033,7 +1051,10 @@ impl Push {
                 return;
             }
             let slot_bytes = r.ring.as_ref().map_or(0, |x| x.slot_bytes) as u64;
-            while let Some(slot) = r.free.pop() {
+            // At least one grant per rank even past the budget (a ring slot
+            // larger than it must still move).
+            while granted + slot_bytes <= budget || (granted == 0 && r.granted.is_empty()) {
+                let Some(slot) = r.free.pop() else { break };
                 let s = r.sources[r.next % r.sources.len()];
                 r.next = r.next.wrapping_add(1);
                 r.granted.insert(slot, s);
@@ -1046,7 +1067,9 @@ impl Push {
                     Some((_, v)) => v.push(g),
                     None => out.push((s, vec![g])),
                 }
+                granted += slot_bytes;
             }
+            st.granted_bytes = granted;
         }
         for (src, grants) in out {
             let me = self.clone();
@@ -1107,6 +1130,10 @@ impl Push {
             if r.granted.remove(&slot).is_none() {
                 return Err(invalid("a slot without a credit"));
             }
+            // The slot is no longer in flight: its budget is free.
+            let b = ring.slot_bytes as u64;
+            st.granted_bytes = st.granted_bytes.saturating_sub(b);
+            let r = st.ranks.get_mut(&(group, rank)).expect("present");
             let p = match slot::parse(ring.slot(slot), r.arena) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1139,7 +1166,33 @@ impl Push {
         if report {
             self.report(group, rank, hub, delivered, complete);
         }
+        // Budget freed: every rank here waiting for it may get grants now.
+        self.grant_waiting();
         Ok(())
+    }
+
+    /// Grant to every rank on this host that has free ring slots.
+    fn grant_waiting(self: &Arc<Self>) {
+        let ranks: Vec<(u64, u32)> = {
+            let st = self.state.lock();
+            st.ranks
+                .iter()
+                .filter(|(_, r)| !r.free.is_empty() && !r.sources.is_empty())
+                .map(|(k, _)| *k)
+                .collect()
+        };
+        for (g, r) in ranks {
+            self.grant(g, r);
+        }
+    }
+
+    /// The incast budget: what this host lets sources have in flight at
+    /// once toward its rings (the fabric's, or 64 MiB without one).
+    fn budget(&self) -> u64 {
+        self.vfs()
+            .ok()
+            .and_then(|v| v.fabric())
+            .map_or(64 << 20, |f| f.incast_bytes())
     }
 
     fn report(self: &Arc<Self>, group: u64, rank: u32, hub: NodeId, bytes: u64, complete: bool) {
@@ -1199,7 +1252,13 @@ impl Push {
     }
 
     fn end_rank(&self, group: u64, rank: u32, reason: String) {
-        if let Some(r) = self.state.lock().ranks.remove(&(group, rank))
+        let mut st = self.state.lock();
+        let removed = st.ranks.remove(&(group, rank));
+        if let Some(r) = &removed {
+            st.release_grants(r);
+        }
+        drop(st);
+        if let Some(r) = removed
             && let Some(e) = r.engine
             && !r.done_sent
         {
@@ -1220,7 +1279,11 @@ impl Push {
             .copied()
             .collect();
         for k in ranks {
-            if let Some(r) = st.ranks.remove(&k)
+            let removed = st.ranks.remove(&k);
+            if let Some(r) = &removed {
+                st.release_grants(r);
+            }
+            if let Some(r) = removed
                 && let Some(e) = r.engine
                 && !r.done_sent
             {
@@ -1469,9 +1532,11 @@ impl Push {
         if let Some((g, r)) = owns_rank {
             let unfinished = {
                 let mut st = self.state.lock();
-                st.ranks
-                    .remove(&(g, r))
-                    .and_then(|rs| (!rs.done_sent).then_some(rs.hub))
+                let rs = st.ranks.remove(&(g, r));
+                if let Some(rs) = &rs {
+                    st.release_grants(rs);
+                }
+                rs.and_then(|rs| (!rs.done_sent).then_some(rs.hub))
             };
             if let Some(hub) = unfinished {
                 let me = self.clone();

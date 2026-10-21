@@ -751,6 +751,8 @@ pub struct Fabric {
     inflight: Arc<Semaphore>,
     /// This host's links, bytes per second.
     link_bps: u64,
+    /// The incast budget in bytes (`inflight`'s size), for push loads.
+    budget_bytes: u64,
     /// Push loads (ADR-063): writes into engines' rings.
     pub(crate) push: crate::push::PushState,
     pub stats: Stats,
@@ -915,6 +917,7 @@ impl Fabric {
             stop: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(Semaphore::new((budget / BUDGET_UNIT as u64) as usize)),
             link_bps: link,
+            budget_bytes: budget,
             stats: Stats::default(),
             io: std::sync::OnceLock::new(),
         });
@@ -1015,6 +1018,12 @@ impl Fabric {
     /// This host's RDMA links, bytes per second (the rails' ports summed).
     pub fn link_bytes_per_s(&self) -> u64 {
         self.link_bps
+    }
+
+    /// Bytes this host lets peers have in flight toward it at once: the
+    /// incast cap (ADR-032), which push grants also stay within (ADR-063).
+    pub fn incast_bytes(&self) -> u64 {
+        self.budget_bytes
     }
 
     /// Chunk-sized landing slots free on the tightest device: speculative
