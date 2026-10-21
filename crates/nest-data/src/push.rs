@@ -1482,7 +1482,7 @@ impl Push {
                 .vfs()
                 .ok()
                 .and_then(|v| v.fabric())
-                .and_then(|f| f.push_pool(IN_FLIGHT as u32, slot_max).ok())
+                .and_then(|f| f.push_pool(in_flight(slot_max) as u32, slot_max).ok())
                 .map(Arc::new);
             let counters = Arc::new(Counters::new(ranks.len()));
             let mut s = Stream {
@@ -1752,15 +1752,24 @@ struct Stream {
     open: Vec<Option<slot::Packer>>,
     /// Slots sent per rank (counted when handed to a send).
     sent: Vec<u64>,
-    /// Sends in flight (bounded by `IN_FLIGHT`).
+    /// Sends in flight (bounded by `in_flight`).
     sends: tokio::task::JoinSet<Result<(), String>>,
     /// Registered staging for RDMA sends, when this host has a fabric.
     pool: Option<Arc<nest_fabric::push::PushPool>>,
     counters: Arc<Counters>,
 }
 
-/// Slot sends a source keeps in flight.
-const IN_FLIGHT: usize = 8;
+/// Slot sends a source keeps in flight, at most: 8 capped a source near
+/// 2.5 GB/s (each 1 MiB write waits a round trip) while its disk reads
+/// several times that. Ranks' grants bound what reaches each port.
+const IN_FLIGHT: usize = 32;
+/// Registered staging a source keeps per group, at most.
+const STAGING_BYTES: usize = 64 << 20;
+
+/// Sends in flight for slots of `slot_bytes`.
+fn in_flight(slot_bytes: usize) -> usize {
+    (STAGING_BYTES / slot_bytes.max(1)).clamp(2, IN_FLIGHT)
+}
 
 impl Stream {
     /// Stream every file; the files that failed, by plan index.
@@ -1901,7 +1910,14 @@ impl Stream {
             .take_credit(self.group, r, &self.notify)
             .await
             .ok_or("cancelled, or no credit came")?;
-        while self.sends.len() >= IN_FLIGHT {
+        let limit = in_flight(
+            self.ranks
+                .iter()
+                .map(|(_, b)| *b as usize)
+                .max()
+                .unwrap_or(0),
+        );
+        while self.sends.len() >= limit {
             if let Some(res) = self.sends.join_next().await {
                 res.map_err(|e| e.to_string())??;
             }

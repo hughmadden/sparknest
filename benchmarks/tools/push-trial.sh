@@ -3,6 +3,8 @@
 # start the trial daemons, write synthetic sealed shards on each source
 # host, run `nest push bench` with one rank per Spark, stop the daemons.
 #   benchmarks/tools/push-trial.sh [GIB_PER_SOURCE] [RUN_BYTES]
+# PUSH_TRIAL_RUNS="all one" runs each load in turn: "all" pushes every
+# source's shard, "one" only ostrich's (one disk's rate alone).
 # Run under the Sparks' hardware lock when other measured work shares them.
 # Trial layout only (scripts/cluster.env): no production data is touched.
 set -euo pipefail
@@ -50,29 +52,38 @@ nest raptor ls /push-bench
 
 # Rank consumers on each rank host, then the coordinator on raptor.
 hosts=$(IFS=,; echo "${ranks[*]}")
-out=$(mktemp)
-ssh raptor "~/$bin/nest --config ~/sparknest-test/state/node.toml --json push bench ${files[*]} --hosts $hosts --run $run" \
-  > "$out" 2> "$out.err" &
-coord=$!
-# Wait for the coordinator to print the rank commands.
-for _ in $(seq 120); do
-  [ "$(grep -c 'nest push rank' "$out.err" 2>/dev/null || true)" -ge "${#ranks[@]}" ] && break
-  sleep 0.5
+bench() {
+  local tag=$1; shift
+  local out; out=$(mktemp)
+  echo "== run $tag: $*"
+  ssh raptor "~/$bin/nest --config ~/sparknest-test/state/node.toml --json push bench $* --hosts $hosts --run $run" \
+    > "$out" 2> "$out.err" &
+  local coord=$!
+  for _ in $(seq 120); do
+    [ "$(grep -c 'nest push rank' "$out.err" 2>/dev/null || true)" -ge "${#ranks[@]}" ] && break
+    sleep 0.5
+  done
+  local pids=()
+  while read -r line; do
+    local h=${line%%:*}; h=${h#on }
+    local args=${line#*nest push rank }
+    ssh "$h" "~/$bin/nest --config ~/sparknest-test/state/node.toml push rank $args" \
+      > "$out.$h" 2>&1 &
+    pids+=($!)
+  done < <(grep 'nest push rank' "$out.err")
+  wait "$coord" || cat "$out.err"
+  for p in "${pids[@]}"; do wait "$p" || true; done
+  echo "== coordinator ($tag)"
+  cat "$out"
+  echo "== ranks ($tag)"
+  for h in "${ranks[@]}"; do grep -h '"rank"' "$out.$h" || cat "$out.$h"; done
+}
+for r in ${PUSH_TRIAL_RUNS:-all}; do
+  case $r in
+    all) bench all "${files[@]}" ;;
+    one) bench one "/push-bench/ostrich.bin" ;;
+  esac
 done
-pids=()
-while read -r line; do
-  h=${line%%:*}; h=${h#on }
-  args=${line#*nest push rank }
-  ssh "$h" "~/$bin/nest --config ~/sparknest-test/state/node.toml push rank $args" \
-    > "$out.$h" 2>&1 &
-  pids+=($!)
-done < <(grep 'nest push rank' "$out.err")
-wait "$coord"
-for p in "${pids[@]}"; do wait "$p" || true; done
-echo "== coordinator"
-cat "$out"
-echo "== ranks"
-for h in "${ranks[@]}"; do grep -h '"rank"' "$out.$h" || cat "$out.$h"; done
 for h in "${sources[@]}"; do
   echo "$h: $(ssh "$h" "curl -s --unix-socket ~/sparknest-test/state/api.sock http://x/v1/push")"
 done
