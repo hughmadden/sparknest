@@ -2791,6 +2791,10 @@ components:
               description: Off-grid hosts that should hold a full copy.
               items:
                 type: string
+            spread:
+              type: boolean
+              default: false
+              description: One copy of each file over the hosts picked (bytes kept even) instead of a full copy on each.
             hub:
               type: string
 

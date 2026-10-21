@@ -238,6 +238,10 @@ pub enum Goal {
         hosts: Vec<String>,
         #[serde(default)]
         hub: String,
+        /// One copy of each file over the hosts picked (their bytes kept
+        /// even) instead of a full copy on each.
+        #[serde(default)]
+        spread: bool,
     },
 }
 
@@ -624,6 +628,7 @@ pub async fn make(placer: &Placer, goal: Goal) -> NestResult<Plan> {
             selector,
             hosts,
             hub,
+            spread,
         } => {
             let sel = Selector::parse(selector, hub).map_err(NestError::Invalid)?;
             let m = placer.manifest(&sel).await?;
@@ -643,7 +648,7 @@ pub async fn make(placer: &Placer, goal: Goal) -> NestResult<Plan> {
                     w.host(*n)
                 )));
             }
-            make_offgrid(w, goal.clone(), &m, picked)
+            make_offgrid(w, goal.clone(), &m, picked, *spread)
         }
     }
 }
@@ -1375,8 +1380,12 @@ fn make_offgrid(
     mut w: World,
     goal: Goal,
     m: &crate::selector::Manifest,
-    picked: Vec<NodeId>,
+    mut picked: Vec<NodeId>,
+    spread: bool,
 ) -> NestResult<Plan> {
+    picked.sort();
+    picked.dedup();
+    let spread = spread && picked.len() > 1;
     let mut offgrid: Vec<NodeId> = w.offgrid.iter().copied().collect();
     offgrid.sort();
     if offgrid.is_empty() {
@@ -1409,13 +1418,35 @@ fn make_offgrid(
     let (mut short_files, mut short_bytes) = (0u64, 0u64);
     let (mut sole, mut sole_bytes) = (0u64, 0u64);
     let mut kept: HashMap<String, u64> = HashMap::new();
+    // Spread: bytes assigned to each picked host so far.
+    let mut assigned: HashMap<NodeId, u64> = HashMap::new();
     for e in &entries {
         let held = holders
             .get(&(e.file, e.generation))
             .cloned()
             .unwrap_or_default();
+        // Who should hold this file: every picked host, or (spread) the
+        // one with the fewest bytes so far that has room, a host already
+        // holding it winning ties.
+        let wanted: Vec<NodeId> = if spread {
+            let mut c = picked.clone();
+            c.sort_by_key(|n| (assigned.get(n).copied().unwrap_or(0), !held.contains(n), *n));
+            let fits = |n: &NodeId| {
+                held.contains(n)
+                    || w.projected.get(n).copied().unwrap_or(0) >= e.size + margin(&w, *n)
+            };
+            match c.iter().find(|n| fits(n)).or(c.first()) {
+                Some(&n) => {
+                    *assigned.entry(n).or_default() += e.size;
+                    vec![n]
+                }
+                None => Vec::new(),
+            }
+        } else {
+            picked.clone()
+        };
         let mut gets: Vec<NodeId> = Vec::new();
-        for &n in &picked {
+        for &n in &wanted {
             if held.contains(&n) {
                 gets.push(n);
                 continue;
@@ -1441,7 +1472,7 @@ fn make_offgrid(
             + gets.iter().filter(|n| !held.contains(n)).count();
         for &n in held
             .iter()
-            .filter(|n| w.offgrid.contains(n) && !picked.contains(n))
+            .filter(|n| w.offgrid.contains(n) && !wanted.contains(n))
         {
             if let Some(rule) = w.required(e.file, n) {
                 *kept
@@ -1459,7 +1490,7 @@ fn make_offgrid(
                 .iter()
                 .chain(gets.iter())
                 .copied()
-                .find(|k| *k != n && !(w.offgrid.contains(k) && !picked.contains(k)));
+                .find(|k| *k != n && !(w.offgrid.contains(k) && !wanted.contains(k)));
             let mut c = Copy::new(
                 e.file,
                 e.generation,
@@ -1477,6 +1508,18 @@ fn make_offgrid(
     let names: Vec<String> = picked.iter().map(|n| w.host(*n)).collect();
     w.notes.push(if names.is_empty() {
         "no off-grid copies".into()
+    } else if spread {
+        let each: Vec<String> = picked
+            .iter()
+            .map(|n| {
+                format!(
+                    "{} {}",
+                    w.host(*n),
+                    human(assigned.get(n).copied().unwrap_or(0))
+                )
+            })
+            .collect();
+        format!("one copy of each file, spread: {}", each.join(", "))
     } else {
         format!("a full copy on {}", names.join(", "))
     });

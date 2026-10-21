@@ -20,6 +20,9 @@
   let keepLive = $state(false);
   let factor = $state(1);
   let bySpeed = $state(false);
+  // Off-grid: one copy of each file over the hosts picked (default), or a
+  // full copy on each.
+  let spreadOff = $state(true);
   let plan = $state<Plan | null>(null);
   let err = $state("");
   let busy = $state(false);
@@ -62,6 +65,7 @@
     picked = [];
     factor = 1;
     bySpeed = false;
+    spreadOff = true;
     plan = null;
     err = "";
     stats = null;
@@ -100,7 +104,7 @@
       plan = await post<Plan>(
         "/v1/plans",
         mode === "offgrid"
-          ? { goal: "offgrid", selector: placing.selector, hosts: targets }
+          ? { goal: "offgrid", selector: placing.selector, hosts: targets, spread: spreadOff && targets.length > 1 }
           : {
               goal: "place",
               selector: placing.selector,
@@ -123,6 +127,7 @@
     void single;
     void k;
     void bySpeed;
+    void spreadOff;
     if (!placing.open) return;
     clearTimeout(timer);
     timer = setTimeout(makeOnce, 300);
@@ -173,7 +178,12 @@
             </button>
           {/each}
         </div>
-        <div class="tiny muted legend">Each host picked keeps a full copy and reads it from its own disk; copies on hosts left unpicked go (never the last one). Fabric hosts are left as they are.</div>
+        <label class="check small" class:off={picked.length < 2}>
+          <input type="checkbox" bind:checked={spreadOff} disabled={picked.length < 2} />
+          spread
+          <span class="tiny muted">{picked.length < 2 ? "pick two or more to spread" : spreadOff ? `one copy of each file over the ${picked.length} hosts, about ${Math.round(100 / picked.length)}% each` : "a full copy on each host picked"}</span>
+        </label>
+        <div class="tiny muted legend">{spreadOff && picked.length > 1 ? "Each file lives on one host picked; the others read it from there over the LAN." : "Each host picked keeps a full copy and reads it from its own disk."} Copies on hosts left unpicked go (never the last one). Fabric hosts are left as they are.</div>
         {#if err}<div class="small" style="color:var(--bad)">{err}</div>{/if}
         {#if plan}
           <div class="preview" class:dim={busy}>

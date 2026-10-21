@@ -322,6 +322,7 @@ async fn offgrid_placement_place_and_offload() {
         selector: "/m".into(),
         hosts: hosts.iter().map(|h| h.to_string()).collect(),
         hub: "/hub".into(),
+        spread: false,
     };
     let plan = p.plan(offgrid(&["n4"])).await.unwrap();
     assert!(plan.feasible, "{plan:?}");
@@ -565,4 +566,103 @@ async fn offgrid_writes_go_over_tcp_lanes_both_ways() {
     v2.release(fh, None).await;
     c.converge().await;
     assert_eq!(read_all(&c, 3, g).await, b"log:abcabcabc");
+}
+
+/// Off-grid spread: with two off-grid hosts picked, each file goes to one of
+/// them (bytes kept even) instead of both; picking spread over hosts that
+/// hold full copies moves each file's second copy away, never the last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn offgrid_spread_puts_one_copy_over_the_hosts_picked() {
+    use nest_place::plan::{Goal, Step};
+    let mut c = with_offgrid(3, 4).await;
+    c.add_offgrid(5).await;
+    c.eventually("n5 serving and named", Duration::from_secs(8), |c| {
+        c.node(5).data.caught_up()
+            && c.node(1)
+                .placer
+                .nodes()
+                .is_ok_and(|v| v.iter().any(|h| h.name == "n5"))
+    })
+    .await;
+    let p = c.node(1).placer.clone();
+    let v = c.node(1).vfs.clone();
+    let dir = v.mkdir(FileId::ROOT, b"m", 0o755).await.unwrap().id;
+    let mut files = Vec::new();
+    for i in 0..6u8 {
+        let (a, fh, _) = v
+            .create(dir, format!("part{i}").as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        v.write(fh, 0, vec![i; 1 << 20]).await.unwrap();
+        v.release(fh, None).await;
+        files.push(a.id);
+    }
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        files.iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    c.converge().await;
+    let goal = |spread| Goal::Offgrid {
+        selector: "/m".into(),
+        hosts: vec!["n4".into(), "n5".into()],
+        hub: "/hub".into(),
+        spread,
+    };
+    let adds = |plan: &nest_place::plan::Plan| -> Vec<(String, usize)> {
+        let mut v: Vec<_> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Replicate { host, copies, .. } => Some((host.clone(), copies.len())),
+                _ => None,
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    // Spread: three files each.
+    let plan = p.plan(goal(true)).await.unwrap();
+    assert!(plan.feasible, "{plan:?}");
+    assert_eq!(adds(&plan), [("n4".to_string(), 3), ("n5".to_string(), 3)]);
+    assert!(
+        plan.notes.iter().any(|n| n.contains("spread")),
+        "{:?}",
+        plan.notes
+    );
+    // Unspread: a full copy on each.
+    let full = p.plan(goal(false)).await.unwrap();
+    assert_eq!(adds(&full), [("n4".to_string(), 6), ("n5".to_string(), 6)]);
+    let job = wait_job(&c, p.apply_plan(full.id).await.unwrap()).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    for f in &files {
+        assert_eq!(holders(&c, *f), [1, 4, 5]);
+    }
+    // Spread over hosts holding full copies: each drops the other's half,
+    // nothing is copied, the fabric copy stays.
+    let plan = p.plan(goal(true)).await.unwrap();
+    assert!(adds(&plan).is_empty(), "{plan:?}");
+    let drops: Vec<(String, usize)> = plan
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Evict { host, copies, .. } => Some((host.clone(), copies.len())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(drops.iter().map(|d| d.1).sum::<usize>(), 6, "{drops:?}");
+    let job = wait_job(&c, p.apply_plan(plan.id).await.unwrap()).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    let mut per = [0; 2];
+    for f in &files {
+        let h = holders(&c, *f);
+        assert_eq!(h.len(), 2, "{h:?}");
+        assert!(h.contains(&1));
+        per[if h.contains(&4) { 0 } else { 1 }] += 1;
+    }
+    assert_eq!(per, [3, 3]);
 }

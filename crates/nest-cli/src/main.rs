@@ -170,6 +170,10 @@ enum Cmd {
         /// off-grid hosts go, never the last one. Fabric hosts are untouched.
         #[arg(long, value_name = "SELECTOR", conflicts_with_all = ["free", "tidy", "speedup", "consolidate", "place"])]
         offgrid: Option<String>,
+        /// --offgrid: one copy of each file over the hosts given (their bytes
+        /// kept even) instead of a full copy on each.
+        #[arg(long, requires = "offgrid")]
+        spread: bool,
         /// Hosts or @groups for --tidy / --speedup (default: all).
         #[arg(long = "host")]
         hosts: Vec<String>,
@@ -333,8 +337,9 @@ Examples:
   read rate (push loads then finish on every host together):
     nest plan --place hf:moonshotai/Kimi-K2 --host ostrich --host dodo --host emu \
       --host kiwi --host rhea --host moa --factor 1/6 --by-speed
-  A full copy on off-grid hosts (kakapo and oliver), or on none of them:
+  A full copy on off-grid hosts, one copy spread over them, or none:
     nest plan --offgrid hf:Qwen/Qwen3-8B --host kakapo --host oliver
+    nest plan --offgrid hf:Qwen/Qwen3-8B --host kakapo --host cassowary --spread
     nest plan --offgrid hf:Qwen/Qwen3-8B
   Edit a plan before applying it: leave a model or one host out:
     nest plan show 1234567 --files
@@ -1610,12 +1615,13 @@ async fn main() -> Result<()> {
             factor,
             by_speed,
             offgrid,
+            spread,
             hosts,
             min,
             keep_free,
         } => {
             let body = if let Some(sel) = offgrid {
-                json!({ "goal": "offgrid", "selector": abspath(sel), "hosts": hosts })
+                json!({ "goal": "offgrid", "selector": abspath(sel), "hosts": hosts, "spread": spread })
             } else if let Some(sel) = place {
                 let factor = match factor.as_deref() {
                     None => 1.0,
