@@ -1011,3 +1011,127 @@ async fn a_finished_source_gives_back_its_ring_slots() {
     assert!(out[..small.len()] == small[..]);
     assert!(out[small.len()..] == large[..]);
 }
+
+/// One group for the whole load (ADR-063 amendment): two ranks on the
+/// hub's host, which is also a source, beside ranks on other hosts. Each
+/// rank gets exactly its share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_ranks_on_the_hub_which_is_also_a_source() {
+    let c = ready(3).await;
+    let (rows, units, unit) = (64u32, 4u32, 1024u32);
+    let row = (units * unit) as usize;
+    let len = rows as usize * row;
+    let a: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+    let b: Vec<u8> = (0..len).map(|i| (i * 13 % 241) as u8).collect();
+    sealed(&c, 1, "a.bin", a.clone()).await;
+    sealed(&c, 2, "b.bin", b.clone()).await;
+
+    // Rank r takes unit r of every row of both files; ranks 0 and 1 are on
+    // node 1 (the hub, holding a.bin), rank 2 on node 2, rank 3 on node 3.
+    let hosts = [1u64, 1, 2, 3];
+    let share = rows as u64 * unit as u64;
+    let patterns: Vec<Pattern> = (0..units)
+        .map(|_| Pattern {
+            run: unit,
+            dims: vec![Dim {
+                steps: Steps::Count(rows),
+                src_stride: row as u64,
+                dst_stride: unit as u64,
+            }],
+        })
+        .collect();
+    let mut entries = Vec::new();
+    for f in 0..2u32 {
+        for r in 0..units {
+            entries.push(Entry {
+                file: f,
+                pattern: r,
+                src_base: (r * unit) as u64,
+                dst_base: f as u64 * share,
+                rank: r,
+            });
+        }
+    }
+    let arena = 2 * share;
+    let (slots, slot_bytes) = (4u32, 16u32 << 10);
+    let hub = c.push_socket(1);
+    let sockets: Vec<_> = hosts.iter().map(|h| c.push_socket(*h)).collect();
+
+    let arenas = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(20));
+        let specs = hosts
+            .iter()
+            .enumerate()
+            .map(|(r, h)| RankSpec {
+                rank: r as u32,
+                host: format!("n{h}"),
+                arena_bytes: arena,
+            })
+            .collect();
+        let g = Coordinator::create(&hub, specs, vec!["/a.bin".into(), "/b.bin".into()], t)
+            .map_err(|e| format!("create: {e}"))?;
+        g.patterns(patterns).unwrap();
+        g.entries(entries).unwrap();
+        let (group, token) = (g.group, g.token);
+        // Ranks join before Start, as the engine does.
+        let joined: Vec<_> = (0..units)
+            .map(|r| {
+                let ring = memfd(slots as usize * slot_bytes as usize);
+                let k = Rank::join(
+                    &sockets[r as usize],
+                    JoinArgs {
+                        group,
+                        token,
+                        rank: r,
+                        ring_fd: ring.as_raw_fd(),
+                        slots,
+                        slot_bytes,
+                    },
+                    t,
+                )
+                .map_err(|e| format!("join {r}: {e}"))?;
+                Ok((k, ring))
+            })
+            .collect::<Result<_, String>>()?;
+        let ranks: Vec<_> = joined
+            .into_iter()
+            .map(|(k, ring)| {
+                std::thread::spawn(move || run_rank(k, ring, slots, slot_bytes, arena as usize))
+            })
+            .collect();
+        g.start().map_err(|e| format!("start: {e}"))?;
+        let arenas = ranks
+            .into_iter()
+            .enumerate()
+            .map(|(i, h)| h.join().unwrap().map_err(|e| format!("rank {i}: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        loop {
+            match g.next().map_err(|e| e.to_string())? {
+                Some(Event::Done) => break,
+                Some(Event::Progress { .. }) => {}
+                other => return Err(format!("coordinator got {other:?}")),
+            }
+        }
+        Ok::<_, String>(arenas)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    for (r, got) in arenas.iter().enumerate() {
+        let mut want = Vec::new();
+        for f in [&a, &b] {
+            for rr in 0..rows as usize {
+                let at = rr * row + r * unit as usize;
+                want.extend_from_slice(&f[at..at + unit as usize]);
+            }
+        }
+        assert!(got == &want, "rank {r}'s arena differs from its share");
+    }
+    let rec = c.node(1).push.history(None);
+    let rec = rec.last().unwrap();
+    let full = c.node(1).push.history(Some(rec.group));
+    let full = full.iter().find(|x| x.group == rec.group).unwrap();
+    assert_eq!(full.ranks, vec!["n1", "n1", "n2", "n3"]);
+    let i1 = full.sources.iter().position(|s| s == "n1").unwrap();
+    assert!(full.local_slots[i1] > 0, "{:?}", full.local_slots);
+}

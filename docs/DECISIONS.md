@@ -2088,6 +2088,15 @@ its engine or on sources. Same-host slots count as `local_slots`, apart
 from fallbacks (`rpc_slots`). Push is not run across versions: hosts are
 upgraded together before loads use it.
 
+**Amendment (2026-10-21): one group per load.** The engine loads a model
+as one group: the coordinator's own GPUs are ranks of the same group as
+the Spark ranks (6 Sparks and 2 coordinator GPUs: 8 ranks, one `Create`,
+one `Start`), not a separate group as item 1's example said. Nothing
+changes in sparknestd: a host may hold several ranks (item 8), the hub's
+host may be a source and a rank host at once, and slots from a host's own
+store to its own ranks are handed over in memory. A test covers two ranks
+on the hub's host beside ranks elsewhere.
+
 ## ADR-064 — Placement readable through the mount (2026-10-21)
 
 **Context.** The engine's containers see the hub only through the mount;
