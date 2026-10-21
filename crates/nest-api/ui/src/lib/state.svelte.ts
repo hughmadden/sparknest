@@ -46,6 +46,8 @@ export const app = $state({
   groups: [] as { name: string; members: string[] }[],
   /** Fabric bytes/s per host, from counter differences between polls. */
   rates: {} as Record<string, Rates>,
+  /** Each running job's current rate (bytes/s), smoothed over a few seconds. */
+  jobRates: {} as Record<number, number>,
   error: "",
   tick: 0,
   /** Seconds the oldest request has been waiting, when that is long. */
@@ -57,6 +59,13 @@ export const app = $state({
 });
 
 const prev: Record<string, { t: number; r: number; s: number; l: number }> = {};
+const prevJob: Record<number, { t: number; b: number; r: number }> = {};
+
+/** Bytes a job has moved so far: whole files, plus what has landed of those in flight. */
+export const jobDone = (j: { hosts: Record<string, { done_bytes: number; partial_bytes?: number }> }) =>
+  Object.values(j.hosts).reduce((a, p) => a + p.done_bytes + (p.partial_bytes ?? 0), 0);
+export const jobTotal = (j: { hosts: Record<string, { total_bytes: number }> }) =>
+  Object.values(j.hosts).reduce((a, p) => a + p.total_bytes, 0);
 
 let runningIds = new Set<number>();
 let uiSeen = "";
@@ -86,6 +95,21 @@ function apply(status: Status, stores: Store[], jobs: Job[], groups: { name: str
     app.status = status;
     app.stores = stores;
     app.jobs = jobs;
+    const jr: Record<number, number> = {};
+    for (const j of jobs) {
+      if (j.finished) continue;
+      const b = jobDone(j);
+      const p = prevJob[j.id];
+      if (p && now > p.t) {
+        // Exponential smoothing over ~3 s; a retried file can step back.
+        const inst = Math.max(0, (b - p.b) / ((now - p.t) / 1000));
+        const a = Math.min(1, (now - p.t) / 3000);
+        jr[j.id] = p.r + a * (inst - p.r);
+      }
+      prevJob[j.id] = { t: now, b, r: jr[j.id] ?? 0 };
+    }
+    for (const id of Object.keys(prevJob)) if (!jobs.some((j) => j.id === Number(id) && !j.finished)) delete prevJob[Number(id)];
+    app.jobRates = jr;
     app.groups = groups;
     app.rates = rates;
     app.error = "";

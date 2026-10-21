@@ -1,25 +1,24 @@
 <script lang="ts">
-  import { runningJobs, cancelJob } from "../lib/state.svelte";
+  import { app, runningJobs, cancelJob, jobDone, jobTotal } from "../lib/state.svelte";
   import { human, duration, selLabel } from "../lib/format";
   import Icon from "./Icon.svelte";
   const jobs = $derived(runningJobs());
-  const sum = (j: (typeof jobs)[number], k: "done_bytes" | "total_bytes") =>
-    Object.values(j.hosts).reduce((a, p) => a + p[k], 0);
 </script>
 
 {#if jobs.length}
   <div class="strip">
     {#each jobs as j (j.id)}
-      {@const done = sum(j, "done_bytes")}
-      {@const total = sum(j, "total_bytes")}
+      {@const done = jobDone(j)}
+      {@const total = jobTotal(j)}
       {@const secs = (Date.now() - j.started_ms) / 1000}
+      {@const r = app.jobRates[j.id] ?? 0}
       <div class="job panel">
         <Icon name="bolt" size={16} />
         <div class="body">
           <div class="what">{selLabel(j.what.replace(/^(replicate|offload) /, ""))}
             <span class="muted tiny">{j.what.split(" ")[0]} → {Object.keys(j.hosts).join(", ") || "starting"}</span></div>
           <div class="bar live"><i style="width:{total ? (100 * done) / total : 0}%"></i></div>
-          <div class="tiny muted mono">{human(done)} / {human(total)} · {duration(secs * 1000)}{secs > 1 && done ? ` · ${human(done / secs)}/s` : ""}</div>
+          <div class="tiny muted mono">{total ? `${Math.floor((100 * done) / total)}% · ` : ""}{human(done)} / {human(total)} · {duration(secs * 1000)}{r >= 1 ? ` · ${human(r)}/s` : ""}{r >= 1 && total > done ? ` · ${duration(((total - done) / r) * 1000)} left` : ""}</div>
         </div>
         {#if j.cancelled}<span class="tiny muted">cancelling…</span>
         {:else}<button class="btn sm danger" onclick={() => cancelJob(j.id)}>Cancel</button>{/if}

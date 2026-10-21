@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +95,11 @@ pub struct JobProgress {
     /// removed.
     #[serde(default)]
     pub cancelled: bool,
+    /// Bytes of files still being copied that have already landed (not in
+    /// `done_bytes`), so progress moves within large files. Filled when
+    /// the status is read.
+    #[serde(default)]
+    pub partial_bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -283,6 +289,9 @@ pub struct Admin {
     pub(crate) name: String,
     pub(crate) mountpoint: Option<String>,
     jobs: Mutex<HashMap<u64, Arc<Mutex<JobProgress>>>>,
+    /// Per replication job, a counter per file in flight: bytes landed so
+    /// far, summed into `partial_bytes` when the status is read.
+    copying: Mutex<HashMap<u64, Vec<std::sync::Weak<AtomicU64>>>>,
     /// The node's placer, for the requests about its own jobs.
     pub(crate) placer: std::sync::OnceLock<std::sync::Weak<crate::placer::Placer>>,
     /// The host's push service, for its loads' records.
@@ -309,6 +318,7 @@ impl Admin {
             name,
             mountpoint,
             jobs: Mutex::new(HashMap::new()),
+            copying: Mutex::new(HashMap::new()),
             placer: std::sync::OnceLock::new(),
             push: std::sync::OnceLock::new(),
         });
@@ -493,15 +503,19 @@ impl Admin {
             let mut jobs = self.jobs.lock();
             if jobs.len() > 256 {
                 jobs.retain(|_, p| !p.lock().finished);
+                let live: std::collections::HashSet<u64> = jobs.keys().copied().collect();
+                self.copying.lock().retain(|j, _| live.contains(j));
             }
             jobs.insert(job, progress.clone());
         }
         let vfs = self.vfs.clone();
+        let me = self.clone();
         tokio::spawn(async move {
             futures::stream::iter(files)
                 .map(|(f, size)| {
                     let vfs = vfs.clone();
                     let progress = progress.clone();
+                    let me = me.clone();
                     async move {
                         if progress.lock().cancelled {
                             return (f, size, None);
@@ -515,8 +529,14 @@ impl Admin {
                                 tokio::time::sleep(Duration::from_millis(200)).await;
                             }
                         };
+                        let copied = Arc::new(AtomicU64::new(0));
+                        me.copying
+                            .lock()
+                            .entry(job)
+                            .or_default()
+                            .push(Arc::downgrade(&copied));
                         tokio::select! {
-                            r = vfs.replicate_into(f, target) => (f, size, Some(r)),
+                            r = vfs.replicate_counting(f, target, &copied) => (f, size, Some(r)),
                             _ = stop => (f, size, None),
                         }
                     }
@@ -545,7 +565,23 @@ impl Admin {
                 })
                 .await;
             progress.lock().finished = true;
+            me.copying.lock().remove(&job);
         });
+    }
+
+    /// Job `job`'s progress as reported: with `partial_bytes`, the bytes
+    /// its files in flight have landed so far.
+    fn job_status(&self, job: u64) -> Option<JobProgress> {
+        let mut p = self.jobs.lock().get(&job)?.lock().clone();
+        if let Some(c) = self.copying.lock().get_mut(&job) {
+            c.retain(|w| w.strong_count() > 0);
+            p.partial_bytes = c
+                .iter()
+                .filter_map(|w| w.upgrade())
+                .map(|n| n.load(Ordering::Relaxed))
+                .sum();
+        }
+        Some(p)
     }
 
     fn area(
@@ -644,8 +680,8 @@ impl Handler for AdminService {
                     .unwrap_or_default();
                     AdminResp::Health(health)
                 }
-                AdminReq::JobStatus { job } => match a.jobs.lock().get(&job) {
-                    Some(p) => AdminResp::Job(p.lock().clone()),
+                AdminReq::JobStatus { job } => match a.job_status(job) {
+                    Some(p) => AdminResp::Job(p),
                     None => AdminResp::Err(format!("no job {job}")),
                 },
                 AdminReq::Evict { files, store } => a.evict(files, store).await,

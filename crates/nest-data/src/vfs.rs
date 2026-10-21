@@ -328,6 +328,8 @@ pub struct Vfs {
 
 /// How long a read of the settings stays fresh: a change applies on every
 /// host within this.
+/// How long a copy keeps trying when no source can serve it right now.
+const COPY_RECOVERY_WAIT: Duration = Duration::from_secs(120);
 const SETTINGS_TTL: Duration = Duration::from_secs(1);
 
 fn io(e: std::io::Error) -> NestError {
@@ -1979,9 +1981,12 @@ impl Vfs {
         }
         let key = ObjectKey::new(file, generation);
         let Some(src) = self.local_source(&a) else {
-            return Err(NestError::Unavailable(
-                "no copy of that generation here".into(),
-            ));
+            return Err(NestError::Unavailable(if self.d.lease_valid() {
+                "no copy of that generation here".into()
+            } else {
+                "not serving right now (this host could not confirm with the cluster in time)"
+                    .into()
+            }));
         };
         src.open_read(key).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -2846,6 +2851,18 @@ impl Vfs {
         file: FileId,
         target: nest_types::StoreId,
     ) -> NestResult<u64> {
+        self.replicate_counting(file, target, &Arc::default()).await
+    }
+
+    /// `replicate_into`, adding each chunk's bytes to `copied` as it lands
+    /// (for a job's progress; a retried source counts again from 0, so
+    /// readers take it as a hint, not a total).
+    pub async fn replicate_counting(
+        &self,
+        file: FileId,
+        target: nest_types::StoreId,
+        copied: &Arc<AtomicU64>,
+    ) -> NestResult<u64> {
         let dest: Arc<nest_store::ObjectStore> = if target == self.me().live_store() {
             self.d.store().clone()
         } else {
@@ -2887,7 +2904,7 @@ impl Vfs {
         } else {
             None
         };
-        self.fetch_into(&a, &dest).await?;
+        self.fetch_counting(&a, &dest, copied).await?;
         let r = self
             .propose(Command::PublishReplica {
                 file,
@@ -2968,6 +2985,58 @@ impl Vfs {
         a: &FileAttr,
         dest: &Arc<nest_store::ObjectStore>,
     ) -> NestResult<()> {
+        self.fetch_counting(a, dest, &Arc::default()).await
+    }
+
+    /// `fetch_into`, adding each chunk's bytes to `copied` as it lands. When
+    /// no source can serve it right now (their leases lapsed while the
+    /// cluster could not confirm, a leader changing), it tries again until
+    /// the cluster's read recovery wait is spent, as reads do (ADR-056):
+    /// a burst of traffic then delays a copy instead of skipping it. Copies
+    /// wait at least `COPY_RECOVERY_WAIT`.
+    async fn fetch_counting(
+        &self,
+        a: &FileAttr,
+        dest: &Arc<nest_store::ObjectStore>,
+        copied: &Arc<AtomicU64>,
+    ) -> NestResult<()> {
+        let mut deadline = None;
+        let mut pause = Duration::from_millis(100);
+        loop {
+            match self.fetch_once(a, dest, copied).await {
+                Err(e @ NestError::Unavailable(_)) => {
+                    // Copies are not waited on by a reader: they ride out
+                    // longer than reads (a flood can hold leases off for
+                    // a minute or two).
+                    let d = *deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(self.setting(Setting::ReadRecoveryWait))
+                                .max(COPY_RECOVERY_WAIT)
+                    });
+                    let now = tokio::time::Instant::now();
+                    if now >= d {
+                        return Err(e);
+                    }
+                    tracing::debug!(file = a.id.0, error = %e, "no source could serve a copy; retrying");
+                    tokio::time::sleep(pause.min(d - now)).await;
+                    pause = (pause * 2).min(Duration::from_secs(1));
+                    // Holders may have changed meanwhile: plan again.
+                    let now = self.raw_attr(a.id)?;
+                    if now.generation != a.generation || now.gen_state != GenState::Stable {
+                        return Err(NestError::Stale);
+                    }
+                }
+                r => return r,
+            }
+        }
+    }
+
+    async fn fetch_once(
+        &self,
+        a: &FileAttr,
+        dest: &Arc<nest_store::ObjectStore>,
+        copied: &Arc<AtomicU64>,
+    ) -> NestResult<()> {
         dest.reserve_room(a.size).map_err(io)?;
         let holders = self.holders(a)?;
         let mut sources: Vec<Option<NodeId>> = Vec::new();
@@ -2988,9 +3057,10 @@ impl Vfs {
         let mut tried = Vec::new();
         let mut last = NestError::Unavailable("no holder reachable".into());
         for src in sources {
+            copied.store(0, Ordering::Relaxed);
             let copied = match src {
-                None => self.copy_local(a, dest).await,
-                Some(n) => self.copy_from(n, a, dest).await,
+                None => self.copy_local(a, dest, copied).await,
+                Some(n) => self.copy_from(n, a, dest, copied).await,
             };
             let from = src.map_or_else(|| "local copy".to_string(), |n| format!("node {n}"));
             match copied {
@@ -3027,6 +3097,7 @@ impl Vfs {
         src: NodeId,
         a: &FileAttr,
         dest: &Arc<nest_store::ObjectStore>,
+        copied: &Arc<AtomicU64>,
     ) -> NestResult<()> {
         let key = ObjectKey::new(a.id, a.generation);
         let store = dest.clone();
@@ -3101,7 +3172,9 @@ impl Vfs {
                         buf.len()
                     )));
                 }
-                st.write(buf, off).await.map_err(io)
+                st.write(buf, off).await.map_err(io)?;
+                copied.fetch_add(len as u64, Ordering::Relaxed);
+                Ok(())
             }
         };
         while next < a.size || !inflight.is_empty() {
@@ -3139,6 +3212,7 @@ impl Vfs {
         &self,
         a: &FileAttr,
         dest: &Arc<nest_store::ObjectStore>,
+        copied: &Arc<AtomicU64>,
     ) -> NestResult<()> {
         let key = ObjectKey::new(a.id, a.generation);
         let src = self
@@ -3146,6 +3220,7 @@ impl Vfs {
             .ok_or_else(|| NestError::Unavailable("the local copy is no longer servable".into()))?;
         let dest = dest.clone();
         let size = a.size;
+        let copied = copied.clone();
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             use std::os::unix::fs::FileExt;
             const CHUNK: usize = 4 << 20;
@@ -3170,6 +3245,7 @@ impl Vfs {
                 }
                 st.write_blocking(buf, off)?;
                 off += want as u64;
+                copied.fetch_add(want as u64, Ordering::Relaxed);
                 // Read once: keep the host's page cache for others.
                 since_drop += want;
                 if since_drop >= 256 << 20 {

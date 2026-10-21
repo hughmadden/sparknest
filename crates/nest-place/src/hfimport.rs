@@ -1215,8 +1215,226 @@ pub async fn remove(
     }
 }
 
+/// What `share` did (or, dry, would do) to one repo.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ShareOutcome {
+    pub repo: String,
+    /// Blobs moved into the shared store, linked to an identical one
+    /// already there (this copy dropped), kept in the repo (files in git,
+    /// as hf keeps them), and not converted (with why, per blob).
+    pub moved: u64,
+    pub linked: u64,
+    pub kept: u64,
+    pub skipped: Vec<String>,
+    pub bytes: u64,
+    pub freed: u64,
+    pub warnings: Vec<String>,
+}
+
+/// Repos in `mount_hub` whose blobs are their own (the layout before
+/// huggingface_hub 1.32): `models--org--name` directories with a regular
+/// file of at least 1 MiB under `blobs/`.
+pub fn unshared_repos(mount_hub: &Path) -> NestResult<Vec<String>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(mount_hub).map_err(|e| NestError::Io(e.to_string()))? {
+        let Ok(e) = e else { continue };
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("models--") || name.starts_with("datasets--")) {
+            continue;
+        }
+        let Ok(blobs) = std::fs::read_dir(e.path().join("blobs")) else {
+            continue;
+        };
+        let own = blobs.flatten().any(|b| {
+            b.file_type().is_ok_and(|t| t.is_file())
+                && b.metadata().is_ok_and(|m| m.len() >= 1 << 20)
+        });
+        if own {
+            out.push(name);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Move `repo`'s own blobs into the hub's shared store with hf's own code
+/// (its lock and `.refs` manifest), leaving relative symlinks: renames on
+/// the mount, so no data moves and every copy stays where it is. `each`
+/// sees every blob converted (its bytes).
+pub async fn share(
+    hf: Option<&Path>,
+    mount_hub: &Path,
+    repo: &str,
+    dry_run: bool,
+    verify: bool,
+    mut each: impl FnMut(u64) + Send,
+) -> NestResult<ShareOutcome> {
+    use tokio::io::AsyncBufReadExt;
+    let (py, drv) = driver(hf)?;
+    let mut cmd = tokio::process::Command::new(py);
+    cmd.arg(drv)
+        .args(["share", repo, "--cache-dir"])
+        .arg(mount_hub)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    if verify {
+        cmd.arg("--verify");
+    }
+    hf_env(&mut cmd, mount_hub);
+    let mut child =
+        spawn(&mut cmd).map_err(|e| NestError::Io(format!("running sparknest-hf-fetch: {e}")))?;
+    let mut lines = tokio::io::BufReader::new(child.stdout.take().expect("piped")).lines();
+    let mut o = ShareOutcome {
+        repo: repo.to_string(),
+        ..Default::default()
+    };
+    let mut done = false;
+    while let Ok(Some(l)) = lines.next_line().await {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) else {
+            continue;
+        };
+        if let Some(w) = v["warning"].as_str() {
+            o.warnings.push(w.to_string());
+        } else if v["done"].as_bool() == Some(true) {
+            o.kept = v["kept"].as_u64().unwrap_or(0);
+            o.freed = v["freed"].as_u64().unwrap_or(0);
+            done = true;
+        } else {
+            let size = v["size"].as_u64().unwrap_or(0);
+            match v["action"].as_str() {
+                Some("move") => o.moved += 1,
+                Some("link") => o.linked += 1,
+                _ => {
+                    o.skipped.push(format!(
+                        "{}: {}",
+                        v["name"].as_str().or(v["blob"].as_str()).unwrap_or("?"),
+                        v["why"].as_str().unwrap_or("skipped")
+                    ));
+                    continue;
+                }
+            }
+            o.bytes += size;
+            each(size);
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| NestError::Io(e.to_string()))?;
+    if !out.status.success() || !done {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = err
+            .lines()
+            .rfind(|l| !l.trim().is_empty())
+            .unwrap_or("failed");
+        return Err(NestError::Io(format!("sharing {repo}: {}", msg.trim())));
+    }
+    Ok(o)
+}
+
 #[cfg(test)]
 mod rm_tests {
+    /// With hf installed: a repo's own Xet blob moves into the shared store
+    /// (a relative symlink left, the .refs manifest naming it), a file kept
+    /// in git stays, and an identical blob in a second repo is linked to the
+    /// store entry and its copy dropped.
+    #[tokio::test]
+    async fn share_moves_xet_blobs_into_the_store() {
+        let Some(hf) = super::find_hf() else { return };
+        if super::fetch_driver().is_none() && std::env::var_os("SPARKNEST_HF_FETCH").is_none() {
+            // SAFETY: tests in this module set it once, before any thread
+            // reads it.
+            unsafe {
+                std::env::set_var(
+                    "SPARKNEST_HF_FETCH",
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../tools/hf-fetch/sparknest-hf-fetch"
+                    ),
+                )
+            };
+        }
+        let hub = std::env::temp_dir().join(format!("nest-hf-share-{}/hub", std::process::id()));
+        let xet = "ab".repeat(32);
+        let weights = vec![7u8; 2 << 20];
+        // Its sha256, the blob's name (an LFS file's etag).
+        let sha = "c406296b30d433e27c08e2989ad557c7e9ae7825d1bea14c42aa4ef53c9e8a9d";
+        for (n, repo) in ["models--org--a", "models--org--b"].iter().enumerate() {
+            let r = hub.join(repo);
+            std::fs::create_dir_all(r.join("blobs")).unwrap();
+            std::fs::create_dir_all(r.join("snapshots/c0ffee")).unwrap();
+            std::fs::create_dir_all(r.join("trees")).unwrap();
+            std::fs::write(r.join("blobs").join(sha), &weights).unwrap();
+            std::fs::write(r.join("blobs/g1"), b"{}").unwrap();
+            std::os::unix::fs::symlink(
+                format!("../../blobs/{sha}"),
+                r.join("snapshots/c0ffee/model.bin"),
+            )
+            .unwrap();
+            let tree = serde_json::json!({"format_version": 1, "files": {
+                "model.bin": {"size": weights.len(), "blob_id": "x", "lfs_sha256": sha, "xet_hash": xet},
+                "config.json": {"size": 2, "blob_id": "g1"},
+            }});
+            std::fs::write(r.join(format!("trees/c0ffee{n}.json")), tree.to_string()).unwrap();
+        }
+        assert_eq!(
+            super::unshared_repos(&hub).unwrap(),
+            ["models--org--a", "models--org--b"]
+        );
+        let dry = super::share(Some(&hf), &hub, "models--org--a", true, false, |_| {})
+            .await
+            .unwrap();
+        assert_eq!((dry.moved, dry.kept), (1, 1), "{dry:?}");
+        assert!(
+            !hub.join("models--org--a/blobs").join(sha).is_symlink(),
+            "dry run changes nothing"
+        );
+
+        let a = super::share(Some(&hf), &hub, "models--org--a", false, true, |_| {})
+            .await
+            .unwrap();
+        assert_eq!((a.moved, a.linked, a.kept), (1, 0, 1), "{a:?}");
+        let store = hub.join("blobs").join(&xet[..2]).join(&xet);
+        assert_eq!(std::fs::read(&store).unwrap(), weights);
+        let link = hub.join("models--org--a/blobs").join(sha);
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::Path::new("../../blobs")
+                .join(&xet[..2])
+                .join(&xet)
+        );
+        assert!(
+            !hub.join("models--org--a/blobs/g1").is_symlink(),
+            "git files stay"
+        );
+        let refs = std::fs::read_to_string(store.with_file_name(format!("{xet}.refs"))).unwrap();
+        assert!(
+            refs.contains(&format!("models--org--a/blobs/{sha}")),
+            "{refs}"
+        );
+        assert_eq!(
+            std::fs::read(hub.join("models--org--a/snapshots/c0ffee/model.bin")).unwrap(),
+            weights
+        );
+
+        let b = super::share(Some(&hf), &hub, "models--org--b", false, false, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            (b.moved, b.linked, b.freed),
+            (0, 1, weights.len() as u64),
+            "{b:?}"
+        );
+        assert!(hub.join("models--org--b/blobs").join(sha).is_symlink());
+        assert!(super::unshared_repos(&hub).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(hub.parent().unwrap());
+    }
+
     /// With hf installed: a dry run reports, a delete removes the repo.
     #[tokio::test]
     async fn hf_removes_a_repo_from_a_hub() {

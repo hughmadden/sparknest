@@ -143,3 +143,32 @@ async fn a_read_fails_once_the_wait_is_spent() {
     c.heal();
     v2.release(fh, None).await;
 }
+
+/// A copy whose only source cannot serve right now (cut off, its lease
+/// lapsed) keeps trying instead of skipping the file, and completes once
+/// the source is back (ADR-067).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_copy_waits_out_a_source_that_cannot_serve() {
+    let c = ready(3).await;
+    set_wait(&c, Some(500)).await;
+    let f = file(&c, 2, "shard", &[7u8; 64 << 10]).await;
+    c.partition(&[2], &[1, 3]);
+    c.eventually("node 2's lease lapsed", Duration::from_secs(5), |c| {
+        !c.node(2).data.lease_valid()
+    })
+    .await;
+    let v3 = c.node(3).vfs.clone();
+    let t = Instant::now();
+    let copy = v3.replicate_into(f, NodeId(3).live_store());
+    let heal = async {
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        c.heal();
+    };
+    let (r, ()) = tokio::join!(copy, heal);
+    // Longer than the read recovery wait set above: copies wait longer.
+    assert!(r.is_ok(), "{r:?}");
+    assert!(t.elapsed() >= Duration::from_millis(2_000));
+    c.converge().await;
+    let (_, copies) = v3.copies(f).unwrap();
+    assert!(copies.iter().any(|c| c.store == "n3"), "{copies:?}");
+}

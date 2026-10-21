@@ -33,6 +33,14 @@
 //! requests return to it. Requests already in flight on the standby finish
 //! there. If the standby itself drops meanwhile, requests return to the
 //! primary at once.
+//!
+//! **The LAN preferred** (`Rpc::prefer_standby`, the cluster setting
+//! `control-on-lan`, ADR-068). Requests move to the
+//! standby once it has answered for `return_after`, the primary left open
+//! as the fallback; there they are watched for silence as the primary is
+//! (a request waiting `silence` with nothing arriving), and moved back to
+//! the primary, the LAN connection closed and dialled again. The primary
+//! failing changes nothing then.
 
 use crate::RpcError;
 use crate::conn::{Conn, Rpc, SVC_PING};
@@ -76,6 +84,9 @@ impl Default for StandbyConfig {
     }
 }
 
+/// Why requests went on the standby when the LAN is preferred.
+const PREFERRED: &str = "the LAN is preferred and answering";
+
 /// One peer's paths, for diagnostics (`nest net`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathState {
@@ -99,6 +110,10 @@ pub struct PathState {
 #[derive(Default)]
 pub(crate) struct Paths {
     peers: Mutex<HashMap<NodeId, Peer>>,
+    /// Requests go on the standby (LAN) while it answers, the primary
+    /// (fabric) becoming the fallback (ADR-068): the control connection
+    /// then never queues behind the fabric's bulk traffic.
+    pub(crate) prefer_standby: std::sync::atomic::AtomicBool,
 }
 
 struct Peer {
@@ -125,6 +140,8 @@ struct Peer {
     primary_answered: Option<Instant>,
     primary_probing: bool,
     primary_ok_since: Option<Instant>,
+    /// Preferred standby: since when it has answered without a break.
+    standby_ok_since: Option<Instant>,
 }
 
 impl Peer {
@@ -148,6 +165,7 @@ impl Peer {
             primary_answered: None,
             primary_probing: false,
             primary_ok_since: None,
+            standby_ok_since: None,
         }
     }
 
@@ -161,13 +179,14 @@ impl Peer {
 
     fn return_to_primary(&mut self, peer: NodeId, why: &str) {
         self.on_standby = false;
+        self.standby_ok_since = None;
         self.since = SystemTime::now();
         self.returns += 1;
         self.reason = Some(why.to_string());
         self.redialled = None;
         self.primary_answered = None;
         self.primary_ok_since = None;
-        tracing::warn!(%peer, reason = why, "control path back on the fabric");
+        tracing::warn!(%peer, reason = why, "control path on the fabric");
     }
 }
 
@@ -342,6 +361,11 @@ fn step(rpc: &Rpc, peer: NodeId) {
     {
         c.close("primary path cut by filter");
     }
+    let prefer = rpc
+        .inner
+        .paths
+        .prefer_standby
+        .load(std::sync::atomic::Ordering::Relaxed);
     let mut g = rpc.inner.paths.peers.lock();
     let Some(p) = g.get_mut(&peer) else { return };
 
@@ -374,6 +398,9 @@ fn step(rpc: &Rpc, peer: NodeId) {
                         if ok {
                             p.answered = Some(Instant::now());
                             p.rtt = Some(t.elapsed());
+                            p.standby_ok_since.get_or_insert_with(Instant::now);
+                        } else {
+                            p.standby_ok_since = None;
                         }
                     }
                 });
@@ -381,7 +408,27 @@ fn step(rpc: &Rpc, peer: NodeId) {
         }
     }
 
+    if p.live().is_none() {
+        p.standby_ok_since = None;
+    }
     if !p.on_standby {
+        // The standby preferred: move onto it once it has answered for
+        // `return_after` (the primary stays open, the fallback).
+        if prefer
+            && !p.switching
+            && p.answering(cfg.ping_fresh)
+            && p.standby_ok_since
+                .is_some_and(|t| t.elapsed() >= cfg.return_after)
+        {
+            p.on_standby = true;
+            p.since = SystemTime::now();
+            p.reason = Some(PREFERRED.into());
+            p.redialled = Some(now);
+            p.primary_answered = None;
+            p.primary_ok_since = None;
+            tracing::info!(%peer, "control path on the LAN (preferred)");
+            return;
+        }
         // A request waiting with the peer silent: probe halfway through,
         // and fail over once the whole budget has passed unanswered.
         let Some(c) = primary else { return };
@@ -403,8 +450,40 @@ fn step(rpc: &Rpc, peer: NodeId) {
 
     // Failed over: redial the primary, probe it, and return once it has
     // been healthy long enough.
-    if p.live().is_none() {
+    let Some(lan) = p.live() else {
         p.return_to_primary(peer, "standby connection lost");
+        return;
+    };
+    if !prefer && p.reason.as_deref() == Some(PREFERRED) {
+        p.return_to_primary(peer, "the LAN is no longer preferred");
+        return;
+    }
+    if prefer {
+        // On the preferred LAN: a request waiting there with nothing at all
+        // arriving falls back to the fabric (as the fabric falls over to
+        // the LAN), the stuck connection closed; the LAN is taken again
+        // once it has answered for `return_after`.
+        if let Some((quiet, probed)) = lan.silence() {
+            if quiet >= cfg.silence / 2 && !probed {
+                lan.probe();
+            } else if quiet >= cfg.silence && probed {
+                let why = format!("no answer on the LAN for {} ms", quiet.as_millis());
+                p.return_to_primary(peer, &why);
+                drop(g);
+                lan.close("LAN path silent; requests back on the fabric");
+                return;
+            }
+        }
+        // Keep the fabric connected for a fallback.
+        if primary.is_none() && p.redialled.is_none_or(|t| t.elapsed() >= cfg.redial_every) {
+            p.redialled = Some(now);
+            let rpc = rpc.clone();
+            tokio::spawn(async move {
+                if let Err(e) = rpc.conn(peer).await {
+                    tracing::debug!(%peer, error = %e, "fabric unreachable (LAN in use)");
+                }
+            });
+        }
         return;
     }
     match primary {

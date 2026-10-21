@@ -132,6 +132,9 @@ pub struct DataNode {
     /// node cannot acknowledge a fence).
     lease_until: Mutex<Option<std::time::Instant>>,
     lease: std::time::Duration,
+    /// When the lease last lapsed while caught up (for the log line when it
+    /// comes back).
+    lapsed_at: Mutex<Option<std::time::Instant>>,
     /// Pooled read-only metadata connections for hot paths (opening one
     /// costs far more than a query).
     readers: Mutex<Vec<rusqlite::Connection>>,
@@ -186,6 +189,7 @@ impl DataNode {
             admitted: std::sync::atomic::AtomicBool::new(true),
             lease_until: Mutex::new(None),
             lease,
+            lapsed_at: Mutex::new(None),
             readers: Mutex::new(Vec::new()),
             archives: Mutex::new(HashMap::new()),
         });
@@ -648,6 +652,21 @@ impl DataNode {
                     *d.lease_until.lock() = Some(started + d.lease);
                     if !d.caught_up.swap(true, Ordering::SeqCst) {
                         tracing::info!("caught up with the cluster; serving");
+                    } else if let Some(since) = d.lapsed_at.lock().take() {
+                        tracing::warn!(
+                            after_ms = since.elapsed().as_millis() as u64,
+                            "serving again: the cluster confirmed this host's lease"
+                        );
+                    }
+                } else if !d.lease_valid() && d.caught_up.load(Ordering::SeqCst) {
+                    // Copies here stop being served until the leader
+                    // confirms again (a cut-off host must not serve).
+                    let mut l = d.lapsed_at.lock();
+                    if l.is_none() {
+                        *l = Some(std::time::Instant::now());
+                        tracing::warn!(
+                            "not serving: could not confirm with the cluster within the lease"
+                        );
                     }
                 }
                 drop(d);

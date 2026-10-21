@@ -1,16 +1,15 @@
 <script lang="ts">
-  import { app, cancelJob, go } from "../lib/state.svelte";
+  import { app, cancelJob, go, jobDone, jobTotal } from "../lib/state.svelte";
   import { human, duration, selLabel } from "../lib/format";
   import Icon from "../components/Icon.svelte";
   const jobs = $derived(app.jobs.slice().sort((a, b) => b.started_ms - a.started_ms || b.id - a.id));
-  const tot = (j: (typeof jobs)[number], k: "done_bytes" | "total_bytes") => Object.values(j.hosts).reduce((a, p) => a + p[k], 0);
 </script>
 
 <div class="stack">
   <div class="row"><h2>Jobs</h2><span class="small muted">on every host since its daemon started</span></div>
   {#each jobs as j (j.id)}
-    {@const done = tot(j, "done_bytes")}
-    {@const total = tot(j, "total_bytes")}
+    {@const done = jobDone(j)}
+    {@const total = jobTotal(j)}
     {@const secs = ((j.finished_ms ?? Date.now()) - j.started_ms) / 1000}
     <div class="job panel" class:live={!j.finished}>
       <div class="row">
@@ -20,15 +19,15 @@
         <b class="what">{selLabel(j.what)}</b>
         {#if j.node}<span class="tiny muted">on {j.node}</span>{/if}
         <span class="spacer"></span>
-        {#if j.started_ms}<span class="tiny muted mono">{new Date(j.started_ms).toLocaleTimeString()} · {duration(secs * 1000)}{done && secs > 0.5 ? ` · ${human(done / secs)}/s` : ""}</span>{/if}
+        {#if j.started_ms}<span class="tiny muted mono">{new Date(j.started_ms).toLocaleTimeString()} · {duration(secs * 1000)}{j.finished ? (done && secs > 0.5 ? ` · ${human(done / secs)}/s` : "") : (app.jobRates[j.id] ?? 0) >= 1 ? ` · ${human(app.jobRates[j.id])}/s` : ""}</span>{/if}
         {#if !j.finished && !j.cancelled}<button class="btn sm danger" onclick={() => cancelJob(j.id)}><Icon name="stop" size={13} /> Cancel</button>{/if}
       </div>
       {#if j.error && !j.cancelled}<div class="small" style="color:var(--bad)">{j.error}</div>{/if}
       <div class="hosts">
         {#each Object.entries(j.hosts) as [h, p]}
           <div class="h">
-            <div class="row small"><b>{h}</b><span class="spacer"></span><span class="mono tiny muted">{p.done_files}/{p.total_files} · {human(p.done_bytes)} / {human(p.total_bytes)}</span></div>
-            <div class="bar" class:live={!p.finished}><i style="width:{p.total_bytes ? (100 * p.done_bytes) / p.total_bytes : p.finished ? 100 : 0}%"></i></div>
+            <div class="row small"><b>{h}</b><span class="spacer"></span><span class="mono tiny muted">{p.done_files}/{p.total_files} · {human(p.done_bytes + (p.partial_bytes ?? 0))} / {human(p.total_bytes)}</span></div>
+            <div class="bar" class:live={!p.finished}><i style="width:{p.total_bytes ? (100 * (p.done_bytes + (p.partial_bytes ?? 0))) / p.total_bytes : p.finished ? 100 : 0}%"></i></div>
             {#if p.failed.length}
               <details><summary class="tiny" style="color:var(--bad)">{p.failed.length} not done</summary>
                 {#each p.failed as [, why]}

@@ -19,6 +19,19 @@ stdout.
       {"file": F, "ok": true}                       finished (or already cached)
       {"file": F, "error": MESSAGE}                 failed; the next file follows
 
+  sparknest-hf-fetch share REPO_DIR --cache-dir HUB [--dry-run] [--verify]
+      moves a repo's own blobs (the layout before huggingface_hub 1.32) into
+      the hub's shared store, leaving relative symlinks, exactly as hf does
+      after a Xet download (its lock and .refs manifest), so hf 2.x treats
+      them as its own. An identical file already in the store is linked to
+      and this copy dropped. Each blob's Xet hash comes from the repo's
+      trees/*.json, else from the Hub. A blob must have the size recorded
+      for it; --verify also checks its LFS sha256 (reads the whole file).
+      Files kept in git (no Xet hash: configs, small JSON) stay in the repo,
+      as hf keeps them. --offline does not ask the Hub.
+      {"blob": B, "name": F, "size": N, "action": "move"|"link"|"skip", "why": W}
+      {"done": true, "moved": N, "linked": N, "kept": N, "skipped": N, "freed": BYTES}
+
 SPDX-License-Identifier: MIT OR Apache-2.0
 """
 import argparse
@@ -103,20 +116,116 @@ def fetch(args):
             emit({"file": name, "error": f"{type(e).__name__}: {e}"})
 
 
+def share(args):
+    import hashlib
+    from pathlib import Path
+    from huggingface_hub.utils import _shared_blobs as sb
+
+    hub = Path(args.cache_dir)
+    repo = hub / args.repo
+    blobs = repo / "blobs"
+    # Every blob name (etag) -> (file name, size, xet hash, lfs sha256), from
+    # the trees hf recorded, then the Hub for anything they lack.
+    known = {}
+    for t in sorted((repo / "trees").glob("*.json")):
+        try:
+            files = json.loads(t.read_text()).get("files", {})
+        except (OSError, ValueError):
+            continue
+        for name, f in files.items():
+            etag = f.get("lfs_sha256") or f.get("blob_id")
+            if etag:
+                # A file kept in git (no Xet hash) stays in the repo, as hf
+                # keeps it.
+                known.setdefault(etag, (name, f.get("size"), f.get("xet_hash"), f.get("lfs_sha256")))
+    local = sorted(p for p in blobs.iterdir() if p.is_file() and not p.is_symlink()
+                   and not p.name.endswith((".incomplete", ".lock")))
+    if any(p.name not in known for p in local) and not args.offline:
+        kind, _, name = args.repo.partition("--")
+        repo_id = name.replace("--", "/", 1)
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        # Snapshots the repo's trees do not cover, each asked on its own: a
+        # stale one (a 64-hex name, a commit the Hub dropped) is skipped.
+        covered = {t.stem for t in (repo / "trees").glob("*.json")}
+        for sha in sorted({s.name for s in (repo / "snapshots").iterdir()} - covered):
+            try:
+                for f in api.list_repo_tree(repo_id, repo_type=kind.rstrip("s"),
+                                            revision=sha, recursive=True, expand=True):
+                    lfs = getattr(f, "lfs", None)
+                    etag = lfs.sha256 if lfs else getattr(f, "blob_id", None)
+                    xet = getattr(f, "xet_hash", None)
+                    if etag:
+                        known.setdefault(etag, (f.path, f.size, xet, lfs.sha256 if lfs else None))
+            except Exception as e:  # offline, or gone from the Hub
+                emit({"warning": f"snapshot {sha[:12]}: the Hub could not list it ({type(e).__name__})"})
+
+    moved = linked = skipped = kept = freed = 0
+    for p in local:
+        info = known.get(p.name)
+        if info is None:
+            emit({"blob": p.name, "action": "skip", "why": "not in the repo's trees, nor on the Hub"})
+            skipped += 1
+            continue
+        name, size, xet, sha = info
+        rec = {"blob": p.name, "name": name, "size": p.stat().st_size}
+        if not xet:
+            kept += 1
+            continue
+        if size is not None and p.stat().st_size != size:
+            emit({**rec, "action": "skip", "why": f"size {p.stat().st_size}, recorded {size}"})
+            skipped += 1
+            continue
+        if args.verify and sha:
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                while chunk := f.read(16 << 20):
+                    h.update(chunk)
+            if h.hexdigest() != sha:
+                emit({**rec, "action": "skip", "why": "content differs from its recorded sha256"})
+                skipped += 1
+                continue
+        store = sb.shared_blob_path(hub, xet)
+        exists = store.is_file()
+        action = "link" if exists else "move"
+        if args.dry_run:
+            emit({**rec, "action": action})
+        elif not sb.publish_blob_to_shared_store(
+            blob_path=str(p), xet_hash=xet, cache_dir=hub, expected_size=rec["size"]
+        ):
+            emit({**rec, "action": "skip", "why": "hf would not publish it"})
+            skipped += 1
+            continue
+        else:
+            emit({**rec, "action": action})
+        if action == "link":
+            linked += 1
+            freed += rec["size"]
+        else:
+            moved += 1
+    emit({"done": True, "moved": moved, "linked": linked, "kept": kept, "skipped": skipped,
+          "freed": freed})
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("plan", "fetch", "refs"):
+    for name in ("plan", "fetch", "refs", "share"):
         s = sub.add_parser(name)
         s.add_argument("repo")
         s.add_argument("--repo-type", default="model", choices=["model", "dataset"])
         s.add_argument("--revision", default=None)
-        if name == "fetch":
+        if name in ("fetch", "share"):
             s.add_argument("--cache-dir", required=True)
+        if name == "share":
+            s.add_argument("--dry-run", action="store_true")
+            s.add_argument("--verify", action="store_true")
+            s.add_argument("--offline", action="store_true")
     args = p.parse_args()
     if args.cmd == "fetch" and not args.revision:
         p.error("fetch needs --revision COMMIT (from plan)")
-    {"plan": plan, "fetch": fetch, "refs": refs}[args.cmd](args)
+    {"plan": plan, "fetch": fetch, "refs": refs, "share": share}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -2172,3 +2172,77 @@ choice of holder at all, and an even spread makes the same tail.
 uneven for files nobody pushes. Stealing work while the load runs (fast
 sources take files from slow ones): needs a second copy anyway, which the
 hub's choice already uses.
+
+## ADR-067 — Bulk off the control connection: push slots on TCP lanes; copy progress within files (2026-10-21)
+
+**Context.** Push slots that cannot go by RDMA (an off-grid source or
+rank, an RDMA lane that failed, a ring the NIC could not register) went
+as `PushMsg::Slot` RPCs on the control connection: 1–16 MiB messages
+queued ahead of Raft heartbeats. Replication and reads never did (RDMA,
+or TCP lanes: ADR-048, ADR-057). Separately, a replication job counted a
+file's bytes only once the whole file was copied: with 8–10 GB shards and
+eight files in flight per host, progress sat at 0 for minutes and then
+jumped, and the user started more plans thinking the first ones were
+queued.
+
+**Decision.**
+1. **Lane messages (lane protocol 3).** A lane frame `kind=5 | id | service
+   u8 | len u32 | bytes`, answered as a write, hands a service's message to
+   the `MessageSink` registered for it on the receiving host. The probe
+   answer becomes 3; a peer that answers 2 or less is never sent one.
+2. **Push slots take the lane.** A slot's fallback goes on a lane to the
+   rank host when one takes messages (the standby lanes between fabric
+   hosts, the lanes off-grid hosts dial), else on the control connection
+   as before. A lane failure falls back to the control connection; a slot
+   that may have arrived is safe to send again (its grant's `seq` drops a
+   duplicate).
+3. **Copy progress within files.** Each chunk a replication copies adds
+   to a counter for its file; `JobProgress.partial_bytes` (appended,
+   ADR-018) sums those of the files in flight when the status is read.
+   The UI shows done plus partial, the percentage, a rate over the last
+   few seconds and the time left. A host before this reports 0.
+4. **Copies ride out a source that cannot serve.** A replication whose
+   every source answers `Unavailable` (its lease lapsed while the cluster
+   could not confirm it: on 2026-10-21 a burst of plans held leases off
+   for two minutes and 109 files were skipped) waits and tries again, up
+   to the read recovery wait or two minutes, whichever is longer, instead
+   of skipping the file. The error says "not serving right now" when that
+   is why, and a host logs when it stops serving and when it serves again.
+
+**Alternatives.** A separate lane connection per service (more
+connections and handshakes for one more frame kind); marking control
+traffic with a higher DSCP class only (still needs the switch to map it,
+and keeps bulk on one TCP stream with Raft; done on the switch side too).
+
+## ADR-068 — Control traffic on the LAN, the fabric its fallback (2026-10-21)
+
+**Context.** ADR-057 kept each fabric pair's control connection (Raft,
+metadata, admin) on the fabric, with a LAN connection as an idle standby
+used only when the fabric connection failed outright; slowness never
+switched. The fabric switch (a CRS804, one egress queue, no pause) tail-
+drops 1–5% under incast, and the control TCP shares that queue with RDMA:
+on 2026-10-21 several placement plans at once dropped enough heartbeats
+that the leader could not confirm leases for two minutes, and every host
+stopped serving. ADR-067 took the last bulk data off the control
+connection, so it is now only small messages; the 10G LAN switch carries
+no RDMA.
+
+**Decision.**
+1. **A cluster setting, `control-on-lan`** (0/1, default 1): every host
+   follows it within a second, live; `nest config set control-on-lan 0`
+   puts control traffic back on the fabric. Path choice, not Raft timing
+   (which stays in node config, ADR-056).
+2. **On**, a peer's requests move to the LAN connection once it has
+   answered probes for `return_after` (10 s); the fabric connection stays
+   open, probed, and redialled if it drops. On the LAN, requests are
+   watched as the fabric's are: one waiting `silence` (1 s) with nothing
+   at all arriving falls back to the fabric, the LAN connection closed
+   and dialled again; the LAN is taken again after `return_after` of
+   answers. A LAN connection that closes falls back at once.
+3. **Off**, ADR-057 as before.
+4. Bulk data is unchanged: RDMA, and TCP lanes when RDMA is down.
+
+**Consequences.** Control latency rises by the LAN's round trip
+(≈0.1 ms more), irrelevant at Raft's 150 ms heartbeat. A fabric outage no
+longer moves control traffic at all. Traffic classes on the fabric switch
+(control above inference above bulk) remain worth doing for the data.

@@ -2002,6 +2002,66 @@ impl Placer {
         })
     }
 
+    /// Convert `repos` (default: every repo with its own blobs) to the
+    /// hub's shared blob store (`hfimport::share`), one after another.
+    pub fn hf_share(
+        self: &Arc<Self>,
+        hf: Option<std::path::PathBuf>,
+        mount_hub: std::path::PathBuf,
+        repos: Vec<String>,
+        verify: bool,
+    ) -> u64 {
+        let what = if repos.is_empty() {
+            "hf share (every repo)".to_string()
+        } else {
+            format!("hf share {}", repos.join(" "))
+        };
+        tracing::info!(?repos, "hf share started");
+        self.local_job(what, move |_vfs, progress, notes| async move {
+            let repos = if repos.is_empty() {
+                let hub = mount_hub.clone();
+                tokio::task::spawn_blocking(move || crate::hfimport::unshared_repos(&hub))
+                    .await
+                    .map_err(|e| NestError::Io(e.to_string()))??
+            } else {
+                repos
+            };
+            progress.lock().total_files = repos.len() as u64;
+            let (mut moved, mut linked, mut freed) = (0u64, 0u64, 0u64);
+            for repo in repos {
+                if progress.lock().cancelled {
+                    break;
+                }
+                let p = progress.clone();
+                match crate::hfimport::share(hf.as_deref(), &mount_hub, &repo, false, verify, |b| {
+                    p.lock().bytes += b
+                })
+                .await
+                {
+                    Ok(o) => {
+                        moved += o.moved;
+                        linked += o.linked;
+                        freed += o.freed;
+                        let mut n = notes.lock();
+                        for s in &o.skipped {
+                            n.push(format!("{repo}: kept {s}"));
+                        }
+                        for w in &o.warnings {
+                            n.push(format!("{repo}: {w}"));
+                        }
+                    }
+                    Err(e) => progress.lock().errors.push(e.to_string()),
+                }
+                progress.lock().files += 1;
+            }
+            notes.lock().push(format!(
+                "{moved} blobs moved into the shared store, {linked} linked to an identical one ({} freed)",
+                crate::plan::human(freed)
+            ));
+            Ok(())
+        })
+    }
+
     /// A job that runs on this node over an `ImportProgress`: its progress
     /// is mirrored into the job under this host's name (files, bytes and
     /// rate like any other job), it can be cancelled, and `notes` lines end
@@ -2052,6 +2112,7 @@ impl Placer {
                         failed: p.errors.iter().map(|e| (FileId(0), e.clone())).collect(),
                         finished: p.finished,
                         cancelled: p.cancelled,
+                        partial_bytes: 0,
                     },
                 );
             }

@@ -111,7 +111,7 @@
     for (const j of runningJobs()) {
       const sel = /^(?:replicate|offload) (\S+)/.exec(j.what)?.[1];
       if (!sel) continue;
-      for (const [h, p] of Object.entries(j.hosts)) if (!p.finished) m.set(sel + " " + h, p.total_bytes ? p.done_bytes / p.total_bytes : 0);
+      for (const [h, p] of Object.entries(j.hosts)) if (!p.finished) m.set(sel + " " + h, p.total_bytes ? (p.done_bytes + (p.partial_bytes ?? 0)) / p.total_bytes : 0);
     }
     return m;
   });

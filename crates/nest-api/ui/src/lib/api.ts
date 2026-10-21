@@ -164,6 +164,8 @@ export interface JobProgress {
   failed: [number, string][];
   finished: boolean;
   cancelled?: boolean;
+  /** Bytes already landed of files still being copied (older hosts: absent). */
+  partial_bytes?: number;
 }
 export interface Job {
   id: number;

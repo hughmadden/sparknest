@@ -462,6 +462,26 @@ enum HfCmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Move repos' own blobs into the hub's shared blob store
+    ///
+    /// Repos written by huggingface_hub before 1.32 keep their blobs in
+    /// their own blobs/ folder; hf ≥ 1.32 stores each file once in the hub's
+    /// shared store and links to it. This converts them with hf's own code:
+    /// renames through the mount, so no data moves and every copy stays
+    /// where it is. Without REPO: every repo that has its own blobs.
+    Share {
+        /// org/name, dataset/org/name, or models--org--name.
+        repos: Vec<String>,
+        /// Show what would change; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Check each blob's sha256 before moving it (reads every byte).
+        #[arg(long)]
+        verify: bool,
+        /// Follow progress until the job finishes.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Delete Hugging Face repos from sparknest's hub (every copy, every host)
     ///
     /// Runs `hf cache rm` on the hub through this host's mount, so hf decides
@@ -987,11 +1007,14 @@ fn print_net(v: &serde_json::Value) {
                 hb["timeouts"].as_u64().unwrap_or(0),
                 lag,
             );
-            if let Some(why) = p["reason"].as_str()
-                && p["control_on_standby"].as_bool() == Some(true)
-            {
+            if let Some(why) = p["reason"].as_str() {
                 println!(
-                    "              on the LAN since {}s: {why}",
+                    "              on the {} since {}s: {why}",
+                    if p["control_on_standby"].as_bool() == Some(true) {
+                        "LAN"
+                    } else {
+                        "fabric"
+                    },
                     p["control_since_s"]
                 );
             }
@@ -2229,6 +2252,67 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             v
+        }
+        Cmd::Hf {
+            cmd:
+                HfCmd::Share {
+                    repos,
+                    dry_run,
+                    verify,
+                    wait,
+                },
+        } => {
+            let v = c
+                .post(
+                    "/v1/hf/share",
+                    json!({ "repos": repos, "dry_run": dry_run, "verify": verify, "hf": which("hf") }),
+                )
+                .await?;
+            if *dry_run {
+                if !cli.json {
+                    let (mut n, mut moved, mut linked, mut bytes, mut freed) = (0, 0, 0, 0, 0);
+                    for r in v["dry_run"].as_array().into_iter().flatten() {
+                        let repo = r["repo"].as_str().unwrap_or("?");
+                        if let Some(e) = r["error"].as_str() {
+                            println!("  {repo}: {e}");
+                            continue;
+                        }
+                        let (m, l, b) = (
+                            r["moved"].as_u64().unwrap_or(0),
+                            r["linked"].as_u64().unwrap_or(0),
+                            r["bytes"].as_u64().unwrap_or(0),
+                        );
+                        let skipped = r["skipped"].as_array().map_or(0, Vec::len);
+                        println!(
+                            "  {repo}: {m} moved, {l} linked ({}){}",
+                            human(b),
+                            if skipped > 0 {
+                                format!(", {skipped} not converted")
+                            } else {
+                                String::new()
+                            }
+                        );
+                        for s in r["skipped"].as_array().into_iter().flatten().take(3) {
+                            println!("      {}", s.as_str().unwrap_or(""));
+                        }
+                        n += 1;
+                        moved += m;
+                        linked += l;
+                        bytes += b;
+                        freed += r["freed"].as_u64().unwrap_or(0);
+                    }
+                    println!(
+                        "would convert {n} repo(s): {moved} blobs moved, {linked} linked ({}); frees {}",
+                        human(bytes),
+                        human(freed)
+                    );
+                    return Ok(());
+                }
+                v
+            } else {
+                let jid = v["job"].as_u64().unwrap_or(0);
+                if *wait { wait_job(&c, jid).await? } else { v }
+            }
         }
         Cmd::Hf {
             cmd:

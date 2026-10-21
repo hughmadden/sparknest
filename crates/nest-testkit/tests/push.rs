@@ -95,7 +95,52 @@ fn run_rank(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn ranks_receive_exactly_their_strided_shares() {
-    let c = ready(3).await;
+    strided_shares(false).await;
+}
+
+/// With TCP lanes between the hosts (the standby lanes fabric pairs keep),
+/// slots that cannot go by RDMA travel on them, off the control connection
+/// (ADR-067).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn slots_without_rdma_travel_on_tcp_lanes() {
+    strided_shares(true).await;
+}
+
+async fn strided_shares(lanes: bool) {
+    let c = if lanes {
+        let c = TestCluster::start_with_standby(3, nest_testkit::fast_tuning()).await;
+        c.eventually("serving", Duration::from_secs(8), |c| {
+            (1..=3).all(|i| c.node(i).data.caught_up() && c.node(i).data.session().is_some())
+        })
+        .await;
+        c.eventually("lanes take messages", Duration::from_secs(10), |c| {
+            [(2, 1), (2, 3), (3, 1)].iter().all(|(a, b)| {
+                c.node(*a)
+                    .vfs
+                    .lanes()
+                    .is_some_and(|l| l.takes_messages(NodeId(*b)))
+            })
+        })
+        .await;
+        c.eventually("names registered", Duration::from_secs(8), |c| {
+            c.node(1)
+                .placer
+                .nodes()
+                .map(|n| n.iter().all(|h| !h.name.starts_with("node")))
+                .unwrap_or(false)
+        })
+        .await;
+        c
+    } else {
+        ready(3).await
+    };
+    let messages = |c: &TestCluster| -> u64 {
+        (1..=3)
+            .filter_map(|i| c.node(i).vfs.lanes())
+            .map(|l| l.stats.messages.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    };
+    let before = messages(&c);
     // Two files: one on node 2, one on node 3 (each written there).
     let (rows, units, unit) = (64u32, 6u32, 1024u32);
     let row = (units * unit) as usize;
@@ -270,7 +315,14 @@ async fn ranks_receive_exactly_their_strided_shares() {
         assert_eq!(got.len(), want.len());
         assert!(got == &want, "rank {r}'s arena differs from its share");
     }
-    let _ = NodeId(0);
+    // Every slot to a rank on another host went on a lane (node 3's own
+    // slots to its own rank go straight in).
+    let sent = messages(&c) - before;
+    if lanes {
+        assert!(sent > 0, "no slot travelled on a lane");
+    } else {
+        assert_eq!(sent, 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

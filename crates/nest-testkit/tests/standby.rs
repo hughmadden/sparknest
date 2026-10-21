@@ -45,6 +45,8 @@ async fn quorum_survives_losing_the_fabric() {
         (1..=3).all(|i| c.node(i).data.caught_up() && c.node(i).data.session().is_some())
     })
     .await;
+    // The fabric first (ADR-057), the LAN only its fallback.
+    set_control_on_lan(&c, 0).await;
     c.eventually("standbys up", Duration::from_secs(5), |c| {
         (1..=3u64).all(|a| {
             (1..=3u64)
@@ -207,4 +209,103 @@ async fn reads_use_the_standby_lane_while_rdma_is_down() {
         lane >= data.len() as u64,
         "standby lane carried {lane} bytes"
     );
+}
+
+async fn set_control_on_lan(c: &TestCluster, v: u64) {
+    c.node(1)
+        .meta
+        .propose(nest_meta::Command::SetSetting {
+            name: Setting::ControlOnLan.name().into(),
+            value: Some(v),
+        })
+        .await
+        .unwrap();
+    c.converge().await;
+    c.eventually("every host on the setting", Duration::from_secs(5), |c| {
+        (1..=3).all(|i| c.node(i).vfs.setting(Setting::ControlOnLan) == v)
+    })
+    .await;
+}
+
+fn on_lan(c: &TestCluster, a: u64, b: u64) -> bool {
+    c.node(a).rpc.path(NodeId(b)).is_some_and(|p| p.on_standby)
+}
+
+/// ADR-068: control traffic goes on the LAN once it answers, falls back to
+/// the fabric when the LAN goes silent (metadata still commits), returns
+/// to the LAN once it answers again, and stays on the fabric with the
+/// setting off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_prefers_the_lan_and_falls_back_to_the_fabric() {
+    let c = TestCluster::start_with_standby(3, nest_testkit::fast_tuning()).await;
+    c.eventually("serving", Duration::from_secs(8), |c| {
+        (1..=3).all(|i| c.node(i).data.caught_up() && c.node(i).data.session().is_some())
+    })
+    .await;
+    let pairs: Vec<(u64, u64)> = (1..=3u64)
+        .flat_map(|a| (1..=3u64).filter(move |b| *b != a).map(move |b| (a, b)))
+        .collect();
+    // On by default: every pair moves to the LAN.
+    c.eventually("every pair on the LAN", Duration::from_secs(8), |c| {
+        pairs.iter().all(|(a, b)| on_lan(c, *a, *b))
+    })
+    .await;
+    let leader = c.wait_leader().await;
+    let term = c.node(leader).meta.metrics().current_term;
+    write_file(&c, 1, "on-lan", b"control on the LAN").await;
+
+    // The LAN switch drops everything: back to the fabric, no election.
+    for (a, b) in &pairs {
+        c.node(*a).rpc.filter().mute_lan(NodeId(*b));
+    }
+    c.eventually(
+        "the leader's peers back on the fabric",
+        Duration::from_secs(5),
+        |c| {
+            (1..=3u64)
+                .filter(|b| *b != leader)
+                .all(|b| !on_lan(c, leader, b))
+        },
+    )
+    .await;
+    for i in 1..=3 {
+        write_file(&c, i, &format!("fabric-{i}"), b"on the fabric").await;
+    }
+    let leader2 = c.wait_leader().await;
+    assert_eq!(
+        (leader2, c.node(leader2).meta.metrics().current_term),
+        (leader, term),
+        "losing the LAN forced an election"
+    );
+    let p = c
+        .node(leader)
+        .rpc
+        .path(NodeId(if leader == 1 { 2 } else { 1 }))
+        .unwrap();
+    // Silence on the LAN, or the LAN connection closing: either names it.
+    assert!(
+        p.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("LAN") || r.contains("standby")),
+        "{p:?}"
+    );
+
+    // The LAN is back: every pair returns to it.
+    for (a, b) in &pairs {
+        c.node(*a).rpc.filter().unmute_lan(NodeId(*b));
+    }
+    c.eventually(
+        "every pair on the LAN again",
+        Duration::from_secs(10),
+        |c| pairs.iter().all(|(a, b)| on_lan(c, *a, *b)),
+    )
+    .await;
+
+    // Off: every pair on the fabric.
+    set_control_on_lan(&c, 0).await;
+    c.eventually("every pair on the fabric", Duration::from_secs(5), |c| {
+        pairs.iter().all(|(a, b)| !on_lan(c, *a, *b))
+    })
+    .await;
+    write_file(&c, 2, "off", b"fabric again").await;
 }

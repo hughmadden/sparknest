@@ -378,6 +378,16 @@ impl Push {
             nest_rpc::service::PUSH,
             Arc::new(PushService(Arc::downgrade(&p))),
         );
+        // Slots that cannot go by RDMA travel on TCP lanes, off the control
+        // connection (ADR-067).
+        if let Some(l) = vfs.lanes() {
+            let sink: Arc<dyn nest_fabric::tcp::MessageSink> =
+                Arc::new(PushService(Arc::downgrade(&p)));
+            l.set_message_sink(nest_rpc::service::PUSH, Arc::downgrade(&sink));
+            // The lanes hold a Weak; this keeps the sink alive with the
+            // process (one per host).
+            std::mem::forget(sink);
+        }
         let w = Arc::downgrade(&p);
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             rt.spawn(async move {
@@ -455,6 +465,29 @@ impl Push {
             }
         }
         .boxed()
+    }
+
+    /// Deliver a slot (bulk): on a TCP lane that takes messages, else
+    /// on the control connection. A lane send that fails before reaching
+    /// the peer falls back; one with an unknown outcome is safe to send
+    /// again (a duplicate fill is dropped by its grant's `seq`).
+    async fn send_bulk(self: &Arc<Self>, to: NodeId, m: PushMsg) -> NestResult<()> {
+        let here = self.me()?;
+        if to != here
+            && let Some(l) = self.vfs()?.lanes().filter(|l| l.takes_messages(to))
+        {
+            let body = nest_rpc::encode(&m).map_err(|e| NestError::Io(e.to_string()))?;
+            match l.message(to, nest_rpc::service::PUSH, body.into()).await {
+                Ok(()) => return Ok(()),
+                Err(nest_fabric::WriteError::Failed(e)) if !is_lane_failure(&e) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::debug!(error = ?e, %to, "push slot over a TCP lane failed; using the control connection")
+                }
+            }
+        }
+        self.send(to, m).await
     }
 
     /// A message from another host, or this one.
@@ -2003,7 +2036,7 @@ impl Stream {
             }
             push.rpc_slots.fetch_add(1, Ordering::Relaxed);
             c.rpc.fetch_add(1, Ordering::Relaxed);
-            push.send(
+            push.send_bulk(
                 to,
                 PushMsg::Slot {
                     group,
@@ -2067,6 +2100,20 @@ impl nest_rpc::Handler for PushService {
     }
 }
 
+impl nest_fabric::tcp::MessageSink for PushService {
+    fn message(&self, peer: NodeId, data: Vec<u8>) -> BoxFuture<'static, NestResult<()>> {
+        let p = self.0.clone();
+        async move {
+            let m: PushMsg = nest_rpc::decode(&data).map_err(|e| invalid(e.to_string()))?;
+            let p = p
+                .upgrade()
+                .ok_or_else(|| NestError::Unavailable("shutting down".into()))?;
+            p.on_msg(peer, m).await
+        }
+        .boxed()
+    }
+}
+
 /// Listen for engines on `path` (`@name`: abstract) until the process
 /// ends. Only this process's uid and root may connect (ADR-063 §8).
 pub fn listen(push: Arc<Push>, path: &str) -> std::io::Result<()> {
@@ -2097,6 +2144,12 @@ pub fn listen(push: Arc<Push>, path: &str) -> std::io::Result<()> {
             }
         })?;
     Ok(())
+}
+
+/// A lane error that says nothing about the message itself (the lane or
+/// its peer went away), rather than the receiver's answer.
+fn is_lane_failure(e: &NestError) -> bool {
+    matches!(e, NestError::Io(m) if m.contains("outcome unknown"))
 }
 
 #[cfg(test)]

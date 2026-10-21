@@ -1249,6 +1249,71 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 
+  /v1/hf/share:
+    post:
+      tags: [hf]
+      summary: Move repos' own blobs into the hub's shared blob store
+      description: >-
+        Repos written by huggingface_hub before 1.32 keep their blobs in their
+        own `blobs/`. This moves each Xet file into `hub/blobs/<xx>/<xet_hash>`
+        and leaves a relative symlink, with hf's own code (its lock and `.refs`
+        manifest), through this node's mount: renames only, no data moves.
+        Files kept in git stay, as hf keeps them.
+      operationId: hfShare
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repos:
+                  type: array
+                  description: "`models--org--name` or `org/name`; empty: every repo with its own blobs."
+                  items:
+                    type: string
+                dry_run:
+                  type: boolean
+                  default: false
+                  description: Report what would change, per repo, synchronously.
+                verify:
+                  type: boolean
+                  default: false
+                  description: Check each blob's sha256 first (reads every file).
+                hf:
+                  type: [string, "null"]
+      responses:
+        "200":
+          description: The per-repo dry run, or the job.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [dry_run]
+                    properties:
+                      dry_run:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            repo: { type: string }
+                            moved: { type: integer }
+                            linked: { type: integer }
+                            kept: { type: integer }
+                            skipped:
+                              type: array
+                              items: { type: string }
+                            bytes: { type: integer }
+                            freed: { type: integer }
+                            warnings:
+                              type: array
+                              items: { type: string }
+                            error: { type: string }
+                  - $ref: "#/components/schemas/JobRef"
+        default:
+          $ref: "#/components/responses/Error"
+
   /v1/hf/refs:
     get:
       tags: [hf]
@@ -2538,6 +2603,9 @@ components:
           type: boolean
         cancelled:
           type: boolean
+        partial_bytes:
+          type: integer
+          description: Bytes already landed of files still being copied (not in done_bytes).
 
     ImportProgress:
       type: object

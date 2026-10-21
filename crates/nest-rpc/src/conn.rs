@@ -291,6 +291,8 @@ impl Conn {
                     if inner.filter.is_muted(peer) {
                         continue; // a switch eating everything
                     }
+                } else if inner.filter.is_lan_muted(peer) {
+                    continue;
                 }
                 // Anything at all from the peer restarts the silence clock:
                 // a slow handler on a live connection is never silence.
@@ -525,6 +527,19 @@ impl Rpc {
         let old = self.inner.addrs.write().insert(node, addr);
         if old.is_some_and(|o| o != addr) {
             self.inner.conns.lock().remove(&node);
+        }
+    }
+
+    /// Send control requests on the standby (LAN) while it answers, the
+    /// fabric the fallback (ADR-068); off, the standby is only the fallback.
+    pub fn prefer_standby(&self, on: bool) {
+        let was = self
+            .inner
+            .paths
+            .prefer_standby
+            .swap(on, std::sync::atomic::Ordering::Relaxed);
+        if was != on {
+            tracing::info!(on, "control traffic prefers the LAN");
         }
     }
 

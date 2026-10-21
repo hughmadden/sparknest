@@ -18,7 +18,14 @@
 //!                  | offset u64 | append u8 | len u32 | <len bytes>
 //!           answered with kind=2 and a 4-byte body (u32 bytes written), or
 //!           kind=3
+//! message   kind=5 | id u64 | service u8 | len u32 | <len bytes>
+//!           answered as a write (kind=2 with a 4-byte body), or kind=3
 //! ```
+//!
+//! Messages (lane protocol 3) carry a service's own requests in bulk off
+//! the control connection: push slots that cannot go by RDMA (ADR-067). The
+//! receiving host hands each to the `MessageSink` registered for its
+//! service. Like writes, they are never resent by the lane.
 //!
 //! Writes (ADR-057) are for fabric pairs whose RDMA link is down, and for
 //! off-grid hosts: the receiving host applies them as their owner through
@@ -55,14 +62,19 @@ const REQ: u8 = 1;
 const ANSWER: u8 = 2;
 const FAILURE: u8 = 3;
 const WRITE: u8 = 4;
+const MESSAGE: u8 = 5;
 /// Bytes after the kind byte.
 const REQ_LEN: usize = 8 + 8 + 8 + 8 + 4;
 const WRITE_LEN: usize = 8 * 6 + 1 + 4;
+const MESSAGE_LEN: usize = 8 + 1 + 4;
 /// A read of this file asks the lane's peer what it takes (`ANSWER` with a
 /// u32 lane protocol); no real file has this id.
 const PROBE_FILE: u64 = u64::MAX;
-/// Lane protocol: 1 reads only, 2 writes too.
+/// Lane protocol: 1 reads only, 2 writes too, 3 messages too.
 const LANE_WRITES: u32 = 2;
+const LANE_MESSAGES: u32 = 3;
+/// Longest message accepted (a push slot is at most 16 MiB).
+pub const MAX_MESSAGE: usize = 32 << 20;
 const ANSWER_LEN: usize = 8 + 4;
 /// Longest failure message accepted.
 const MAX_FAILURE: usize = 64 << 10;
@@ -113,6 +125,9 @@ pub struct LaneStats {
     /// Writes other hosts sent here, applied by the sink.
     pub written: AtomicU64,
     pub written_bytes: AtomicU64,
+    /// Messages this host sent (taken), and their bytes.
+    pub messages: AtomicU64,
+    pub message_bytes: AtomicU64,
 }
 
 /// Unit the in-flight budget counts in.
@@ -128,6 +143,7 @@ pub struct Lanes {
     dial: Mutex<HashMap<NodeId, (SocketAddr, usize)>>,
     source: Mutex<Option<Weak<dyn ReadSource>>>,
     sink: Mutex<Option<Weak<dyn WriteSink>>>,
+    messages: Mutex<HashMap<u8, Weak<dyn MessageSink>>>,
     budget: Arc<tokio::sync::Semaphore>,
     rt: tokio::runtime::Handle,
     stop: tokio::sync::watch::Sender<bool>,
@@ -149,6 +165,8 @@ struct Lane {
     outstanding: AtomicUsize,
     /// The peer applies writes sent on this lane (learned by the probe).
     writable: AtomicBool,
+    /// The peer takes messages on this lane (learned by the probe).
+    messages: AtomicBool,
     dead: AtomicBool,
     sock: std::net::TcpStream,
 }
@@ -174,6 +192,21 @@ enum Out {
         id: u64,
         r: Result<u32, NestError>,
     },
+    Message {
+        id: u64,
+        service: u8,
+        data: bytes::Bytes,
+    },
+}
+
+/// Takes the messages peers send a service over lanes.
+pub trait MessageSink: Send + Sync + 'static {
+    /// Handle a message from `peer`; Ok once taken.
+    fn message(
+        &self,
+        peer: NodeId,
+        data: Vec<u8>,
+    ) -> futures::future::BoxFuture<'static, Result<(), NestError>>;
 }
 
 impl Lanes {
@@ -202,6 +235,7 @@ impl Lanes {
             dial: Mutex::new(HashMap::new()),
             source: Mutex::new(None),
             sink: Mutex::new(None),
+            messages: Mutex::new(HashMap::new()),
             budget: Arc::new(tokio::sync::Semaphore::new(units)),
             rt: tokio::runtime::Handle::current(),
             stop,
@@ -247,6 +281,83 @@ impl Lanes {
         *self.sink.lock() = Some(sink);
     }
 
+    /// Hand messages peers send `service` over lanes to `sink`.
+    pub fn set_message_sink(&self, service: u8, sink: Weak<dyn MessageSink>) {
+        self.messages.lock().insert(service, sink);
+    }
+
+    /// Whether a live lane to `peer` takes messages.
+    pub fn takes_messages(&self, peer: NodeId) -> bool {
+        self.pick_by(peer, |l| l.messages.load(Ordering::SeqCst))
+            .is_some()
+    }
+
+    /// Send `data` to `service` on `peer` over a lane; Ok once the peer's
+    /// sink took it. `Unsent` errors mean nothing reached the peer (send it
+    /// another way); others are its answer or an unknown outcome.
+    pub async fn message(
+        &self,
+        peer: NodeId,
+        service: u8,
+        data: bytes::Bytes,
+    ) -> Result<(), WriteError> {
+        let lane = self
+            .pick_by(peer, |l| l.messages.load(Ordering::SeqCst))
+            .ok_or_else(|| {
+                WriteError::Unsent(NestError::Unavailable(format!(
+                    "no TCP lane to {peer} takes messages"
+                )))
+            })?;
+        if data.len() > MAX_MESSAGE {
+            return Err(WriteError::Unsent(NestError::Invalid(
+                "message larger than a lane takes".into(),
+            )));
+        }
+        let len = data.len();
+        let _budget = self
+            .budget
+            .acquire_many(len.div_ceil(BUDGET_UNIT).max(1) as u32)
+            .await
+            .map_err(|_| WriteError::Unsent(NestError::Unavailable("lanes stopped".into())))?;
+        let id = lane.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        lane.writes.lock().insert(id, tx);
+        if lane.dead.load(Ordering::SeqCst) {
+            lane.writes.lock().remove(&id);
+            return Err(WriteError::Unsent(NestError::Unavailable(format!(
+                "TCP lane to {peer} closed"
+            ))));
+        }
+        lane.outstanding.fetch_add(1, Ordering::Relaxed);
+        let r = match lane.out.send(Out::Message { id, service, data }) {
+            Err(_) => Err(WriteError::Unsent(NestError::Unavailable(format!(
+                "TCP lane to {peer} closed"
+            )))),
+            Ok(()) => match tokio::time::timeout(self.cfg.read_timeout, rx).await {
+                Ok(Ok(Ok(_))) => Ok(()),
+                Ok(Ok(Err(e))) => Err(WriteError::Failed(e)),
+                Ok(Err(_)) => Err(WriteError::Failed(NestError::Io(format!(
+                    "message over TCP lane to {peer}: lane lost; outcome unknown"
+                )))),
+                Err(_) => {
+                    lane.stalled("message");
+                    Err(WriteError::Failed(NestError::Io(format!(
+                        "message over TCP lane to {peer}: no answer; outcome unknown"
+                    ))))
+                }
+            },
+        };
+        lane.writes.lock().remove(&id);
+        lane.outstanding.fetch_sub(1, Ordering::Relaxed);
+        if r.is_ok() {
+            self.stats.messages.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .message_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+        }
+        r
+    }
+
     /// Keep `per_peer` lanes open to `peer` at `addr` (an off-grid host
     /// dials every host it knows; the others only accept).
     pub fn dial(&self, peer: NodeId, addr: SocketAddr) {
@@ -276,11 +387,16 @@ impl Lanes {
     }
 
     fn pick_writable(&self, peer: NodeId) -> Option<Arc<Lane>> {
+        self.pick_by(peer, |l| l.writable.load(Ordering::SeqCst))
+    }
+
+    /// The live lane to `peer` passing `ok` with the fewest requests waiting.
+    fn pick_by(&self, peer: NodeId, ok: impl Fn(&Lane) -> bool) -> Option<Arc<Lane>> {
         self.peers
             .lock()
             .get(&peer)?
             .iter()
-            .filter(|l| !l.dead.load(Ordering::SeqCst) && l.writable.load(Ordering::SeqCst))
+            .filter(|l| !l.dead.load(Ordering::SeqCst) && ok(l))
             .min_by_key(|l| l.outstanding.load(Ordering::Relaxed))
             .cloned()
     }
@@ -469,6 +585,7 @@ impl Lanes {
             next_id: AtomicU64::new(1),
             outstanding: AtomicUsize::new(0),
             writable: AtomicBool::new(false),
+            messages: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             sock: s.try_clone()?,
         });
@@ -508,9 +625,10 @@ impl Lanes {
             if sent.is_ok()
                 && let Ok(Ok(Ok(b))) = tokio::time::timeout(wait, rx).await
                 && b.len() == 4
-                && u32::from_le_bytes(b[..4].try_into().unwrap()) >= LANE_WRITES
             {
-                lane.writable.store(true, Ordering::SeqCst);
+                let v = u32::from_le_bytes(b[..4].try_into().unwrap());
+                lane.writable.store(v >= LANE_WRITES, Ordering::SeqCst);
+                lane.messages.store(v >= LANE_MESSAGES, Ordering::SeqCst);
             }
             lane.pending.lock().remove(&id);
         });
@@ -605,7 +723,7 @@ fn reader(lane: Arc<Lane>, lanes: Weak<Lanes>, mut s: std::net::TcpStream) {
                         // before the sink is attached fails, unapplied).
                         let _ = lane.out.send(Out::Written {
                             id,
-                            r: Ok(LANE_WRITES),
+                            r: Ok(LANE_MESSAGES),
                         });
                         continue;
                     }
@@ -669,6 +787,40 @@ fn reader(lane: Arc<Lane>, lanes: Weak<Lanes>, mut s: std::net::TcpStream) {
                                         .written_bytes
                                         .fetch_add(*n as u64, Ordering::Relaxed);
                                 }
+                                let _ = out.send(Out::Written { id, r });
+                            });
+                        }
+                    }
+                }
+                MESSAGE => {
+                    let mut b = [0u8; MESSAGE_LEN];
+                    s.read_exact(&mut b)?;
+                    let id = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                    let service = b[8];
+                    let len = u32::from_le_bytes(b[9..13].try_into().unwrap()) as usize;
+                    if len > MAX_MESSAGE {
+                        return Err(std::io::Error::other("oversized message"));
+                    }
+                    let mut data = vec![0u8; len];
+                    s.read_exact(&mut data)?;
+                    let Some(l) = lanes.upgrade() else {
+                        return Ok(());
+                    };
+                    let sink = l.messages.lock().get(&service).and_then(|w| w.upgrade());
+                    let out = lane.out.clone();
+                    match sink {
+                        None => {
+                            let _ = out.send(Out::Written {
+                                id,
+                                r: Err(NestError::Unavailable(format!(
+                                    "no service {service} here"
+                                ))),
+                            });
+                        }
+                        Some(sink) => {
+                            let fut = sink.message(lane.peer, data);
+                            l.rt.spawn(async move {
+                                let r = fut.await.map(|()| 0);
                                 let _ = out.send(Out::Written { id, r });
                             });
                         }
@@ -768,6 +920,15 @@ fn writer(
                     b[..1 + ANSWER_LEN].copy_from_slice(&answer_header(ANSWER, id, 4));
                     b[1 + ANSWER_LEN..].copy_from_slice(&n.to_le_bytes());
                     s.write_all(&b)?;
+                }
+                Out::Message { id, service, data } => {
+                    let mut b = [0u8; 1 + MESSAGE_LEN];
+                    b[0] = MESSAGE;
+                    b[1..9].copy_from_slice(&id.to_le_bytes());
+                    b[9] = service;
+                    b[10..14].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                    send_more(&s, &b)?;
+                    s.write_all(&data)?;
                 }
                 Out::Write { id, op, data } => {
                     let mut b = [0u8; 1 + WRITE_LEN];

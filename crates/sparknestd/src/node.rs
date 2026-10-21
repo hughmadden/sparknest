@@ -383,6 +383,19 @@ impl Node {
             nest_place::Placer::start(vfs.clone(), cfg.node.name.clone(), mountpoint.clone());
         let push = nest_data::push::Push::new(&vfs);
         placer.set_push(&push);
+        // Control traffic on the LAN, the fabric the fallback (ADR-068):
+        // the cluster setting, followed live.
+        {
+            let (v, rpc) = (Arc::downgrade(&vfs), rpc.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Some(v) = v.upgrade() else { return };
+                    rpc.prefer_standby(v.setting(nest_types::Setting::ControlOnLan) != 0);
+                    drop(v);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+        }
         let api = nest_api::Api {
             push: Some(push.clone()),
             vfs: vfs.clone(),

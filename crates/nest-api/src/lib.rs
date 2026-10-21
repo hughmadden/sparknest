@@ -192,6 +192,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/hf/detail", get(hf_detail))
         .route("/v1/hf/import", post(hf_import))
         .route("/v1/hf/remove", post(hf_remove))
+        .route("/v1/hf/share", post(hf_share))
         .route("/v1/hf/refs", get(hf_refs))
         .route("/v1/hf/search", get(hf_search))
         .route("/v1/hf/size", get(hf_size))
@@ -902,6 +903,67 @@ async fn hf_remove(State(api): State<Api>, Json(r): Json<HfRemoveReq>) -> R<serd
     }
     Ok(Json(
         json!({ "job": api.placer.hf_remove(hf, mount_hub, r.targets) }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct HfShareReq {
+    /// Repo directories (`models--org--name`) or `org/name`; empty: every
+    /// repo with its own blobs.
+    #[serde(default)]
+    repos: Vec<String>,
+    /// Report what would change, per repo, synchronously.
+    #[serde(default)]
+    dry_run: bool,
+    /// Check each blob's sha256 before moving it (reads every file).
+    #[serde(default)]
+    verify: bool,
+    hf: Option<String>,
+}
+
+/// Move repos' own blobs into the hub's shared store (the layout
+/// huggingface_hub ≥ 1.32 writes, ADR-010), with hf's own code, through
+/// this node's mount.
+async fn hf_share(State(api): State<Api>, Json(r): Json<HfShareReq>) -> R<serde_json::Value> {
+    let hub = mount_hub(&api)?;
+    let hf = r.hf.map(std::path::PathBuf::from);
+    let repos: Vec<String> = r
+        .repos
+        .iter()
+        .map(|t| {
+            if t.starts_with("models--") || t.starts_with("datasets--") {
+                t.clone()
+            } else {
+                let p = nest_place::hfimport::parse_repo_ref(t);
+                let kind = if p.dataset { "dataset" } else { "model" };
+                nest_place::hfimport::repo_dir(kind, &p.repo)
+            }
+        })
+        .collect();
+    if r.dry_run {
+        let repos = if repos.is_empty() {
+            let h = hub.clone();
+            tokio::task::spawn_blocking(move || nest_place::hfimport::unshared_repos(&h))
+                .await
+                .map_err(|e| NestError::Io(e.to_string()))??
+        } else {
+            repos
+        };
+        let mut out = Vec::new();
+        for repo in repos {
+            out.push(
+                match nest_place::hfimport::share(hf.as_deref(), &hub, &repo, true, false, |_| {})
+                    .await
+                {
+                    Ok(o) => serde_json::to_value(o).expect("plain JSON"),
+                    Err(e) => json!({ "repo": repo, "error": e.to_string() }),
+                },
+            );
+        }
+        return Ok(Json(json!({ "dry_run": out })));
+    }
+    Ok(Json(
+        json!({ "job": api.placer.hf_share(hf, hub, repos, r.verify) }),
     ))
 }
 

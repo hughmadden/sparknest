@@ -524,3 +524,74 @@ async fn a_lane_that_stops_answering_is_replaced() {
         );
     }
 }
+
+/// Messages (lane protocol 3) reach the sink registered for their service,
+/// both ways, carrying a push slot's size; the sink's error comes back, and
+/// a service nobody registered is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn lanes_carry_messages_to_their_service() {
+    use nest_fabric::WriteError;
+    use nest_fabric::tcp::MessageSink;
+    struct Inbox(parking_lot::Mutex<Vec<(NodeId, Vec<u8>)>>);
+    impl MessageSink for Inbox {
+        fn message(
+            &self,
+            peer: NodeId,
+            data: Vec<u8>,
+        ) -> BoxFuture<'static, Result<(), NestError>> {
+            let r = if data == b"refuse" {
+                Err(NestError::Invalid("refused".into()))
+            } else {
+                self.0.lock().push((peer, data));
+                Ok(())
+            };
+            async move { r }.boxed()
+        }
+    }
+    let (core, offgrid) = pair(LanesConfig {
+        per_peer: 2,
+        ..LanesConfig::default()
+    })
+    .await;
+    let (a, b) = (
+        Arc::new(Inbox(Default::default())),
+        Arc::new(Inbox(Default::default())),
+    );
+    core.set_message_sink(7, Arc::downgrade(&(a.clone() as Arc<dyn MessageSink>)));
+    offgrid.set_message_sink(7, Arc::downgrade(&(b.clone() as Arc<dyn MessageSink>)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !offgrid.takes_messages(NodeId(1)) || !core.takes_messages(NodeId(8)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no lane takes messages"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let slot = pattern(9, 16 << 20);
+    offgrid
+        .message(NodeId(1), 7, slot.clone().into())
+        .await
+        .unwrap();
+    core.message(NodeId(8), 7, b"back".to_vec().into())
+        .await
+        .unwrap();
+    assert_eq!(*a.0.lock(), vec![(NodeId(8), slot)]);
+    assert_eq!(*b.0.lock(), vec![(NodeId(1), b"back".to_vec())]);
+    assert!(matches!(
+        offgrid
+            .message(NodeId(1), 7, b"refuse".to_vec().into())
+            .await,
+        Err(WriteError::Failed(NestError::Invalid(_)))
+    ));
+    assert!(matches!(
+        offgrid.message(NodeId(1), 9, b"x".to_vec().into()).await,
+        Err(WriteError::Failed(NestError::Unavailable(_)))
+    ));
+    assert_eq!(
+        offgrid
+            .stats
+            .messages
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}

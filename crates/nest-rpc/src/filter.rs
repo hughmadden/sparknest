@@ -11,11 +11,13 @@ use std::sync::Arc;
 /// a standby connection (ADR-057) working: a cut primary is closed and
 /// refuses to be dialled (a pulled cable, a switch that is off), a muted
 /// one stays open but nothing arrives on it (a switch dropping everything).
+/// `mute_lan` does the latter to the standby connections.
 #[derive(Clone, Default)]
 pub struct Filter {
     blocked: Arc<RwLock<HashSet<NodeId>>>,
     cut: Arc<RwLock<HashSet<NodeId>>>,
     muted: Arc<RwLock<HashSet<NodeId>>>,
+    lan_muted: Arc<RwLock<HashSet<NodeId>>>,
 }
 
 impl Filter {
@@ -30,6 +32,7 @@ impl Filter {
         self.blocked.write().clear();
         self.cut.write().clear();
         self.muted.write().clear();
+        self.lan_muted.write().clear();
     }
     pub fn is_blocked(&self, peer: NodeId) -> bool {
         self.blocked.read().contains(&peer)
@@ -53,5 +56,15 @@ impl Filter {
     }
     pub fn is_muted(&self, peer: NodeId) -> bool {
         self.muted.read().contains(&peer)
+    }
+    /// Drop every frame `peer` sends on a standby (LAN) connection.
+    pub fn mute_lan(&self, peer: NodeId) {
+        self.lan_muted.write().insert(peer);
+    }
+    pub fn unmute_lan(&self, peer: NodeId) {
+        self.lan_muted.write().remove(&peer);
+    }
+    pub fn is_lan_muted(&self, peer: NodeId) -> bool {
+        self.lan_muted.read().contains(&peer)
     }
 }

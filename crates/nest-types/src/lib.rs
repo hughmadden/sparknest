@@ -279,15 +279,23 @@ pub enum Setting {
     /// The host the leader hands leadership to once that host has been up,
     /// caught up and reachable for a while (ADR-057). A node id; 0 is none.
     PreferredLeader,
+    /// Control traffic between fabric hosts on the LAN while it answers,
+    /// the fabric the fallback (ADR-068). 1 on, 0 off.
+    ControlOnLan,
 }
 
 impl Setting {
-    pub const ALL: &'static [Setting] = &[Setting::ReadRecoveryWait, Setting::PreferredLeader];
+    pub const ALL: &'static [Setting] = &[
+        Setting::ReadRecoveryWait,
+        Setting::PreferredLeader,
+        Setting::ControlOnLan,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Setting::ReadRecoveryWait => "read-recovery-wait",
             Setting::PreferredLeader => "preferred-leader",
+            Setting::ControlOnLan => "control-on-lan",
         }
     }
 
@@ -299,6 +307,7 @@ impl Setting {
         match self {
             Setting::ReadRecoveryWait => 5_000,
             Setting::PreferredLeader => 0,
+            Setting::ControlOnLan => 1,
         }
     }
 
@@ -306,6 +315,7 @@ impl Setting {
         match self {
             Setting::ReadRecoveryWait => "ms",
             Setting::PreferredLeader => "node",
+            Setting::ControlOnLan => "0/1",
         }
     }
 
@@ -317,6 +327,9 @@ impl Setting {
             Setting::PreferredLeader => {
                 "host the metadata leader moves to once it is settled (0: none)"
             }
+            Setting::ControlOnLan => {
+                "control traffic on the 10G LAN while it answers, the fabric the fallback (0: fabric first)"
+            }
         }
     }
 
@@ -325,6 +338,7 @@ impl Setting {
         match self {
             Setting::ReadRecoveryWait => (0, 120_000),
             Setting::PreferredLeader => (0, u32::MAX as u64),
+            Setting::ControlOnLan => (0, 1),
         }
     }
 
