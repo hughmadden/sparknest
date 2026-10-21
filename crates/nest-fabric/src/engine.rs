@@ -152,6 +152,9 @@ impl Default for FabricConfig {
     }
 }
 
+/// A refused dial's reason when both ends dialled at once (see `accept`).
+const SIMULTANEOUS: &str = "simultaneous dial";
+
 /// The protocol links speak: the lower of the two hosts'.
 /// 2: imm carries the whole slot id, the length is the completion's count.
 /// 3: remote writes pulled by the owner (`WriteReq`/`WriteDone`).
@@ -718,6 +721,8 @@ enum FabricResp {
 }
 
 pub struct Fabric {
+    /// This host.
+    me: NodeId,
     cfg: FabricConfig,
     rails: Vec<Rail>,
     pub(crate) devices: Vec<Arc<Device>>,
@@ -896,6 +901,7 @@ impl Fabric {
             "fabric read budget"
         );
         let fabric = Arc::new(Fabric {
+            me,
             cfg,
             rails,
             devices,
@@ -1150,6 +1156,15 @@ impl Fabric {
 
     /// Server side of link setup: pair offered rails with ours by subnet.
     fn accept(&self, peer: NodeId, req: FabricReq) -> FabricResp {
+        // Both ends dialling each other at once (an all-to-all start: push
+        // loads) would make two links per pair; each end keeps the one it
+        // installs last and retires the other's partner lanes, so the peer
+        // writes into QPs in the error state until its retries run out. The
+        // lower id's dial wins: while we are dialling a higher peer, its
+        // dial is refused, and it uses the link our dial gives it.
+        if self.me < peer && self.dialling(peer) {
+            return FabricResp::Refused(SIMULTANEOUS.into());
+        }
         let mine = self.cfg.protocol;
         // A dialler offers its own protocol. One newer than ours is
         // refused with "read protocol …" before anything is made, so it
@@ -1293,7 +1308,27 @@ impl Fabric {
             )));
         }
         self.attempts.fetch_add(1, Ordering::Relaxed);
-        match self.connect(peer).await {
+        let r = match self.connect(peer).await {
+            // The peer was dialling us at the same moment and its id is
+            // lower: its link reaches us through `accept`. Wait for it.
+            Err(NestError::Unavailable(why)) if why.contains(SIMULTANEOUS) => {
+                drop(_g);
+                let until = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(l) = self.live_link(peer) {
+                        break Ok(l);
+                    }
+                    if std::time::Instant::now() >= until {
+                        break Err(NestError::Unavailable(format!(
+                            "{peer} was dialling us, but its link did not arrive"
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            r => r,
+        };
+        match r {
             Ok(link) => {
                 // Keep the next wait: a link that dies soon after pairing
                 // (a dead switch: pairing rides the control connection)
@@ -1309,6 +1344,14 @@ impl Fabric {
                 Err(e)
             }
         }
+    }
+
+    /// Whether this host is setting up a link to `peer` right now.
+    fn dialling(&self, peer: NodeId) -> bool {
+        self.connecting
+            .lock()
+            .get(&peer)
+            .is_some_and(|g| g.try_lock().is_err())
     }
 
     fn live_link(&self, peer: NodeId) -> Option<Arc<Link>> {

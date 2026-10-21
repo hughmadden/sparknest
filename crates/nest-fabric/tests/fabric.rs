@@ -1120,3 +1120,62 @@ async fn push_writes_land_in_a_registered_shared_ring() {
         (2 * slots * slot_bytes) as f64 / dt.as_secs_f64() / 1e9
     );
 }
+
+/// Both ends dialling each other at the same moment (an all-to-all start,
+/// as push loads do) must leave one working link per pair: the lower id's
+/// dial wins. Two links per pair used to leave each end writing into the
+/// other's retired QPs until its retries ran out (status 12).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn simultaneous_dials_leave_one_working_link() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("warn")
+        .try_init();
+    let cfg = FabricConfig {
+        devices: vec![],
+        ..FabricConfig::default()
+    };
+    for round in 0..5u64 {
+        let base = 100 + round * 2;
+        let Some((rpc1, f1)) = node(base, cfg.clone()).await else {
+            return;
+        };
+        let (rpc2, f2) = node(base + 1, cfg.clone()).await.unwrap();
+        rpc2.set_peer(NodeId(base), rpc1.local_addr());
+        rpc1.set_peer(NodeId(base + 1), rpc2.local_addr());
+        let src: Arc<dyn ReadSource> = Arc::new(Pattern);
+        f1.set_source(Arc::downgrade(&src));
+        f2.set_source(Arc::downgrade(&src));
+        // Both read from each other at once: each dials the other.
+        let (a, b) = tokio::join!(
+            f1.read(NodeId(base + 1), FileId(7), Generation(3), 0, 4096),
+            f2.read(NodeId(base), FileId(7), Generation(3), 0, 4096),
+        );
+        assert!(
+            a.is_ok() && b.is_ok(),
+            "round {round}: {:?} {:?}",
+            a.err(),
+            b.err()
+        );
+        // Then traffic both ways for a while: a half-dead pair would fail
+        // within the NIC's retry time (seconds).
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(5) {
+            let (a, b) = tokio::join!(
+                f1.read(NodeId(base + 1), FileId(7), Generation(3), 1 << 20, 1 << 20),
+                f2.read(NodeId(base), FileId(7), Generation(3), 2 << 20, 1 << 20),
+            );
+            assert!(
+                a.is_ok() && b.is_ok(),
+                "round {round} at {:?}: {:?} {:?}",
+                t.elapsed(),
+                a.err(),
+                b.err()
+            );
+        }
+        assert!(!f1.link_failed(NodeId(base + 1)) && !f2.link_failed(NodeId(base)));
+        f1.shutdown();
+        f2.shutdown();
+        drop(src);
+    }
+}
