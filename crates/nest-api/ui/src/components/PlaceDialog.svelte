@@ -278,7 +278,8 @@
   .use i { position: absolute; inset: 0 auto 0 0; background: linear-gradient(90deg, var(--spark-2), var(--spark)); box-shadow: 0 0 8px rgba(56, 232, 255, 0.6); }
   .legend { margin-top: -6px; }
   .factor { display: flex; flex-direction: column; gap: 6px; }
-  .factor input { width: 100%; accent-color: var(--spark); }
+  .factor input[type="range"] { width: 100%; accent-color: var(--spark); }
+  .factor input[type="checkbox"] { accent-color: var(--spark); }
   .ends { gap: 0; }
   .factor .check { flex-wrap: wrap; }
   .check.off { opacity: 0.5; }
