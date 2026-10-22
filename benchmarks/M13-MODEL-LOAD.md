@@ -216,3 +216,21 @@ The last 5 s are rhea and moa alone at ~8 GB/s each: they hold more than
 twice the bytes of the other Sparks. Placed in proportion to each source's
 rate here, the same 475 GB would end in ~11 s; that is placement, not push. Two dips (at 4.0
 and 6.0 s) slowed every source but emu at once, to 1–4 GB/s for a bin or two.
+
+### An archive as a source of its own (2026-10-23, ADR-069)
+
+Trial cluster, `PUSH_TRIAL_ARCHIVE=/mnt/scratch/sparknest-trial-archive
+benchmarks/tools/push-trial.sh 8`: the six Sparks' 8 GiB shards plus one
+8 GiB shard held only in an archive store on raptor's `/mnt/scratch`
+(a Samsung 870 SATA SSD), six ranks (load 3206424498470912):
+
+| Source | Done | Rate |
+|---|---|---|
+| ostrich, dodo, emu, kiwi, rhea, moa | 1.7–3.3 s | 2.6–5.0 GB/s (~20 GB/s together) |
+| trial-archive (raptor, its own stream) | 16.8 s | 0.51 GB/s |
+
+Every rank received its 10.0 GB exactly. The archive streamed beside the
+Sparks from the start and never held them back: they finished at their
+own disks' pace while it held its share of the grants, then it ran on
+alone at the SATA disk's rate. The load's end is that disk: 8.6 GB at
+0.5 GB/s.

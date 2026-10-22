@@ -46,6 +46,23 @@ for h in "${sources[@]}"; do
     python3 -c 'import os,sys; os.setxattr(sys.argv[1], \"user.sparknest.sealed\", b\"1\")' ~/sparknest-test/mnt/$f"
   files+=("/$f")
 done
+# PUSH_TRIAL_ARCHIVE=DIR adds a shard held only in an archive store at DIR
+# on raptor (its own stream beside raptor's disk, ADR-069).
+if [ -n "${PUSH_TRIAL_ARCHIVE:-}" ]; then
+  f=push-bench/archived.bin
+  ssh raptor "mkdir -p ${PUSH_TRIAL_ARCHIVE}"
+  nest raptor store add trial-archive "${PUSH_TRIAL_ARCHIVE}" --gateways raptor || true
+  ssh raptor "if [ \$(stat -c %s ~/sparknest-test/mnt/$f 2>/dev/null || echo 0) -ne $((gib << 30)) ]; then \
+      rm -f ~/sparknest-test/mnt/$f; \
+      dd if=/dev/urandom of=/dev/shm/push-seed bs=1M count=64 status=none; \
+      for i in \$(seq $((gib * 16))); do cat /dev/shm/push-seed; done > ~/sparknest-test/mnt/$f; \
+      rm -f /dev/shm/push-seed; \
+    fi; \
+    python3 -c 'import os,sys; os.setxattr(sys.argv[1], \"user.sparknest.sealed\", b\"1\")' ~/sparknest-test/mnt/$f"
+  sleep 3
+  nest raptor offload /$f --store trial-archive --wait
+  files+=("/$f")
+fi
 sleep 3
 echo "== shards: ${files[*]}"
 nest raptor ls /push-bench
@@ -75,6 +92,14 @@ bench() {
   for p in "${pids[@]}"; do wait "$p" || true; done
   echo "== coordinator ($tag)"
   cat "$out"
+  # The hub's record of the load (per-source, per-rank bins), kept.
+  local group; group=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["group"])' "$out" 2>/dev/null || true)
+  if [ -n "$group" ]; then
+    mkdir -p ~/build/push-loads
+    ssh raptor "curl -s --unix-socket ~/sparknest-test/state/api.sock http://x/v1/push/loads/$group" \
+      > ~/build/push-loads/trial-$tag-$group.json
+    echo "== record: ~/build/push-loads/trial-$tag-$group.json"
+  fi
   echo "== ranks ($tag)"
   for h in "${ranks[@]}"; do grep -h '"rank"' "$out.$h" || cat "$out.$h"; done
 }
