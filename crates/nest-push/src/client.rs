@@ -392,12 +392,17 @@ impl Coordinator {
     }
 
     /// Check the plan; streaming starts once every rank has joined.
+    /// Progress before Planned is skipped: sparknestd 0.6.3 and earlier
+    /// could send some once sources were streaming.
     pub fn start(&self) -> io::Result<Forecast> {
         self.conn.request(&Request::Start, None)?;
-        match self.conn.event()? {
-            Some(Event::Planned(f)) => Ok(f),
-            Some(e) => Err(refused(e)),
-            None => Err(io::Error::other("sparknestd closed the push socket")),
+        loop {
+            match self.conn.event()? {
+                Some(Event::Planned(f)) => return Ok(f),
+                Some(Event::Progress { .. }) => {}
+                Some(e) => return Err(refused(e)),
+                None => return Err(io::Error::other("sparknestd closed the push socket")),
+            }
         }
     }
 
@@ -543,6 +548,29 @@ mod tests {
         t.join().unwrap().unwrap();
         assert!(msgs > 1);
         assert_eq!(got, want);
+    }
+
+    /// Group 1535845564284940: a source's first slots landed before
+    /// Planned reached the coordinator, and start() took Progress as a
+    /// refusal.
+    #[test]
+    fn start_skips_progress_before_planned() {
+        let (a, b) = Conn::pair().unwrap();
+        let g = Coordinator {
+            conn: b,
+            group: 1,
+            token: 2,
+        };
+        a.send_event(&Event::Progress { done: 1, total: 9 })
+            .unwrap();
+        a.send_event(&Event::Planned(Forecast::default())).unwrap();
+        assert_eq!(g.start().unwrap(), Forecast::default());
+        assert!(matches!(
+            a.next_request().unwrap(),
+            Some((Request::Start, None))
+        ));
+        a.send_event(&Event::Refused("plan: no".into())).unwrap();
+        assert_eq!(g.start().unwrap_err().to_string(), "plan: no");
     }
 
     #[test]

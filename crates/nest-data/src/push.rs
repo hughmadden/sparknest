@@ -828,7 +828,7 @@ impl Push {
 
     /// `Start`: check the plan, tell rank hosts what to expect, wait for
     /// every rank to join, then start the sources.
-    async fn start(self: &Arc<Self>, group: u64) -> NestResult<Forecast> {
+    async fn start(self: &Arc<Self>, group: u64) -> NestResult<()> {
         let me = self.me()?;
         let (plan, ranks, rank_hosts, notify) = {
             let mut st = self.state.lock();
@@ -950,6 +950,9 @@ impl Push {
             g.sources = g.streaming.clone();
             g.progress_at = tokio::time::Instant::now();
             g.t0 = tokio::time::Instant::now();
+            // Planned goes out before any source is told to stream: once
+            // one is, Progress (or Done, for an empty plan) can follow.
+            let _ = g.engine.send(Event::Planned(forecast));
         }
         {
             let names_s: Vec<String> = by_source.keys().map(|n| self.name_of(*n)).collect();
@@ -1002,7 +1005,7 @@ impl Push {
         {
             self.finish(group).await;
         }
-        Ok(forecast)
+        Ok(())
     }
 
     fn name_of(&self, n: NodeId) -> String {
@@ -1967,14 +1970,9 @@ impl Push {
                     Some(g) => {
                         let (me, tx2) = (self.clone(), tx.clone());
                         rt.spawn(async move {
-                            match me.start(g).await {
-                                Ok(f) => {
-                                    let _ = tx2.send(Event::Planned(f));
-                                }
-                                Err(e) => {
-                                    let _ = tx2.send(Event::Refused(e.to_string()));
-                                    me.fail(g, e.to_string(), Vec::new()).await;
-                                }
+                            if let Err(e) = me.start(g).await {
+                                let _ = tx2.send(Event::Refused(e.to_string()));
+                                me.fail(g, e.to_string(), Vec::new()).await;
                             }
                         });
                         None
