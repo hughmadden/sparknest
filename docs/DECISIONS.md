@@ -2146,6 +2146,23 @@ too: each source always holds a grant of every rank it owes. A second
 test reproduces it (a source opening with another rank's stretch) and
 fails without the floor.
 
+**Amendment (2026-10-22): sources pack into registered staging, and read
+ahead across files.** A source packed each slot into a fresh zeroed
+buffer and then copied it into a staging slot registered on the lane's
+device. Staging is now one anonymous mapping registered on every device,
+so a slot bound for another host is packed where the NIC sends it from:
+no allocation, no zeroing, no copy. A write that fails hands its bytes
+back for the RPC path. Slots for this host's own ranks stay plain
+buffers. Staging grows by one slot per rank (each rank's slot being
+packed). Read-ahead (`READ_AHEAD` reads of 16 MiB) used to restart per
+file, so the queue drained at every file's end and waited on the next
+open; it now runs over the source's reads of all its files in order, and
+opens each file in its first read. On EXLR8 (load 1535845564284937)
+rhea and moa pushed 8.0 GB/s from disks that read 13 GB/s, the slower
+Sparks 4.6 from 5.7: one stream's ceiling, not the disk. Packing alone
+(pack_bench, 20 GB of K4) went from 10 to 13.5–15 GB/s on a Spark and
+18 to 36 GB/s on raptor.
+
 ## ADR-064 — Placement readable through the mount (2026-10-21)
 
 **Context.** The engine's containers see the hub only through the mount;

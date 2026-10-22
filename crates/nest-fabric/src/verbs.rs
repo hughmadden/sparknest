@@ -80,12 +80,13 @@ pub enum Access {
 }
 
 /// Memory another process shares with us through an fd (a push ring,
-/// ADR-063), mapped read-write and shared. Usable without a fabric; with
-/// one, `Region::register_shared` registers it with a NIC.
+/// ADR-063), mapped read-write and shared; or anonymous memory several
+/// devices register (a push source's staging). Usable without a fabric;
+/// with one, `Region::register_shared` registers it with a NIC.
 pub struct SharedMap {
     ptr: *mut u8,
     len: usize,
-    _fd: std::os::fd::OwnedFd,
+    _fd: Option<std::os::fd::OwnedFd>,
 }
 
 // SAFETY: plain shared bytes; whoever hands out ranges (the push receiver,
@@ -133,7 +134,33 @@ impl SharedMap {
         Ok(SharedMap {
             ptr: ptr as *mut u8,
             len,
-            _fd: fd,
+            _fd: Some(fd),
+        })
+    }
+
+    /// `len` bytes of fresh, zeroed private memory.
+    pub fn anonymous(len: usize) -> io::Result<SharedMap> {
+        if len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty mapping"));
+        }
+        // SAFETY: a fresh anonymous mapping; nothing else refers to it.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(last_err("mmap"));
+        }
+        Ok(SharedMap {
+            ptr: ptr as *mut u8,
+            len,
+            _fd: None,
         })
     }
 

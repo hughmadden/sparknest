@@ -5,7 +5,7 @@
 //! rank host                                   source
 //!   register_push_ring(ring)  -> rkey per device, address
 //!   (credit: slot i, addr + i·slot_bytes, rkeys, token)  ->
-//!                                             copy the slot image into a
+//!                                             pack the slot image in a
 //!                                             registered staging slot
 //!                 <- RDMA WRITE_WITH_IMM(staging -> ring slot), imm = PUSH|token
 //!   PushSink::landed(token, len)              completion: staging slot free
@@ -18,9 +18,8 @@
 //! landed from the 31-bit token the rank host chose for that credit.
 
 use crate::engine::{Fabric, wr};
-use crate::pool::{Pool, Slot};
 use crate::verbs::{Access, Region, SharedMap};
-use nest_types::{NestError, NestResult, NodeId};
+use nest_types::{NestError, NodeId};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -75,21 +74,83 @@ impl PushRing {
     }
 }
 
-/// A source's registered staging slots, one pool per device.
-pub struct PushPool {
-    pools: Vec<(u32, Arc<Pool>)>,
+/// A source's registered staging: one mapping of `slots × slot_bytes`,
+/// registered on every device, so a slot is packed once and written
+/// through whichever device the lane uses.
+pub struct PushPool(Arc<Staging>);
+
+struct Staging {
+    /// Per device: its registration of `map`. Dropped before `map`.
+    regions: Vec<(u32, Region)>,
+    map: Arc<SharedMap>,
     slot_bytes: usize,
+    free: Mutex<Vec<u32>>,
+    returned: tokio::sync::Notify,
 }
 
 impl PushPool {
     pub fn slot_bytes(&self) -> usize {
-        self.slot_bytes
+        self.0.slot_bytes
+    }
+
+    /// A free slot, viewed as its first `len` bytes (at most `slot_bytes`;
+    /// the rank's slot size). Waits while every slot is in use.
+    pub async fn acquire(&self, len: usize) -> PushSlot {
+        assert!(len <= self.0.slot_bytes, "slot larger than the push pool's");
+        loop {
+            let notified = self.0.returned.notified();
+            if let Some(index) = self.0.free.lock().pop() {
+                return PushSlot {
+                    s: self.0.clone(),
+                    index,
+                    len,
+                };
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One staging slot, owned: the packer fills it, `push_write` hands it to
+/// the NIC, and it returns to its pool once the write completes.
+pub struct PushSlot {
+    s: Arc<Staging>,
+    index: u32,
+    len: usize,
+}
+
+impl PushSlot {
+    fn offset(&self) -> usize {
+        self.index as usize * self.s.slot_bytes
+    }
+}
+
+impl AsRef<[u8]> for PushSlot {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the slot is ours alone (the NIC reads it only while a
+        // write owns it in `in_flight`); len is within the slot.
+        unsafe { self.s.map.slice(self.offset(), self.len) }
+    }
+}
+
+impl AsMut<[u8]> for PushSlot {
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` excludes other views.
+        unsafe { self.s.map.slice_mut(self.offset(), self.len) }
+    }
+}
+
+impl Drop for PushSlot {
+    fn drop(&mut self) {
+        self.s.free.lock().push(self.index);
+        self.s.returned.notify_one();
     }
 }
 
 /// A push write in flight: its staging slot (held until the NIC is done
-/// with it), its length, and the writer waiting for the completion.
-type InFlight = (Slot, u32, oneshot::Sender<bool>);
+/// with it), its length, and the writer waiting for the completion (sent
+/// the slot back if the write failed).
+type InFlight = (PushSlot, u32, oneshot::Sender<Result<(), PushSlot>>);
 
 /// Push writes in flight, and where landed writes are reported.
 #[derive(Default)]
@@ -100,20 +161,28 @@ pub(crate) struct PushState {
 }
 
 impl Fabric {
-    /// Registered staging for a push source: `slots` of `slot_bytes` on
-    /// every device. Freed when dropped (after the group's writes finish).
+    /// Registered staging for a push source: `slots` of `slot_bytes`,
+    /// registered on every device. Freed when dropped (after the group's
+    /// writes finish).
     pub fn push_pool(&self, slots: u32, slot_bytes: usize) -> std::io::Result<PushPool> {
-        let pools = self
+        let map = Arc::new(SharedMap::anonymous(slots as usize * slot_bytes)?);
+        let regions = self
             .devices
             .iter()
             .map(|d| {
                 Ok((
                     d.id,
-                    Pool::with_access(&d.ctx, slots, slot_bytes, Access::Local, 0)?,
+                    Region::register_shared(&d.ctx, map.clone(), Access::Local)?,
                 ))
             })
             .collect::<std::io::Result<Vec<_>>>()?;
-        Ok(PushPool { pools, slot_bytes })
+        Ok(PushPool(Arc::new(Staging {
+            regions,
+            map,
+            slot_bytes,
+            free: Mutex::new((0..slots).rev().collect()),
+            returned: tokio::sync::Notify::new(),
+        })))
     }
 
     /// Register an engine's ring on every device so peers can write into
@@ -144,28 +213,27 @@ impl Fabric {
         *self.push.sink.lock() = Some(sink);
     }
 
-    /// Write `data` (at most the pool's slot size) into `target` on
-    /// `peer`, through a lane of the link to it. Returns once the NIC has
-    /// finished (the bytes are in the peer's ring and its host was told).
+    /// Write `slot` (its packed bytes) into `target` on `peer`, through a
+    /// lane of the link to it. Returns once the NIC has finished (the bytes
+    /// are in the peer's ring and its host was told). A write that failed
+    /// hands its bytes back, to send another way.
     pub async fn push_write(
         &self,
         peer: NodeId,
-        pool: &PushPool,
-        data: &[u8],
+        slot: PushSlot,
         target: &PushTarget,
-    ) -> NestResult<()> {
-        if data.len() > pool.slot_bytes {
-            return Err(NestError::Invalid(
-                "slot larger than the push pool's".into(),
-            ));
-        }
-        let link = self.link(peer).await?;
+    ) -> Result<(), (NestError, Vec<u8>)> {
+        let fail = |e: NestError, slot: &PushSlot| (e, slot.as_ref().to_vec());
+        let link = match self.link(peer).await {
+            Ok(l) => l,
+            Err(e) => return Err(fail(e, &slot)),
+        };
         let lane = link.lanes
             [link.next.fetch_add(1, Ordering::Relaxed) as usize % link.lanes.len()]
         .clone();
         // The rank host's device at the far end of this lane shares its
         // subnet with ours.
-        let rkey = target
+        let Some(rkey) = target
             .rkeys
             .iter()
             .find(|(addr, prefix, _)| {
@@ -176,28 +244,34 @@ impl Fabric {
                 })
             })
             .map(|(_, _, k)| *k)
-            .ok_or_else(|| {
-                NestError::Invalid("no ring registration in this lane's subnet".into())
-            })?;
-        let pool_of = pool
-            .pools
+        else {
+            let e = NestError::Invalid("no ring registration in this lane's subnet".into());
+            return Err(fail(e, &slot));
+        };
+        let Some(lkey) = slot
+            .s
+            .regions
             .iter()
             .find(|(d, _)| *d == lane.dev.id)
-            .map(|(_, p)| p.clone())
-            .ok_or_else(|| NestError::Unavailable("no push staging on that device".into()))?;
-        let mut slot = pool_of.acquire().await;
-        slot.as_mut_slice(data.len()).copy_from_slice(data);
+            .map(|(_, r)| r.lkey())
+        else {
+            let e = NestError::Unavailable("no push staging on that device".into());
+            return Err(fail(e, &slot));
+        };
         if lane.dead.load(Ordering::SeqCst) {
-            return Err(NestError::Unavailable("RDMA link failed".into()));
+            let e = NestError::Unavailable("RDMA link failed".into());
+            return Err(fail(e, &slot));
         }
         let n = self.push.next.fetch_add(1, Ordering::Relaxed);
         let id = wr(WR_PUSH, lane.id, n);
         let (tx, rx) = oneshot::channel();
-        let (ptr, lkey) = (slot.ptr(), slot.lkey());
+        let (ptr, len) = (slot.s.map.addr() as *mut u8, slot.len);
+        // SAFETY: the offset is within the mapping (a slot of it).
+        let ptr = unsafe { ptr.add(slot.offset()) };
         self.push
             .in_flight
             .lock()
-            .insert(id, (slot, data.len() as u32, tx));
+            .insert(id, (slot, len as u32, tx));
         // SAFETY: the staging slot stays in `in_flight` until this write's
         // completion (success or flush); the remote range is a ring slot
         // the rank host registered and granted to us for this write.
@@ -205,7 +279,7 @@ impl Fabric {
             lane.qp.post_write_imm(
                 id,
                 ptr,
-                data.len() as u32,
+                len as u32,
                 lkey,
                 target.addr,
                 rkey,
@@ -213,26 +287,39 @@ impl Fabric {
             )
         };
         if let Err(e) = posted {
-            drop(self.push.in_flight.lock().remove(&id));
+            let slot = self.push.in_flight.lock().remove(&id).map(|x| x.0);
             self.fail_lane(&lane);
-            return Err(NestError::Unavailable(e.to_string()));
+            let e = NestError::Unavailable(e.to_string());
+            return Err(match slot {
+                Some(s) => fail(e, &s),
+                None => (e, Vec::new()),
+            });
         }
         match tokio::time::timeout(PUSH_TIMEOUT, rx).await {
-            Ok(Ok(true)) => {
+            Ok(Ok(Ok(()))) => {
                 self.stats.push_writes.fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .push_bytes
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    .fetch_add(len as u64, Ordering::Relaxed);
                 Ok(())
             }
-            Ok(_) => Err(NestError::Unavailable("push write failed".into())),
+            Ok(Ok(Err(slot))) => Err(fail(
+                NestError::Unavailable("push write failed".into()),
+                &slot,
+            )),
+            Ok(Err(_)) => Err((
+                NestError::Unavailable("push write failed".into()),
+                Vec::new(),
+            )),
             Err(_) => {
                 // The NIC may still read the slot: never reuse it.
+                let mut back = Vec::new();
                 if let Some((slot, _, _)) = self.push.in_flight.lock().remove(&id) {
+                    back = slot.as_ref().to_vec();
                     std::mem::forget(slot);
                 }
                 self.fail_lane(&lane);
-                Err(NestError::Unavailable("push write timed out".into()))
+                Err((NestError::Unavailable("push write timed out".into()), back))
             }
         }
     }
@@ -240,8 +327,7 @@ impl Fabric {
     /// A push write's completion (on the completion thread): its bytes.
     pub(crate) fn push_written(&self, wr_id: u64, ok: bool) -> Option<u32> {
         let (slot, n, tx) = self.push.in_flight.lock().remove(&wr_id)?;
-        drop(slot);
-        let _ = tx.send(ok);
+        let _ = tx.send(if ok { Ok(()) } else { Err(slot) });
         ok.then_some(n)
     }
 

@@ -11,8 +11,10 @@
 //!
 //! MODE `0.6.2` replays the loop as 0.6.2 shipped it, for comparison: every
 //! read walks all of the file's entries, and the read buffer is copied out
-//! of the direct read's aligned buffer first. The default is the loop as
-//! it is now ([`FileEntries`], bytes packed where the read left them).
+//! of the direct read's aligned buffer first. MODE `0.6.3` packs each slot
+//! into a fresh zeroed buffer and copies it into RDMA staging, as 0.6.3
+//! does. The default is the loop as it is now ([`FileEntries`], bytes
+//! packed where the read left them, straight into reused staging slots).
 
 use nest_push::plan::{Entry, Extent, FileEntries, Pattern, Plan, RunWalk};
 use nest_push::slot::Packer;
@@ -44,20 +46,36 @@ struct Times {
 struct Packing {
     open: Vec<Option<Packer>>,
     staging: Vec<u8>,
+    /// Packing in place: staging slots, reused (they hold old bytes).
+    in_place: bool,
+    free: Vec<Vec<u8>>,
 }
 
 impl Packing {
     fn put(&mut self, t: &mut Times, r: usize, mut dst: u64, mut data: &[u8]) {
         while !data.is_empty() {
-            let pk = self.open[r].get_or_insert_with(|| Packer::new(vec![0u8; SLOT]));
-            let took = pk.push(dst, data);
+            if self.open[r].is_none() {
+                let buf = if self.in_place {
+                    self.free.pop().unwrap_or_else(|| vec![0xAAu8; SLOT])
+                } else {
+                    vec![0u8; SLOT]
+                };
+                self.open[r] = Some(Packer::new(buf));
+            }
+            let took = self.open[r].as_mut().unwrap().push(dst, data);
             if took == 0 {
                 let (bytes, _, _) = self.open[r].take().unwrap().finish();
-                // The copy into registered RDMA staging.
-                let t1 = Instant::now();
-                self.staging.copy_from_slice(&bytes);
-                std::hint::black_box(&self.staging);
-                t.staging += t1.elapsed();
+                if self.in_place {
+                    // The NIC sends it from here; back to the pool after.
+                    std::hint::black_box(&bytes);
+                    self.free.push(bytes);
+                } else {
+                    // The copy into registered RDMA staging.
+                    let t1 = Instant::now();
+                    self.staging.copy_from_slice(&bytes);
+                    std::hint::black_box(&self.staging);
+                    t.staging += t1.elapsed();
+                }
                 t.slots += 1;
                 continue;
             }
@@ -71,10 +89,11 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let path = a
         .get(1)
-        .expect("usage: pack_bench PLAN.json [GB] [SOURCES] [0.6.2]");
+        .expect("usage: pack_bench PLAN.json [GB] [SOURCES] [0.6.2|0.6.3]");
     let limit = a.get(2).map_or(20.0, |s| s.parse::<f64>().unwrap()) * 1e9;
     let sources: usize = a.get(3).map_or(6, |s| s.parse().unwrap());
-    let old = a.get(4).is_some_and(|s| s == "0.6.2");
+    let mode = a.get(4).map_or("current", |s| s.as_str());
+    let old = mode == "0.6.2";
     let c: Checked = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let Plan {
         files,
@@ -87,7 +106,7 @@ fn main() {
         patterns.len(),
         entries.len(),
         c.arenas.len(),
-        if old { "0.6.2" } else { "current" }
+        mode
     );
     let mut per_file: Vec<Vec<Entry>> = vec![Vec::new(); files.len()];
     for e in entries {
@@ -116,6 +135,8 @@ fn main() {
     let mut k = Packing {
         open: (0..c.arenas.len()).map(|_| None).collect(),
         staging: vec![0u8; SLOT],
+        in_place: mode == "current",
+        free: Vec::new(),
     };
     let mut t = Times::default();
     let start = Instant::now();

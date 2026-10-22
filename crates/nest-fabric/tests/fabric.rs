@@ -1078,12 +1078,14 @@ async fn push_writes_land_in_a_registered_shared_ring() {
     let t = Instant::now();
     for round in 0..2u32 {
         for i in 0..slots as u32 {
-            let data: Vec<u8> = (0..slot_bytes)
-                .map(|k| (k as u32 ^ i ^ round) as u8)
-                .collect();
+            let mut slot = pool.acquire(slot_bytes).await;
+            for (k, b) in slot.as_mut().iter_mut().enumerate() {
+                *b = (k as u32 ^ i ^ round) as u8;
+            }
             let target = ring.target(i as u64 * slot_bytes as u64, round << 8 | i);
-            f2.push_write(NodeId(1), &pool, &data, &target)
+            f2.push_write(NodeId(1), slot, &target)
                 .await
+                .map_err(|(e, _)| e)
                 .unwrap();
         }
     }

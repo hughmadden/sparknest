@@ -150,3 +150,20 @@ Production sources ran at 3.8–4.0 GB/s (K4, load 120235912134657), so
 packing at 5.5 GB/s was most of a source's time per byte; grant waits are
 the rest. EXLR8 (load 120235912134668, 2.0 GB/s per source) has ~100×
 fewer, longer runs and stalls on every source at once: not packing.
+
+### Packing into registered staging (2026-10-22)
+
+The same bench, `0.6.3` (each slot packed into a fresh zeroed 1 MiB
+buffer, then copied into staging) against packing into reused staging
+slots in place (`current`), 20 GB from source 0 of 6, two runs each:
+
+| Plan | Host | 0.6.3 | in place |
+|---|---|---|---|
+| GLM-5.3 K4 TP6 | Spark (ostrich) | 10.2, 9.6 GB/s | **13.5, 15.1 GB/s** |
+| | raptor | 18.1, 19.3 GB/s | 35.1, 36.8 GB/s |
+| Kimi K3 TP6 | Spark (ostrich) | 12.4, 11.3 GB/s | **17.2, 23.8 GB/s** |
+| | raptor | 16.8, 17.7 GB/s | 35.1, 44.5 GB/s |
+
+The staging copy was 0.29–0.50 s of each run; the rest is the zeroing
+and allocation of a fresh slot buffer, which in place packing skips (a
+reused slot's old bytes past the payload and table are never read).

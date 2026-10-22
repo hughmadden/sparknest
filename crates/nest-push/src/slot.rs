@@ -17,16 +17,19 @@ pub const FOOTER: usize = 16;
 
 /// Fills one slot: payload from the front, fragment table behind it.
 /// Runs that continue the previous fragment in the arena extend it.
-pub struct Packer {
-    buf: Vec<u8>,
+/// `B` is the slot's memory: a `Vec`, or a sender's registered staging
+/// slot, packed in place (bytes past the payload and table are never
+/// read, so it need not start zeroed).
+pub struct Packer<B = Vec<u8>> {
+    buf: B,
     payload: usize,
     frags: Vec<(u64, u32)>,
 }
 
-impl Packer {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> Packer<B> {
     /// A packer filling `buf` (the slot, `slot_bytes` long).
-    pub fn new(buf: Vec<u8>) -> Packer {
-        assert!(buf.len() > FOOTER + FRAG, "slot too small");
+    pub fn new(buf: B) -> Packer<B> {
+        assert!(buf.as_ref().len() > FOOTER + FRAG, "slot too small");
         Packer {
             buf,
             payload: 0,
@@ -42,6 +45,7 @@ impl Packer {
     /// Payload room with a table of `frags` entries.
     fn free(&self, frags: usize) -> usize {
         self.buf
+            .as_ref()
             .len()
             .saturating_sub(self.payload + frags * FRAG + FOOTER)
     }
@@ -66,7 +70,7 @@ impl Packer {
         if take == 0 {
             return 0;
         }
-        self.buf[self.payload..self.payload + take].copy_from_slice(&data[..take]);
+        self.buf.as_mut()[self.payload..self.payload + take].copy_from_slice(&data[..take]);
         self.payload += take;
         match self.frags.last_mut() {
             Some((_, n)) if extends => *n += take as u32,
@@ -82,19 +86,20 @@ impl Packer {
 
     /// Write the table and footer at the slot's end; the slot (whole: the
     /// footer sits at its end), its payload bytes and fragment count.
-    pub fn finish(mut self) -> (Vec<u8>, usize, usize) {
-        let len = self.buf.len();
+    pub fn finish(mut self) -> (B, usize, usize) {
+        let buf = self.buf.as_mut();
+        let len = buf.len();
         let table = len - FOOTER - self.frags.len() * FRAG;
         for (i, (o, n)) in self.frags.iter().enumerate() {
             let at = table + i * FRAG;
-            self.buf[at..at + 8].copy_from_slice(&o.to_le_bytes());
-            self.buf[at + 8..at + 12].copy_from_slice(&n.to_le_bytes());
-            self.buf[at + 12..at + 16].fill(0);
+            buf[at..at + 8].copy_from_slice(&o.to_le_bytes());
+            buf[at + 8..at + 12].copy_from_slice(&n.to_le_bytes());
+            buf[at + 12..at + 16].fill(0);
         }
         let f = len - FOOTER;
-        self.buf[f..f + 4].copy_from_slice(&MAGIC.to_le_bytes());
-        self.buf[f + 4..f + 8].copy_from_slice(&(self.frags.len() as u32).to_le_bytes());
-        self.buf[f + 8..f + 16].copy_from_slice(&(self.payload as u64).to_le_bytes());
+        buf[f..f + 4].copy_from_slice(&MAGIC.to_le_bytes());
+        buf[f + 4..f + 8].copy_from_slice(&(self.frags.len() as u32).to_le_bytes());
+        buf[f + 8..f + 16].copy_from_slice(&(self.payload as u64).to_le_bytes());
         let (p, n) = (self.payload, self.frags.len());
         (self.buf, p, n)
     }
@@ -229,6 +234,27 @@ mod tests {
         assert_eq!(p.push(room as u64, &[1]), 0);
         let (buf, _, _) = p.finish();
         assert!(parse(&buf, 1 << 30).is_ok());
+    }
+
+    /// A reused staging slot holds the last slot's bytes: only payload,
+    /// table and footer are read, so the image parses the same.
+    #[test]
+    fn packing_over_old_bytes_reads_the_same() {
+        let mut clean = Packer::new(vec![0u8; 256]);
+        let mut dirty = Packer::new(vec![0xAAu8; 256]);
+        for p in [&mut clean, &mut dirty] {
+            p.push(64, &[5; 20]);
+            p.push(4096, &[6; 7]);
+        }
+        let (a, _, _) = clean.finish();
+        let (b, _, _) = dirty.finish();
+        let (pa, pb) = (parse(&a, 1 << 20).unwrap(), parse(&b, 1 << 20).unwrap());
+        assert_eq!(pa, pb);
+        assert_eq!(
+            Fragments::new(&a, pa).collect::<Vec<_>>(),
+            Fragments::new(&b, pb).collect::<Vec<_>>()
+        );
+        assert_eq!(a[..27], b[..27]);
     }
 
     #[test]

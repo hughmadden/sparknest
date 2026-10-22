@@ -1822,13 +1822,15 @@ impl Push {
         let me = self.clone();
         tokio::spawn(async move {
             let src = me.me().unwrap_or(NodeId(0));
-            // Staging for RDMA writes, sized to the largest ring slot.
+            // Staging for RDMA writes, sized to the largest ring slot: one
+            // per send in flight, and one per rank being packed.
             let slot_max = ranks.iter().map(|(_, b)| *b as usize).max().unwrap_or(0);
+            let staged = in_flight(slot_max) + ranks.len();
             let pool = me
                 .vfs()
                 .ok()
                 .and_then(|v| v.fabric())
-                .and_then(|f| f.push_pool(in_flight(slot_max) as u32, slot_max).ok())
+                .and_then(|f| f.push_pool(staged as u32, slot_max).ok())
                 .map(Arc::new);
             let counters = Arc::new(Counters::new(ranks.len()));
             let mut s = Stream {
@@ -2113,7 +2115,8 @@ struct Stream {
     /// Per rank: its host and slot size.
     ranks: Vec<(NodeId, u32)>,
     notify: Arc<tokio::sync::Notify>,
-    open: Vec<Option<slot::Packer>>,
+    /// Per rank: the slot being packed.
+    open: Vec<Option<slot::Packer<SlotBuf>>>,
     /// Slots sent per rank (counted when handed to a send).
     sent: Vec<u64>,
     /// Sends in flight (bounded by `in_flight`).
@@ -2135,13 +2138,59 @@ fn in_flight(slot_bytes: usize) -> usize {
     (STAGING_BYTES / slot_bytes.max(1)).clamp(2, IN_FLIGHT)
 }
 
+/// A file's reads, in order: its entries' ranges merged across small
+/// gaps, cut into `READ_CHUNK`s.
+fn reads_of(index: &FileEntries) -> Vec<(u64, u64)> {
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in index.ranges() {
+        match merged.last_mut() {
+            Some(last) if a <= last.1.saturating_add(GAP) => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+        .iter()
+        .flat_map(|&(a, b)| {
+            (a..b)
+                .step_by(READ_CHUNK as usize)
+                .map(move |at| (at, (at + READ_CHUNK).min(b)))
+        })
+        .collect()
+}
+
+/// A slot's memory while it is packed: registered staging when it is
+/// bound for another host (packed in place, and the NIC sends it from
+/// there), else plain.
+enum SlotBuf {
+    Staged(nest_fabric::push::PushSlot),
+    Plain(Vec<u8>),
+}
+
+impl AsRef<[u8]> for SlotBuf {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            SlotBuf::Staged(s) => s.as_ref(),
+            SlotBuf::Plain(v) => v,
+        }
+    }
+}
+
+impl AsMut<[u8]> for SlotBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        match self {
+            SlotBuf::Staged(s) => s.as_mut(),
+            SlotBuf::Plain(v) => v,
+        }
+    }
+}
+
 impl Stream {
     /// Stream every file; the files that failed, by plan index.
     async fn run(&mut self, patterns: &[Pattern], files: Vec<SourceFile>) -> Vec<(u32, String)> {
         let n = self.ranks.len();
         self.open = (0..n).map(|_| None).collect();
         self.sent = vec![0; n];
-        let mut failed = Vec::new();
+        let mut failed: Vec<(u32, String)> = Vec::new();
         let vfs = match self.push.vfs() {
             Ok(v) => v,
             Err(e) => return files.iter().map(|f| (f.index, e.to_string())).collect(),
@@ -2150,9 +2199,60 @@ impl Stream {
         // entries over a few patterns).
         let extents: Vec<Option<nest_push::plan::Extent>> =
             patterns.iter().map(|p| p.check().ok()).collect();
-        for f in files {
-            if let Err(e) = self.file(&vfs, patterns, &extents, &f).await {
-                failed.push((f.index, e));
+        // Each file's entries by offset: each read visits only those that
+        // read it.
+        let index: Vec<FileEntries> = files
+            .iter()
+            .map(|f| FileEntries::new(&f.entries, &extents))
+            .collect();
+        // Every read of every file, in order, with `READ_AHEAD` in flight
+        // while earlier ones are packed, across file boundaries: the disk
+        // never waits for the packing, nor for the next file's open.
+        let reads: Vec<(usize, u64, u64)> = index
+            .iter()
+            .enumerate()
+            .flat_map(|(i, x)| reads_of(x).into_iter().map(move |(a, b)| (i, a, b)))
+            .collect();
+        // Each file is opened by its first read, and closed after its last.
+        type Opened = Arc<std::sync::OnceLock<Result<crate::vfs::PushObject, String>>>;
+        let mut objs: Vec<Opened> = files.iter().map(|_| Opened::default()).collect();
+        let mut ahead: VecDeque<tokio::task::JoinHandle<Result<PushRead, String>>> =
+            VecDeque::new();
+        let mut next = 0;
+        for (k, &(i, at, end)) in reads.iter().enumerate() {
+            while next < reads.len() && ahead.len() < READ_AHEAD {
+                let (fi, a, b) = reads[next];
+                let (v, obj, f) = (vfs.clone(), objs[fi].clone(), &files[fi]);
+                let (file, generation) = (f.file, f.generation);
+                ahead.push_back(tokio::task::spawn_blocking(move || {
+                    let o = obj
+                        .get_or_init(|| v.push_open(file, generation).map_err(|e| e.to_string()))
+                        .as_ref()
+                        .map_err(|e| e.clone())?;
+                    o.read(a, (b - a) as usize)
+                        .map_err(|e| format!("reading: {e}"))
+                }));
+                next += 1;
+            }
+            let read = ahead
+                .pop_front()
+                .expect("a read in flight")
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+            if reads.get(k + 1).is_none_or(|r| r.0 != i) {
+                objs[i] = Opened::default();
+            }
+            // The rest of a file that failed is skipped.
+            if failed.last().is_some_and(|f| f.0 == files[i].index) {
+                continue;
+            }
+            let packed = match read {
+                Ok(buf) => self.pack(patterns, &index[i], at, end, &buf).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = packed {
+                failed.push((files[i].index, e));
                 if self.cancelled() {
                     return failed;
                 }
@@ -2177,66 +2277,21 @@ impl Stream {
         st.sources.get(&self.group).is_none_or(|s| s.cancelled)
     }
 
-    async fn file(
+    /// Pack one read's bytes (`buf`, file range `[at, end)`) into the
+    /// slots of the ranks whose entries read it.
+    async fn pack(
         &mut self,
-        vfs: &Arc<Vfs>,
         patterns: &[Pattern],
-        extents: &[Option<nest_push::plan::Extent>],
-        f: &SourceFile,
+        index: &FileEntries,
+        at: u64,
+        end: u64,
+        buf: &[u8],
     ) -> Result<(), String> {
-        let obj = {
-            let (v, file, generation) = (vfs.clone(), f.file, f.generation);
-            Arc::new(
-                tokio::task::spawn_blocking(move || v.push_open(file, generation))
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .map_err(|e| e.to_string())?,
-            )
-        };
-        // The file's entries by offset: each read visits only those that
-        // read it.
-        let index = FileEntries::new(&f.entries, extents);
-        // The file's ranges, merged across small gaps: one pass in order.
-        let mut merged: Vec<(u64, u64)> = Vec::new();
-        for (a, b) in index.ranges() {
-            match merged.last_mut() {
-                Some(last) if a <= last.1.saturating_add(GAP) => last.1 = last.1.max(b),
-                _ => merged.push((a, b)),
-            }
-        }
-        // Every read of the file, in order, with `READ_AHEAD` in flight while
-        // earlier ones are packed: the disk never waits for the packing.
-        let reads: Vec<(u64, u64)> = merged
-            .iter()
-            .flat_map(|&(a, b)| {
-                (a..b)
-                    .step_by(READ_CHUNK as usize)
-                    .map(move |at| (at, (at + READ_CHUNK).min(b)))
-            })
-            .collect();
-        let mut ahead: VecDeque<tokio::task::JoinHandle<std::io::Result<PushRead>>> =
-            VecDeque::new();
-        let mut next = 0;
-        for &(at, end) in &reads {
-            while next < reads.len() && ahead.len() < READ_AHEAD {
-                let (o, (a, b)) = (obj.clone(), reads[next]);
-                ahead.push_back(tokio::task::spawn_blocking(move || {
-                    o.read(a, (b - a) as usize)
-                }));
-                next += 1;
-            }
-            let buf = ahead
-                .pop_front()
-                .expect("a read in flight")
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| format!("reading: {e}"))?;
-            for e in index.overlapping(at, end) {
-                let p = &patterns[e.pattern as usize];
-                for (s, d, n) in RunWalk::new(p, e, at, end) {
-                    let off = (s - at) as usize;
-                    self.put(e.rank, d, &buf[off..off + n as usize]).await?;
-                }
+        for e in index.overlapping(at, end) {
+            let p = &patterns[e.pattern as usize];
+            for (s, d, n) in RunWalk::new(p, e, at, end) {
+                let off = (s - at) as usize;
+                self.put(e.rank, d, &buf[off..off + n as usize]).await?;
             }
         }
         Ok(())
@@ -2247,8 +2302,17 @@ impl Stream {
     async fn put(&mut self, r: u32, mut dst: u64, mut data: &[u8]) -> Result<(), String> {
         let ri = r as usize;
         while !data.is_empty() {
-            let len = self.ranks[ri].1 as usize;
-            let s = self.open[ri].get_or_insert_with(|| slot::Packer::new(vec![0u8; len]));
+            if self.open[ri].is_none() {
+                let (host, len) = (self.ranks[ri].0, self.ranks[ri].1 as usize);
+                let buf = match &self.pool {
+                    Some(p) if host != self.me && len <= p.slot_bytes() => {
+                        SlotBuf::Staged(p.acquire(len).await)
+                    }
+                    _ => SlotBuf::Plain(vec![0u8; len]),
+                };
+                self.open[ri] = Some(slot::Packer::new(buf));
+            }
+            let s = self.open[ri].as_mut().expect("opened above");
             let took = s.push(dst, data);
             if took == 0 {
                 self.flush(r).await?;
@@ -2267,7 +2331,7 @@ impl Stream {
         let Some(s) = self.open[ri].take() else {
             return Ok(());
         };
-        let (bytes, _, _) = s.finish();
+        let (buf, payload, _) = s.finish();
         let grant = self
             .push
             .take_credit(self.group, r, &self.notify)
@@ -2286,38 +2350,44 @@ impl Stream {
             }
         }
         let (push, group, me, to) = (self.push.clone(), self.group, self.me, self.ranks[ri].0);
-        let pool = self.pool.clone();
         let c = self.counters.clone();
-        // Payload bytes of this slot (its footer says), for the record.
-        let payload = slot::parse(&bytes, u64::MAX).map_or(0, |p| p.payload as u64);
-        c.bytes[ri].fetch_add(payload, Ordering::Relaxed);
+        c.bytes[ri].fetch_add(payload as u64, Ordering::Relaxed);
         self.sends.spawn(async move {
-            if let (Some(t), Some(pool)) = (&grant.target, &pool)
-                && to != me
-                && bytes.len() <= pool.slot_bytes()
-                && let Some(f) = push.vfs().ok().and_then(|v| v.fabric())
-            {
-                let lose = |r: NestResult<()>| match r {
-                    Ok(())
-                        if push
-                            .lose_acks
-                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-                            .is_ok() =>
-                    {
-                        Err(NestError::Unavailable("ack lost (test)".into()))
+            let bytes = match buf {
+                SlotBuf::Plain(v) => v,
+                SlotBuf::Staged(slot) => {
+                    match (&grant.target, push.vfs().ok().and_then(|v| v.fabric())) {
+                        (Some(t), Some(f)) => {
+                            // Tests: a write that lands but is taken as
+                            // lost, and so is sent again by RPC.
+                            let lost = push
+                                .lose_acks
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                    n.checked_sub(1)
+                                })
+                                .is_ok();
+                            let copy = lost.then(|| slot.as_ref().to_vec());
+                            match f.push_write(to, slot, t).await {
+                                Ok(()) if !lost => {
+                                    push.rdma_slots.fetch_add(1, Ordering::Relaxed);
+                                    c.rdma.fetch_add(1, Ordering::Relaxed);
+                                    return Ok(());
+                                }
+                                Ok(()) => copy.expect("copied above"),
+                                // Never landed: the slot is still ours to fill.
+                                Err((e, bytes)) => {
+                                    tracing::debug!(error = %e, "push write over RDMA failed; using RPC");
+                                    if bytes.is_empty() {
+                                        return Err(format!("sending a slot: {e}"));
+                                    }
+                                    bytes
+                                }
+                            }
+                        }
+                        _ => slot.as_ref().to_vec(),
                     }
-                    r => r,
-                };
-                match lose(f.push_write(to, pool, &bytes, t).await) {
-                    Ok(()) => {
-                        push.rdma_slots.fetch_add(1, Ordering::Relaxed);
-                        c.rdma.fetch_add(1, Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    // Never landed: the slot is still ours to fill.
-                    Err(e) => tracing::debug!(error = %e, "push write over RDMA failed; using RPC"),
                 }
-            }
+            };
             if to == me {
                 // This host's own rank: handed over in memory.
                 c.local.fetch_add(1, Ordering::Relaxed);
