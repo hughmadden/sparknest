@@ -167,3 +167,26 @@ slots in place (`current`), 20 GB from source 0 of 6, two runs each:
 The staging copy was 0.29–0.50 s of each run; the rest is the zeroing
 and allocation of a fresh slot buffer, which in place packing skips (a
 reused slot's old bytes past the payload and table are never read).
+
+### One source alone (2026-10-22)
+
+`nest push bench` on production 0.6.4, rhea the only holder, ranks
+ostrich, dodo, emu, kiwi, GLM-5.3-Flash K3.25 shards 1–8 (68.7 GB),
+RoCE counters sampled every 250 ms on every fabric host
+(loads 4132356212719628 and …629):
+
+| Run | Rate | Steady | ECN marks | Seq errors | Pauses |
+|---|---|---|---|---|---|
+| after dropping rhea's cache | 8.0 GB/s | ~9 GB/s | 56 | 0 | 0 |
+| straight after | 4.35 GB/s | 3.3 GB/s for 11 s, then ~9 | 0 | 0 | 0 |
+
+Every ring kept 60–64 of its 64 grants free, so the ranks never held the
+source back. Sources read with `O_DIRECT`, so the second run was not warm:
+its 11 s at 3.3 GB/s was rhea's disk (likely the SSD settling after
+137 GB had just been written to it), not the fabric.
+
+Alone, rhea pushes ~9 GB/s with a clean fabric; in a full EXLR8 load it
+pushes 7.5–7.8 GB/s while each Spark records 15–27 M ECN marks and
+13–24 K sequence errors. Incast costs a source ~15%; the end of a load
+is set by the slower Spark disks (4.2–4.4 GB/s), which only placement
+(fewer bytes on them) can change.
