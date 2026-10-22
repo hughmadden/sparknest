@@ -676,7 +676,13 @@ impl Push {
                     Ok(())
                 }
                 PushMsg::End { group, reason } => {
-                    me.end_here(group, &reason);
+                    // To the hub, a rank's end fails the group: every host
+                    // in it hears, so sources stop and other ranks are told.
+                    if me.state.lock().hub.contains_key(&group) {
+                        me.fail(group, reason, Vec::new()).await;
+                    } else {
+                        me.end_here(group, &reason);
+                    }
                     Ok(())
                 }
             }

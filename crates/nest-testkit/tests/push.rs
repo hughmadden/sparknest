@@ -492,6 +492,103 @@ async fn a_rank_that_leaves_fails_the_group() {
     );
 }
 
+/// A rank leaving fails the group on every host: a rank on another host
+/// hears at once, not after its own timeout (group 4132356212719644: the
+/// hub's own rank left, the hub forgot the group without telling the
+/// other hosts, and their ranks and sources ran on for minutes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_rank_that_leaves_ends_the_group_on_every_host() {
+    let c = ready(3).await;
+    let len = 1usize << 20;
+    sealed(&c, 3, "w.bin", vec![5u8; 2 * len]).await;
+    let (hub, s1, s2) = (c.push_socket(1), c.push_socket(1), c.push_socket(2));
+    let r = tokio::task::spawn_blocking(move || {
+        let g = Coordinator::create(
+            &hub,
+            (0..2)
+                .map(|r| RankSpec {
+                    rank: r,
+                    host: format!("n{}", r + 1),
+                    arena_bytes: len as u64,
+                })
+                .collect(),
+            vec!["/w.bin".into()],
+            Some(Duration::from_secs(20)),
+        )
+        .unwrap();
+        g.patterns(vec![Pattern {
+            run: len as u32,
+            dims: vec![],
+        }])
+        .unwrap();
+        g.entries(
+            (0..2)
+                .map(|r| Entry {
+                    file: 0,
+                    pattern: 0,
+                    // Rank 0's bytes first: the source streams in file
+                    // order, so rank 0 gets a slot before rank 1's ring
+                    // (never released) blocks it.
+                    src_base: r as u64 * len as u64,
+                    dst_base: 0,
+                    rank: r,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let (group, token) = (g.group, g.token);
+        let (slots, slot_bytes) = (2u32, 64u32 << 10);
+        let join = move |sock: String, rank: u32| {
+            std::thread::spawn(move || {
+                let ring = memfd(slots as usize * slot_bytes as usize);
+                let k = loop {
+                    if let Ok(k) = Rank::join(
+                        &sock,
+                        JoinArgs {
+                            group,
+                            token,
+                            rank,
+                            ring_fd: ring.as_raw_fd(),
+                            slots,
+                            slot_bytes,
+                        },
+                        Some(Duration::from_secs(10)),
+                    ) {
+                        break k;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                (k, ring)
+            })
+        };
+        let (j0, j1) = (join(s1, 0), join(s2, 1));
+        g.start().unwrap();
+        let (leave, _ring0) = j0.join().unwrap();
+        let (stay, _ring1) = j1.join().unwrap();
+        // Rank 0 (on the hub's host) takes one slot and leaves; rank 1 (on
+        // n2) never releases, and the coordinator stays.
+        assert!(matches!(leave.next().unwrap(), Some(Event::Filled { .. })));
+        drop(leave);
+        let t = std::time::Instant::now();
+        let ev = loop {
+            match stay.next() {
+                Ok(Some(Event::Filled { .. })) => continue,
+                Ok(other) => break Ok(other),
+                Err(e) => break Err(e.to_string()),
+            }
+        };
+        drop(g);
+        (ev, t.elapsed())
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(&r.0, Ok(Some(Event::Failed { reason, .. })) if reason.contains("rank 0 closed")),
+        "{r:?}"
+    );
+    assert!(r.1 < Duration::from_secs(5), "{r:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_coordinator_that_leaves_cancels_the_ranks() {
     let c = ready(2).await;
