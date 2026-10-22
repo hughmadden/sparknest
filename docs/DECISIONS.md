@@ -2352,3 +2352,45 @@ fabric is preferred, the fabric when the LAN is.
 (≈0.1 ms more), irrelevant at Raft's 150 ms heartbeat. A fabric outage no
 longer moves control traffic at all. Traffic classes on the fabric switch
 (control above inference above bulk) remain worth doing for the data.
+
+## ADR-069 — Push: an archive is a source of its own; grants go to the source holding fewest (2026-10-23)
+
+**Context.** ADR-063 item 4 lets a push load read a file from an archive
+when no host holds it, but the hub resolved holders from hosts only: a
+group whose plan named an archive-only file failed at Start with "no
+live copy" (a GLM-5.3-Flash shard in October), and the engine had to
+load it through the mount. Two more gaps sat behind that one:
+- **One stream per host, not per store.** A source was a host; an
+  archive's gateway (raptor, for `/mnt/scratch` and the NAS share) would
+  have read archive files in the same single pass as its NVMe files,
+  so the slow disk would hold up the fast one.
+- **Round robin grants.** A rank host granted its incast budget round
+  robin over the sources owing a rank. A source that fills its grants
+  slowly (an archive disk, an off-grid host over TCP) keeps getting its
+  turn while holding the ones it has, so within a second or two it holds
+  nearly the whole budget and every fast source waits on its floor of
+  one grant: one slow source slows the load to its pace.
+
+**Decision.**
+- **A source is a store.** Each stream reads one store: a host's own,
+  or an archive, read by one of its gateways (the hub if it is one, else
+  the first). A gateway runs its archive's stream beside its own, as
+  another disk of the same host, each with its own read-ahead, slots and
+  grants. Messages name the store (`Src {store, host}`): `Stream` says
+  which store to read, `Credit` which stream it is for. The record and
+  forecast list an archive by its name.
+- **Nearest kind first.** A file is read from fabric hosts when any hold
+  it, else from archives, else from off-grid hosts (over TCP lanes, as
+  before); within a kind, the ADR-066 rule (soonest done at disk rate)
+  picks. An archive has no measured rate and counts at the median.
+- **Budget grants go to the owing source holding fewest** of the rank's
+  grants (ties rotate). A slow source then holds an even share of the
+  budget at most and streams at its own pace beside the rest; the floor
+  still gives every source one grant.
+- **Wire format.** `PushMsg` changed in place, which ADR-063's
+  amendment allows: push is not run across versions.
+
+**Alternatives.** Reading archive files after the gateway's own, in one
+stream: the gateway's fast disk would wait on the slow one. A per-source
+cap on grants: a fixed number is wrong for one source and for eight;
+fewest-held adapts to however many there are.

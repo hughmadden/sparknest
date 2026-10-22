@@ -24,7 +24,7 @@ use nest_push::client::Conn;
 use nest_push::plan::{Entry, FileEntries, Pattern, Plan, RunWalk};
 use nest_push::proto::{Event, Forecast, Missing, RankSpec, Request, StreamForecast};
 use nest_push::slot;
-use nest_types::{FileId, Generation, NestError, NestResult, NodeId};
+use nest_types::{FileId, Generation, NestError, NestResult, NodeId, StoreId};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -72,21 +72,24 @@ pub(crate) enum PushMsg {
     Sources {
         group: u64,
         rank: u32,
-        sources: Vec<NodeId>,
+        sources: Vec<Src>,
     },
-    /// Hub → source: stream these files.
+    /// Hub → source host: stream these files from store `source.store`.
     Stream {
         group: u64,
         hub: NodeId,
+        source: Src,
         patterns: Vec<Pattern>,
         files: Vec<SourceFile>,
         /// Per rank: its host and slot size.
         ranks: Vec<(NodeId, u32)>,
     },
-    /// Rank host → source: these ring slots of `rank` may be filled, each
-    /// by RDMA into its target when it has one, else by `Slot`.
+    /// Rank host → source host: these ring slots of `rank` may be filled
+    /// by the stream reading `store`, each by RDMA into its target when it
+    /// has one, else by `Slot`.
     Credit {
         group: u64,
+        store: StoreId,
         rank: u32,
         grants: Vec<Grant>,
     },
@@ -95,7 +98,7 @@ pub(crate) enum PushMsg {
     Slot {
         group: u64,
         rank: u32,
-        source: NodeId,
+        source: Src,
         slot: u32,
         /// The grant this fills (`Grant::seq`).
         seq: u64,
@@ -106,7 +109,7 @@ pub(crate) enum PushMsg {
     /// read, by plan index.
     SourceDone {
         group: u64,
-        source: NodeId,
+        source: Src,
         slots: Vec<u64>,
         failed: Vec<(u32, String)>,
     },
@@ -123,7 +126,7 @@ pub(crate) enum PushMsg {
     /// load's record).
     Sent {
         group: u64,
-        source: NodeId,
+        source: Src,
         bytes: Vec<u64>,
         rdma: u64,
         /// By a fallback: a TCP lane or the control connection.
@@ -158,6 +161,25 @@ pub struct RingState {
     pub last_release_ms: Option<u64>,
     /// Milliseconds after the rank joined, as of this report.
     pub at_ms: u64,
+}
+
+/// A source stream (ADR-063: one per store): the store it reads, and the
+/// host that reads it: the store's own host, or for an archive one of its
+/// gateways, where it runs beside that host's own stream as another disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub(crate) struct Src {
+    pub store: StoreId,
+    pub host: NodeId,
+}
+
+impl Src {
+    /// A host's own store.
+    fn host(n: NodeId) -> Src {
+        Src {
+            store: n.live_store(),
+            host: n,
+        }
+    }
 }
 
 /// One ring slot a source may fill.
@@ -202,8 +224,8 @@ struct HubGroup {
     joined: HashMap<u32, u32>,
     joined_notify: Arc<tokio::sync::Notify>,
     /// Sources still streaming, and every source used.
-    streaming: Vec<NodeId>,
-    sources: Vec<NodeId>,
+    streaming: Vec<Src>,
+    sources: Vec<Src>,
     /// Slots per rank, summed over the sources that finished.
     slots: Vec<u64>,
     failed: Vec<(u32, String)>,
@@ -215,11 +237,11 @@ struct HubGroup {
     /// When streaming started, and each source's last report (bytes per
     /// rank) for the record.
     t0: tokio::time::Instant,
-    last_sent: HashMap<NodeId, Vec<u64>>,
+    last_sent: HashMap<Src, Vec<u64>>,
     /// Each rank's ring as its host last reported it.
     rings: HashMap<u32, RingState>,
     /// The sources still owing each rank slots.
-    owing: Vec<Vec<NodeId>>,
+    owing: Vec<Vec<Src>>,
 }
 
 impl HubGroup {
@@ -273,7 +295,7 @@ struct RankSlot {
     /// Ring slots no credit names.
     free: Vec<u32>,
     /// Ring slots granted and not yet filled: to which source, which grant.
-    granted: HashMap<u32, (NodeId, u64)>,
+    granted: HashMap<u32, (Src, u64)>,
     /// Those of `granted` given as a source's floor, outside the host's
     /// budget (`push-grant-floor`).
     floor: std::collections::HashSet<u32>,
@@ -287,8 +309,8 @@ struct RankSlot {
     rdma: Option<Arc<nest_fabric::push::PushRing>>,
     /// This rank's token prefix: landing tokens are `id << 12 | slot`.
     token_id: u32,
-    /// Sources owing this rank slots, granted to round robin.
-    sources: Vec<NodeId>,
+    /// Sources owing this rank slots.
+    sources: Vec<Src>,
     next: usize,
     done_sent: bool,
     /// When the rank joined, its releases and when the last came.
@@ -377,10 +399,11 @@ impl State {
 struct State {
     hub: HashMap<u64, HubGroup>,
     ranks: HashMap<(u64, u32), RankSlot>,
-    sources: HashMap<u64, SourceState>,
-    /// Credits that came before their group's `Stream` (rank hosts start
-    /// granting as soon as they learn their sources): (group, rank) → n.
-    early: HashMap<(u64, u32), Vec<Grant>>,
+    /// Streams on this host, by group and the store each reads.
+    sources: HashMap<(u64, StoreId), SourceState>,
+    /// Credits that came before their stream's `Stream` (rank hosts start
+    /// granting as soon as they learn their sources): (group, store, rank).
+    early: HashMap<(u64, StoreId, u32), Vec<Grant>>,
     /// Loads this host was the hub of, for status (`push_record`).
     history: crate::push_record::History,
     /// Landing tokens' rank ids → the rank they belong to.
@@ -422,34 +445,42 @@ struct Resolved {
     file: FileId,
     generation: Generation,
     size: u64,
-    /// Hosts with a live copy, this host first if it holds one.
-    holders: Vec<NodeId>,
+    /// The copies to read it from: those of the nearest kind there is
+    /// (fabric hosts, else archives, else off-grid hosts; ADR-063).
+    holders: Vec<Src>,
 }
 
 /// Give each file to one holder so the holders finish together: largest
 /// files first, each to the holder whose share would be done soonest at its
 /// measured disk read rate (`rates`, bytes/s; a holder with no rate counts at
 /// the median, and with no rates at all every holder counts the same, which
-/// balances bytes). This host's own copy wins ties (ADR-066).
-fn assign(files: &[Resolved], me: NodeId, rates: &HashMap<NodeId, u64>) -> Vec<NodeId> {
+/// balances bytes). A host's rate is its own store's; an archive has none.
+/// This host's own copies win ties (ADR-066).
+fn assign(files: &[Resolved], me: NodeId, rates: &HashMap<NodeId, u64>) -> Vec<Src> {
     let mut known: Vec<u64> = rates.values().copied().filter(|b| *b > 0).collect();
     known.sort_unstable();
     let median = known.get(known.len() / 2).copied().unwrap_or(1);
-    let rate = |h: &NodeId| rates.get(h).copied().filter(|b| *b > 0).unwrap_or(median) as f64;
+    let rate = |s: &Src| {
+        Some(s.host)
+            .filter(|h| h.live_store() == s.store)
+            .and_then(|h| rates.get(&h).copied())
+            .filter(|b| *b > 0)
+            .unwrap_or(median) as f64
+    };
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by_key(|i| std::cmp::Reverse(files[*i].size));
-    let mut load: HashMap<NodeId, u64> = HashMap::new();
-    let mut out = vec![me; files.len()];
+    let mut load: HashMap<Src, u64> = HashMap::new();
+    let mut out = vec![Src::host(me); files.len()];
     for i in order {
         let f = &files[i];
-        let done = |h: &NodeId| (load.get(h).copied().unwrap_or(0) + f.size) as f64 / rate(h);
+        let done = |s: &Src| (load.get(s).copied().unwrap_or(0) + f.size) as f64 / rate(s);
         let pick = *f
             .holders
             .iter()
             .min_by(|a, b| {
                 done(a)
                     .total_cmp(&done(b))
-                    .then((**a != me).cmp(&(**b != me)))
+                    .then((a.host != me).cmp(&(b.host != me)))
             })
             .expect("resolved files have holders");
         *load.entry(pick).or_default() += f.size;
@@ -535,7 +566,7 @@ impl Push {
     pub fn groups(&self) -> Vec<(u64, &'static str)> {
         let st = self.state.lock();
         let mut v: Vec<(u64, &'static str)> = st.hub.keys().map(|g| (*g, "hub")).collect();
-        v.extend(st.sources.keys().map(|g| (*g, "source")));
+        v.extend(st.sources.keys().map(|(g, _)| (*g, "source")));
         v.extend(st.ranks.keys().map(|(g, _)| (*g, "rank")));
         v.sort_unstable();
         v.dedup();
@@ -615,19 +646,21 @@ impl Push {
                 PushMsg::Stream {
                     group,
                     hub,
+                    source,
                     patterns,
                     files,
                     ranks,
                 } => {
-                    me.stream(group, hub, patterns, files, ranks);
+                    me.stream(group, hub, source, patterns, files, ranks);
                     Ok(())
                 }
                 PushMsg::Credit {
                     group,
+                    store,
                     rank,
                     grants,
                 } => {
-                    me.credit(group, rank, grants);
+                    me.credit(group, store, rank, grants);
                     Ok(())
                 }
                 PushMsg::Slot {
@@ -815,13 +848,15 @@ impl Push {
                 if !a.sealed || a.gen_state != nest_types::GenState::Stable {
                     return Err(invalid(format!("{p}: not sealed")));
                 }
-                let mut holders = v.read_order(id)?;
-                if v.holds_live(&a) {
-                    holders.insert(0, v.me());
-                }
-                if holders.is_empty() {
+                let copies = v.push_holders(&a)?;
+                let Some(nearest) = copies.iter().map(|c| c.2).min() else {
                     return Err(invalid(format!("{p}: no live copy")));
-                }
+                };
+                let holders = copies
+                    .iter()
+                    .filter(|c| c.2 == nearest)
+                    .map(|&(store, host, _)| Src { store, host })
+                    .collect();
                 Ok(Resolved {
                     file: id,
                     generation: a.generation,
@@ -902,7 +937,7 @@ impl Push {
         for e in plan.entries {
             per_file[e.file as usize].push(e);
         }
-        let mut by_source: BTreeMap<NodeId, Vec<SourceFile>> = BTreeMap::new();
+        let mut by_source: BTreeMap<Src, Vec<SourceFile>> = BTreeMap::new();
         for (i, entries) in per_file.into_iter().enumerate() {
             if entries.is_empty() {
                 continue;
@@ -916,7 +951,7 @@ impl Push {
             });
         }
         // Which sources owe each rank anything.
-        let mut owing: Vec<Vec<NodeId>> = vec![Vec::new(); ranks.len()];
+        let mut owing: Vec<Vec<Src>> = vec![Vec::new(); ranks.len()];
         for (src, files) in &by_source {
             let mut rs: Vec<u32> = files
                 .iter()
@@ -935,10 +970,10 @@ impl Push {
             streams: by_source
                 .iter()
                 .map(|(n, fs)| StreamForecast {
-                    store: self.name_of(*n),
+                    store: self.src_name(*n),
                     bytes: fs.iter().map(|f| totals.file_bytes[f.index as usize]).sum(),
                     files: fs.len() as u32,
-                    transport: if *n == me { "local" } else { "rpc" }.into(),
+                    transport: if n.host == me { "local" } else { "rpc" }.into(),
                     bytes_per_s: 0,
                 })
                 .collect(),
@@ -961,7 +996,7 @@ impl Push {
             let _ = g.engine.send(Event::Planned(forecast));
         }
         {
-            let names_s: Vec<String> = by_source.keys().map(|n| self.name_of(*n)).collect();
+            let names_s: Vec<String> = by_source.keys().map(|n| self.src_name(*n)).collect();
             let names_r: Vec<String> = rank_hosts.iter().map(|n| self.name_of(*n)).collect();
             let started = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -990,10 +1025,11 @@ impl Push {
         let rank_info: Vec<(NodeId, u32)> = rank_hosts.iter().copied().zip(slot_bytes).collect();
         for (src, files) in by_source {
             self.send(
-                src,
+                src.host,
                 PushMsg::Stream {
                     group,
                     hub: me,
+                    source: src,
                     patterns: plan.patterns.clone(),
                     files,
                     ranks: rank_info.clone(),
@@ -1028,9 +1064,20 @@ impl Push {
             .unwrap_or_else(|| format!("node{}", n.0))
     }
 
+    /// A source's name in records: its host's, or its archive's.
+    fn src_name(&self, s: Src) -> String {
+        if s.store == s.host.live_store() {
+            return self.name_of(s.host);
+        }
+        self.vfs()
+            .ok()
+            .and_then(|v| v.data().archive_row(s.store))
+            .map_or_else(|| format!("store{}", s.store.0), |(name, _)| name)
+    }
+
     /// Milliseconds since the group started streaming, and the index of
     /// `source` among its sources.
-    fn rec_at(g: &HubGroup, source: NodeId) -> (u64, Option<usize>) {
+    fn rec_at(g: &HubGroup, source: Src) -> (u64, Option<usize>) {
         (
             g.t0.elapsed().as_millis() as u64,
             g.sources.iter().position(|s| *s == source),
@@ -1038,7 +1085,7 @@ impl Push {
     }
 
     /// A source's report: into the load's record.
-    fn sent(&self, group: u64, source: NodeId, bytes: &[u64], rdma: u64, rpc: u64, local: u64) {
+    fn sent(&self, group: u64, source: Src, bytes: &[u64], rdma: u64, rpc: u64, local: u64) {
         let mut st = self.state.lock();
         let State { hub, history, .. } = &mut *st;
         let Some(g) = hub.get_mut(&group) else { return };
@@ -1147,11 +1194,11 @@ impl Push {
     async fn source_done(
         self: &Arc<Self>,
         group: u64,
-        source: NodeId,
+        source: Src,
         slots: Vec<u64>,
         failed: Vec<(u32, String)>,
     ) {
-        tracing::trace!(group, %source, ?slots, ?failed, "push source done");
+        tracing::trace!(group, ?source, ?slots, ?failed, "push source done");
         let all_done = {
             let mut st = self.state.lock();
             let State { hub, history, .. } = &mut *st;
@@ -1267,7 +1314,7 @@ impl Push {
                 missing,
             });
             let mut h = g.rank_hosts.clone();
-            h.extend(g.sources.iter().copied());
+            h.extend(g.sources.iter().map(|s| s.host));
             h.sort_unstable();
             h.dedup();
             h
@@ -1438,7 +1485,7 @@ impl Push {
     /// The sources owing this rank, at Start and again whenever one
     /// finishes: grants held by a source no longer listed come back (it
     /// will fill none of them).
-    fn rank_sources(self: &Arc<Self>, group: u64, rank: u32, sources: Vec<NodeId>) {
+    fn rank_sources(self: &Arc<Self>, group: u64, rank: u32, sources: Vec<Src>) {
         {
             let mut st = self.state.lock();
             let Some(r) = st.ranks.get_mut(&(group, rank)) else {
@@ -1467,16 +1514,21 @@ impl Push {
 
     /// Hand free ring slots to sources as grants: first each owing source's
     /// floor (`push-grant-floor` grants of this rank held at once, outside
-    /// the budget),
-    /// then round robin while this host's grants outstanding stay within the
-    /// incast budget.
+    /// the budget), then, while this host's grants outstanding stay within
+    /// the incast budget, each to the owing source holding fewest.
+    ///
+    /// Fewest held, not round robin: a slow source (an archive disk, an
+    /// off-grid host over TCP) fills its grants slowly, and round robin
+    /// kept handing it its turn until it held nearly the whole budget and
+    /// every fast source waited on one grant each. Now it holds at most an
+    /// even share, and streams at its own pace beside the others.
     ///
     /// The floor is what keeps two ranks on one host live: sources stream
     /// in file order, so a source blocked on rank B's credit holds rank A's
     /// grants unfilled; with one budget for both ranks, A's parked grants
     /// could take all of it and B never get one (group 120235912134667).
     fn grant(self: &Arc<Self>, group: u64, rank: u32) {
-        let mut out: Vec<(NodeId, Vec<Grant>)> = Vec::new();
+        let mut out: Vec<(Src, Vec<Grant>)> = Vec::new();
         {
             let mut st = self.state.lock();
             let mut granted = st.granted_bytes;
@@ -1489,11 +1541,11 @@ impl Push {
             }
             let slot_bytes = r.ring.as_ref().map_or(0, |x| x.slot_bytes) as u64;
             // Each owing source's floor first, then the budget's round robin.
-            let mut held: HashMap<NodeId, usize> = HashMap::new();
+            let mut held: HashMap<Src, usize> = HashMap::new();
             for (s, _) in r.granted.values() {
                 *held.entry(*s).or_default() += 1;
             }
-            let mut floor: VecDeque<NodeId> = r
+            let mut floor: VecDeque<Src> = r
                 .sources
                 .iter()
                 .flat_map(|s| {
@@ -1505,7 +1557,7 @@ impl Push {
                 let (s, is_floor) = if let Some(s) = floor.pop_front() {
                     (s, true)
                 } else if granted + slot_bytes <= budget {
-                    let s = r.sources[r.next % r.sources.len()];
+                    let s = fewest(&r.sources, &held, r.next);
                     r.next = r.next.wrapping_add(1);
                     (s, false)
                 } else {
@@ -1515,6 +1567,7 @@ impl Push {
                 let seq = r.next_seq;
                 r.next_seq += 1;
                 r.granted.insert(slot, (s, seq));
+                *held.entry(s).or_default() += 1;
                 if is_floor {
                     r.floor.insert(slot);
                 }
@@ -1538,9 +1591,10 @@ impl Push {
             tokio::spawn(async move {
                 if let Err(e) = me
                     .send(
-                        src,
+                        src.host,
                         PushMsg::Credit {
                             group,
+                            store: src.store,
                             rank,
                             grants,
                         },
@@ -1562,7 +1616,7 @@ impl Push {
         self: &Arc<Self>,
         group: u64,
         rank: u32,
-        source: NodeId,
+        source: Src,
         slot: u32,
         seq: u64,
         bytes: &[u8],
@@ -1782,11 +1836,13 @@ impl Push {
             }
         }
         tracing::info!(group, %reason, ranks = ?failed_ranks, "push group ended here; ranks told");
-        if let Some(s) = st.sources.get_mut(&group) {
-            s.cancelled = true;
-            s.notify.notify_waiters();
+        for ((g, _), s) in st.sources.iter_mut() {
+            if *g == group {
+                s.cancelled = true;
+                s.notify.notify_waiters();
+            }
         }
-        st.early.retain(|(g, _), _| *g != group);
+        st.early.retain(|(g, _, _), _| *g != group);
         if let Some(g) = st.hub.remove(&group) {
             let _ = g.engine.send(Event::Failed {
                 reason: reason.to_string(),
@@ -1801,6 +1857,7 @@ impl Push {
         self: &Arc<Self>,
         group: u64,
         hub: NodeId,
+        source: Src,
         patterns: Vec<Pattern>,
         files: Vec<SourceFile>,
         ranks: Vec<(NodeId, u32)>,
@@ -1812,12 +1869,12 @@ impl Push {
             for (r, c) in credits.iter_mut().enumerate() {
                 *c = st
                     .early
-                    .remove(&(group, r as u32))
+                    .remove(&(group, source.store, r as u32))
                     .unwrap_or_default()
                     .into();
             }
             st.sources.insert(
-                group,
+                (group, source.store),
                 SourceState {
                     credits,
                     notify: notify.clone(),
@@ -1827,7 +1884,7 @@ impl Push {
         }
         let me = self.clone();
         tokio::spawn(async move {
-            let src = me.me().unwrap_or(NodeId(0));
+            let src = source;
             // Staging for RDMA writes, sized to the largest ring slot: one
             // per send in flight, and one per rank being packed.
             let slot_max = ranks.iter().map(|(_, b)| *b as usize).max().unwrap_or(0);
@@ -1866,7 +1923,7 @@ impl Push {
             ticker.abort();
             let _ = me.send(hub, counters.msg(group, src)).await;
             let slots = std::mem::take(&mut s.sent);
-            me.state.lock().sources.remove(&group);
+            me.state.lock().sources.remove(&(group, src.store));
             let _ = me
                 .send(
                     hub,
@@ -1881,16 +1938,20 @@ impl Push {
         });
     }
 
-    fn credit(&self, group: u64, rank: u32, grants: Vec<Grant>) {
+    fn credit(&self, group: u64, store: StoreId, rank: u32, grants: Vec<Grant>) {
         let mut st = self.state.lock();
-        match st.sources.get_mut(&group) {
+        match st.sources.get_mut(&(group, store)) {
             Some(s) => {
                 if let Some(c) = s.credits.get_mut(rank as usize) {
                     c.extend(grants);
                     s.notify.notify_waiters();
                 }
             }
-            None => st.early.entry((group, rank)).or_default().extend(grants),
+            None => st
+                .early
+                .entry((group, store, rank))
+                .or_default()
+                .extend(grants),
         }
     }
 
@@ -1899,6 +1960,7 @@ impl Push {
     async fn take_credit(
         &self,
         group: u64,
+        store: StoreId,
         rank: u32,
         notify: &tokio::sync::Notify,
     ) -> Option<Grant> {
@@ -1906,7 +1968,7 @@ impl Push {
             let n = notify.notified();
             {
                 let mut st = self.state.lock();
-                let s = st.sources.get_mut(&group)?;
+                let s = st.sources.get_mut(&(group, store))?;
                 if s.cancelled {
                     return None;
                 }
@@ -2098,7 +2160,7 @@ impl Counters {
         }
     }
 
-    fn msg(&self, group: u64, source: NodeId) -> PushMsg {
+    fn msg(&self, group: u64, source: Src) -> PushMsg {
         PushMsg::Sent {
             group,
             source,
@@ -2117,7 +2179,8 @@ impl Counters {
 struct Stream {
     push: Arc<Push>,
     group: u64,
-    me: NodeId,
+    /// The store this stream reads, and this host.
+    me: Src,
     /// Per rank: its host and slot size.
     ranks: Vec<(NodeId, u32)>,
     notify: Arc<tokio::sync::Notify>,
@@ -2138,6 +2201,16 @@ struct Stream {
 const IN_FLIGHT: usize = 32;
 /// Registered staging a source keeps per group, at most.
 const STAGING_BYTES: usize = 64 << 20;
+
+/// Of `sources` (not empty), the one holding fewest grants; ties go to
+/// the first from `from` on, so equal sources take turns.
+fn fewest(sources: &[Src], held: &HashMap<Src, usize>, from: usize) -> Src {
+    let n = sources.len();
+    (0..n)
+        .map(|k| sources[(from + k) % n])
+        .min_by_key(|s| held.get(s).copied().unwrap_or(0))
+        .expect("sources is not empty")
+}
 
 /// Sends in flight for slots of `slot_bytes`.
 fn in_flight(slot_bytes: usize) -> usize {
@@ -2229,10 +2302,13 @@ impl Stream {
             while next < reads.len() && ahead.len() < READ_AHEAD {
                 let (fi, a, b) = reads[next];
                 let (v, obj, f) = (vfs.clone(), objs[fi].clone(), &files[fi]);
-                let (file, generation) = (f.file, f.generation);
+                let (file, generation, store) = (f.file, f.generation, self.me.store);
                 ahead.push_back(tokio::task::spawn_blocking(move || {
                     let o = obj
-                        .get_or_init(|| v.push_open(file, generation).map_err(|e| e.to_string()))
+                        .get_or_init(|| {
+                            v.push_open_from(store, file, generation)
+                                .map_err(|e| e.to_string())
+                        })
                         .as_ref()
                         .map_err(|e| e.clone())?;
                     o.read(a, (b - a) as usize)
@@ -2280,7 +2356,9 @@ impl Stream {
 
     fn cancelled(&self) -> bool {
         let st = self.push.state.lock();
-        st.sources.get(&self.group).is_none_or(|s| s.cancelled)
+        st.sources
+            .get(&(self.group, self.me.store))
+            .is_none_or(|s| s.cancelled)
     }
 
     /// Pack one read's bytes (`buf`, file range `[at, end)`) into the
@@ -2311,7 +2389,7 @@ impl Stream {
             if self.open[ri].is_none() {
                 let (host, len) = (self.ranks[ri].0, self.ranks[ri].1 as usize);
                 let buf = match &self.pool {
-                    Some(p) if host != self.me && len <= p.slot_bytes() => {
+                    Some(p) if host != self.me.host && len <= p.slot_bytes() => {
                         SlotBuf::Staged(p.acquire(len).await)
                     }
                     _ => SlotBuf::Plain(vec![0u8; len]),
@@ -2340,7 +2418,7 @@ impl Stream {
         let (buf, payload, _) = s.finish();
         let grant = self
             .push
-            .take_credit(self.group, r, &self.notify)
+            .take_credit(self.group, self.me.store, r, &self.notify)
             .await
             .ok_or("cancelled, or no credit came")?;
         let limit = in_flight(
@@ -2394,7 +2472,7 @@ impl Stream {
                     }
                 }
             };
-            if to == me {
+            if to == me.host {
                 // This host's own rank: handed over in memory.
                 c.local.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -2527,15 +2605,15 @@ mod tests {
                 file: FileId(i as u64 + 1),
                 generation: Generation(1),
                 size,
-                holders: holders.iter().map(|h| NodeId(*h)).collect(),
+                holders: holders.iter().map(|h| Src::host(NodeId(*h))).collect(),
             })
             .collect()
     }
 
-    fn bytes(files: &[Resolved], to: &[NodeId]) -> HashMap<u64, u64> {
+    fn bytes(files: &[Resolved], to: &[Src]) -> HashMap<u64, u64> {
         let mut b = HashMap::new();
-        for (f, h) in files.iter().zip(to) {
-            *b.entry(h.0).or_default() += f.size;
+        for (f, s) in files.iter().zip(to) {
+            *b.entry(s.store.0).or_default() += f.size;
         }
         b
     }
@@ -2568,6 +2646,44 @@ mod tests {
     fn unknown_rates_count_at_the_median_and_own_copy_wins_ties() {
         let rates = HashMap::from([(NodeId(2), 10), (NodeId(3), 0)]);
         let f = files(1, 5, &[2, 1, 3]);
-        assert_eq!(assign(&f, NodeId(1), &rates), vec![NodeId(1)]);
+        assert_eq!(assign(&f, NodeId(1), &rates), vec![Src::host(NodeId(1))]);
+    }
+
+    #[test]
+    fn a_source_slow_to_fill_its_grants_gets_no_more_until_others_catch_up() {
+        let [slow, a, b] = [1, 2, 3].map(|n| Src::host(NodeId(n)));
+        let sources = [slow, a, b];
+        let mut held = HashMap::from([(slow, 0), (a, 0), (b, 0)]);
+        // Grant 30 while only the fast sources fill theirs: the slow one
+        // stops at an even share, however long it holds them.
+        for k in 0..30 {
+            let s = fewest(&sources, &held, k);
+            *held.get_mut(&s).unwrap() += 1;
+            if s != slow {
+                *held.get_mut(&s).unwrap() -= 1;
+            }
+        }
+        assert_eq!(held[&slow], 1, "{held:?}");
+        // Equal sources take turns.
+        let held = HashMap::new();
+        let turns: Vec<Src> = (0..3).map(|k| fewest(&sources, &held, k)).collect();
+        assert_eq!(turns, sources);
+    }
+
+    #[test]
+    fn an_archive_is_a_stream_of_its_own_beside_its_gateways_store() {
+        // Host 1 holds half the files on its own store; the other half are
+        // only in an archive host 1 is the gateway of: two streams.
+        let archive = Src {
+            store: StoreId(crate::local::ARCHIVE_STORE_BASE),
+            host: NodeId(1),
+        };
+        let mut f = files(4, 10, &[1]);
+        for r in &mut f[2..] {
+            r.holders = vec![archive];
+        }
+        let to = assign(&f, NodeId(1), &HashMap::from([(NodeId(1), 10)]));
+        assert_eq!(to[..2], [Src::host(NodeId(1)); 2]);
+        assert_eq!(to[2..], [archive; 2]);
     }
 }

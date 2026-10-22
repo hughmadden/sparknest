@@ -1463,3 +1463,210 @@ async fn grants_parked_at_busy_sources_do_not_deadlock_one_rank_per_host() {
         );
     }
 }
+
+/// An archive is a source of its own (ADR-063): a file only in an archive
+/// streams from its gateway beside that host's own store, as another
+/// disk of the same host, and the record names the archive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_archive_only_file_streams_from_its_gateway() {
+    let c = ready(2).await;
+    let p = c.node(1).placer.clone();
+    let scratch = c.state_dir(1).join("scratch-disk");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let r = p
+        .add_store("scratch", scratch.to_str().unwrap(), &["n1".into()])
+        .await
+        .unwrap();
+    assert!(r.iter().all(|(_, r)| r.is_ok()), "{r:?}");
+    let len = 3usize << 20;
+    let a: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+    let b: Vec<u8> = (0..len).map(|i| (i * 13 % 241) as u8).collect();
+    sealed(&c, 1, "live.bin", a.clone()).await;
+    let fb = sealed(&c, 2, "archived.bin", b.clone()).await;
+    let sel = nest_place::Selector::parse("/archived.bin", "/hub").unwrap();
+    let job = p.offload(sel, "scratch".into(), 2).await.unwrap();
+    c.eventually("offloaded", Duration::from_secs(20), |c| {
+        c.node(1).placer.job(job).is_some_and(|j| j.finished)
+    })
+    .await;
+    assert!(p.job(job).unwrap().error.is_none());
+    c.converge().await;
+    let only_archive = |c: &TestCluster| {
+        let r = c.node(1).meta.open_reader().unwrap();
+        nest_meta::query::replicas(&r, fb)
+            .unwrap()
+            .iter()
+            .all(|r| r.store.0 >= 1 << 20)
+    };
+    c.eventually(
+        "only the archive holds it",
+        Duration::from_secs(5),
+        only_archive,
+    )
+    .await;
+
+    let arena = 2 * len as u64;
+    let (hub, sock) = (c.push_socket(1), c.push_socket(2));
+    let got = tokio::task::spawn_blocking(move || {
+        let g = Coordinator::create(
+            &hub,
+            vec![RankSpec {
+                rank: 0,
+                host: "n2".into(),
+                arena_bytes: arena,
+            }],
+            vec!["/live.bin".into(), "/archived.bin".into()],
+            Some(Duration::from_secs(20)),
+        )
+        .map_err(|e| format!("create: {e}"))?;
+        g.patterns(vec![Pattern {
+            run: len as u32,
+            dims: vec![],
+        }])
+        .unwrap();
+        g.entries(
+            (0..2u32)
+                .map(|f| Entry {
+                    file: f,
+                    pattern: 0,
+                    src_base: 0,
+                    dst_base: f as u64 * len as u64,
+                    rank: 0,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let (group, token) = (g.group, g.token);
+        let (slots, slot_bytes) = (4u32, 64u32 << 10);
+        let joiner = std::thread::spawn(move || {
+            let ring = memfd(slots as usize * slot_bytes as usize);
+            let rank = loop {
+                if let Ok(k) = Rank::join(
+                    &sock,
+                    JoinArgs {
+                        group,
+                        token,
+                        rank: 0,
+                        ring_fd: ring.as_raw_fd(),
+                        slots,
+                        slot_bytes,
+                    },
+                    Some(Duration::from_secs(20)),
+                ) {
+                    break k;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            run_rank(rank, ring, slots, slot_bytes, arena as usize)
+        });
+        let forecast = g.start().map_err(|e| format!("start: {e}"))?;
+        let out = joiner.join().unwrap()?;
+        Ok::<_, String>((forecast, out))
+    })
+    .await
+    .unwrap();
+    let (forecast, out) = got.unwrap();
+    let mut stores: Vec<_> = forecast.streams.iter().map(|s| s.store.clone()).collect();
+    stores.sort();
+    assert_eq!(stores, vec!["n1", "scratch"]);
+    assert!(out[..len] == a[..], "the live file's bytes");
+    assert!(out[len..] == b[..], "the archived file's bytes");
+    let rec = c.node(1).push.history(None);
+    let rec = rec.last().unwrap();
+    let mut sources = rec.sources.clone();
+    sources.sort();
+    assert_eq!(sources, vec!["n1", "scratch"]);
+}
+
+/// An off-grid host (ADR-047) is a source when nothing nearer holds a
+/// file: its slots travel over the connections it opened, and a fabric
+/// host's copy of another file is still read from the fabric host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_offgrid_host_sources_what_only_it_holds() {
+    let mut c = ready(2).await;
+    c.add_offgrid(3).await;
+    c.eventually("off-grid host serving", Duration::from_secs(8), |c| {
+        c.node(3).data.caught_up() && c.node(3).data.session().is_some()
+    })
+    .await;
+    c.eventually("off-grid host named", Duration::from_secs(8), |c| {
+        c.node(1)
+            .placer
+            .nodes()
+            .is_ok_and(|v| v.iter().any(|h| h.name == "n3"))
+    })
+    .await;
+    let len = 2usize << 20;
+    let a: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+    let b: Vec<u8> = (0..len).map(|i| (i * 13 % 241) as u8).collect();
+    sealed(&c, 1, "here.bin", a.clone()).await;
+    sealed(&c, 3, "away.bin", b.clone()).await;
+    c.converge().await;
+
+    let arena = 2 * len as u64;
+    let (hub, sock) = (c.push_socket(1), c.push_socket(2));
+    let got = tokio::task::spawn_blocking(move || {
+        let g = Coordinator::create(
+            &hub,
+            vec![RankSpec {
+                rank: 0,
+                host: "n2".into(),
+                arena_bytes: arena,
+            }],
+            vec!["/here.bin".into(), "/away.bin".into()],
+            Some(Duration::from_secs(20)),
+        )
+        .map_err(|e| format!("create: {e}"))?;
+        g.patterns(vec![Pattern {
+            run: len as u32,
+            dims: vec![],
+        }])
+        .unwrap();
+        g.entries(
+            (0..2u32)
+                .map(|f| Entry {
+                    file: f,
+                    pattern: 0,
+                    src_base: 0,
+                    dst_base: f as u64 * len as u64,
+                    rank: 0,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let (group, token) = (g.group, g.token);
+        let (slots, slot_bytes) = (4u32, 64u32 << 10);
+        let joiner = std::thread::spawn(move || {
+            let ring = memfd(slots as usize * slot_bytes as usize);
+            let rank = loop {
+                if let Ok(k) = Rank::join(
+                    &sock,
+                    JoinArgs {
+                        group,
+                        token,
+                        rank: 0,
+                        ring_fd: ring.as_raw_fd(),
+                        slots,
+                        slot_bytes,
+                    },
+                    Some(Duration::from_secs(20)),
+                ) {
+                    break k;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            run_rank(rank, ring, slots, slot_bytes, arena as usize)
+        });
+        let forecast = g.start().map_err(|e| format!("start: {e}"))?;
+        let out = joiner.join().unwrap()?;
+        Ok::<_, String>((forecast, out))
+    })
+    .await
+    .unwrap();
+    let (forecast, out) = got.unwrap();
+    let mut stores: Vec<_> = forecast.streams.iter().map(|s| s.store.clone()).collect();
+    stores.sort();
+    assert_eq!(stores, vec!["n1", "n3"]);
+    assert!(out[..len] == a[..], "the fabric host's file");
+    assert!(out[len..] == b[..], "the off-grid host's file");
+}

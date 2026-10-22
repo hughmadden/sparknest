@@ -1480,6 +1480,71 @@ impl Vfs {
         })
     }
 
+    /// Where a push load can read `a`'s generation (ADR-063): each live
+    /// copy as (store, the host that reads it, how far: 0 a fabric host's
+    /// store or this host's, 1 an archive, 2 an off-grid host's). An
+    /// archive is read by this host when it is a gateway, else by its
+    /// first gateway. This host's own copy counts only if it can serve it.
+    pub fn push_holders(&self, a: &FileAttr) -> NestResult<Vec<(nest_types::StoreId, NodeId, u8)>> {
+        let me = self.me();
+        let offgrid = self.offgrid_hosts();
+        let replicas = self.q(|c| query::replicas(c, a.id))?;
+        let mut out = Vec::new();
+        for r in replicas
+            .iter()
+            .filter(|r| r.generation == a.generation && r.state == nest_types::ReplicaState::Live)
+        {
+            if crate::is_archive(r.store) {
+                let Some((_, cfg)) = self.d.archive_row(r.store) else {
+                    continue;
+                };
+                let host = if cfg.gateways.contains(&me) {
+                    Some(me)
+                } else {
+                    cfg.gateways.first().copied()
+                };
+                if let Some(h) = host {
+                    out.push((r.store, h, 1));
+                }
+                continue;
+            }
+            let host = NodeId(r.store.0);
+            if host == me && !self.holds_live(a) {
+                continue;
+            }
+            out.push((r.store, host, if offgrid.contains(&host) { 2 } else { 0 }));
+        }
+        Ok(out)
+    }
+
+    /// Open `generation` of `file` from store `store` of this host (its own,
+    /// or an archive it is a gateway of) for a push source; as `push_open`.
+    pub fn push_open_from(
+        &self,
+        store: nest_types::StoreId,
+        file: FileId,
+        generation: Generation,
+    ) -> NestResult<PushObject> {
+        if !crate::is_archive(store) {
+            return self.push_open(file, generation);
+        }
+        let a = self.raw_attr(file)?;
+        if a.generation != generation {
+            return Err(NestError::Stale);
+        }
+        let key = ObjectKey::new(file, generation);
+        let arch = self.d.servable_archive(store, key).ok_or_else(|| {
+            NestError::Unavailable("that archive does not serve this copy here".into())
+        })?;
+        let buffered = Arc::new(arch.store.open_read(key).map_err(io)?);
+        let direct = arch.store.open_read_direct(key).ok();
+        Ok(PushObject {
+            buffered,
+            direct,
+            size: a.size,
+        })
+    }
+
     /// Whether this host's own store holds a live copy of `a`'s generation.
     pub fn holds_live(&self, a: &FileAttr) -> bool {
         self.d.servable(ObjectKey::new(a.id, a.generation))
