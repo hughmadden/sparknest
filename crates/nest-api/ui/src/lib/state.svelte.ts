@@ -1,7 +1,7 @@
 // Cluster state shared by every view, refreshed every 2 s while the page is
 // visible, plus routing and toasts.
 
-import { post, hasToken, tokenRefused, ApiError, net, wsUrl, setTransport, type Status, type Store, type Job, type LogLine } from "./api";
+import { post, hasToken, tokenRefused, forgetToken, ApiError, net, wsUrl, setTransport, type Status, type Store, type Job, type LogLine } from "./api";
 
 /** One run of `fn` at a time: a slow server gets one request of each kind,
  * never a growing pile. A call made meanwhile is not lost: it runs once
@@ -207,7 +207,10 @@ function connect() {
     if (!everOpen && ++failures >= 2) {
       tokenRefused().then((refused) => {
         if (socket !== ws) return;
-        if (refused) app.authed = false;
+        if (refused) {
+          forgetToken();
+          app.authed = false;
+        }
         else again();
       });
       return;

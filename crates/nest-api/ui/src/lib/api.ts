@@ -11,14 +11,27 @@ export function withoutToken(hash: string): string {
   const qs = p.toString();
   return path || qs ? `#${path}${qs ? "?" + qs : ""}` : "";
 }
+// Kept in localStorage: iOS Safari discards a background tab and reloads it
+// on return, often without its sessionStorage (always, from the home
+// screen), which sent the page back to the login form. Forgotten only when
+// the node refuses it.
+const KEY = "nest-token";
+function keep(t: string) {
+  try {
+    if (t) localStorage.setItem(KEY, t);
+    else localStorage.removeItem(KEY);
+  } catch {
+    /* storage blocked: the token lasts this page view */
+  }
+}
 try {
   const m = location.hash.match(/token=([0-9a-f]+)/);
   if (m) {
     token = m[1];
-    sessionStorage.setItem("nest-token", token);
+    keep(token);
     // Drop the token from the address, keeping any route (#/loads?token=…).
     history.replaceState(null, "", location.pathname + location.search + withoutToken(location.hash));
-  } else token = sessionStorage.getItem("nest-token") || "";
+  } else token = localStorage.getItem(KEY) || sessionStorage.getItem(KEY) || "";
 } catch {
   /* storage blocked: the login form still works for this page view */
 }
@@ -45,11 +58,12 @@ export const wsUrl = () =>
   `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/v1/ws?token=${encodeURIComponent(token)}`;
 export function setToken(t: string) {
   token = t.trim();
-  try {
-    sessionStorage.setItem("nest-token", token);
-  } catch {
-    /* ignore */
-  }
+  keep(token);
+}
+/** The node refused the token: forget it, so a reload asks for another. */
+export function forgetToken() {
+  token = "";
+  keep("");
 }
 
 export class ApiError extends Error {
