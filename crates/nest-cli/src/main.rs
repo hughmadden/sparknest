@@ -1150,6 +1150,9 @@ async fn wait_job(c: &Client, id: u64) -> Result<Value> {
             if let Some(e) = j["error"].as_str() {
                 bail!("job failed: {e}");
             }
+            if j["cancelled"].as_bool() == Some(true) {
+                bail!("job {id} was cancelled");
+            }
             return Ok(v);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2200,6 +2203,9 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             let jid = v["job"].as_u64().unwrap_or(0);
+            if v["attached"].as_bool() == Some(true) {
+                eprintln!("already downloading as job {jid}");
+            }
             if *wait { wait_job(&c, jid).await? } else { v }
         }
         Cmd::Hf {

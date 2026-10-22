@@ -1636,6 +1636,37 @@ pub fn driver(hf: Option<&Path>) -> NestResult<(PathBuf, PathBuf)> {
     Ok((py, drv))
 }
 
+/// Hub downloads running from one node, by (kind, repo, commit).
+#[derive(Default)]
+pub struct Running(std::collections::HashMap<(String, String, String), u64>);
+
+impl Running {
+    /// The job for `key`: the one already running (`live` says whether it
+    /// still is), joined, or a new id from `next`. True when joined.
+    pub fn claim(
+        &mut self,
+        key: &(String, String, String),
+        live: impl FnOnce(u64) -> bool,
+        next: impl FnOnce() -> u64,
+    ) -> (u64, bool) {
+        if let Some(&j) = self.0.get(key)
+            && live(j)
+        {
+            return (j, true);
+        }
+        let j = next();
+        self.0.insert(key.clone(), j);
+        (j, false)
+    }
+
+    /// `job` ended; forget it unless a later one took its key.
+    pub fn release(&mut self, key: &(String, String, String), job: u64) {
+        if self.0.get(key) == Some(&job) {
+            self.0.remove(key);
+        }
+    }
+}
+
 /// A repo at one commit: its files and their sizes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepoPlan {
@@ -2072,6 +2103,23 @@ mod fetch_tests {
         assert_eq!(p.done_bytes(), 100);
         assert_eq!(p.files[1].state, FetchState::Failed);
         assert_eq!(p.files[1].error, "HTTPError: 404");
+    }
+
+    #[test]
+    fn asking_again_for_a_running_download_joins_it() {
+        let k = |sha: &str| ("model".to_string(), "org/a".to_string(), sha.to_string());
+        let mut r = Running::default();
+        assert_eq!(r.claim(&k("s1"), |_| true, || 7), (7, false));
+        assert_eq!(r.claim(&k("s1"), |j| j == 7, || 8), (7, true));
+        // Another commit of the same repo is its own download.
+        assert_eq!(r.claim(&k("s2"), |_| true, || 9), (9, false));
+        // A cancelled or finished one is not joined; a new one starts.
+        assert_eq!(r.claim(&k("s1"), |_| false, || 10), (10, false));
+        // The old job ending does not forget the new one.
+        r.release(&k("s1"), 7);
+        assert_eq!(r.claim(&k("s1"), |j| j == 10, || 11), (10, true));
+        r.release(&k("s1"), 10);
+        assert_eq!(r.claim(&k("s1"), |_| true, || 12), (12, false));
     }
 
     fn hosts(n: usize) -> Vec<FetchHost> {

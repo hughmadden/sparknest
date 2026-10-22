@@ -1203,7 +1203,7 @@ async fn hf_download(State(api): State<Api>, Json(r): Json<HfDownloadReq>) -> R<
     } else {
         vec![r.host]
     };
-    let job = api
+    let (job, attached) = api
         .placer
         .hf_download_spread(
             api.hub.clone(),
@@ -1214,7 +1214,7 @@ async fn hf_download(State(api): State<Api>, Json(r): Json<HfDownloadReq>) -> R<
             r.in_flight.unwrap_or(4).clamp(1, 16),
         )
         .await?;
-    Ok(Json(json!({ "job": job })))
+    Ok(Json(json!({ "job": job, "attached": attached })))
 }
 
 async fn cluster(State(api): State<Api>) -> R<serde_json::Value> {

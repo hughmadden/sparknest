@@ -129,6 +129,8 @@ pub struct Placer {
     imports: Mutex<HashMap<u64, Arc<Mutex<crate::import::ImportProgress>>>>,
     /// This host's shares of Hugging Face downloads (`hf_fetch_here`).
     fetches: Mutex<HashMap<u64, Arc<Mutex<crate::hfimport::FetchProgress>>>>,
+    /// Hub downloads running from here: asking again for one joins it.
+    downloads: Mutex<crate::hfimport::Running>,
     /// Recent answers the web UI asks for every few seconds.
     usage_cache: Mutex<Option<(u64, std::time::Instant, UsageMap)>>,
     stores_cache: Mutex<Option<(std::time::Instant, Vec<StoreStatus>)>>,
@@ -240,6 +242,7 @@ impl Placer {
             jobs: Mutex::new(HashMap::new()),
             imports: Mutex::new(HashMap::new()),
             fetches: Mutex::new(HashMap::new()),
+            downloads: Mutex::default(),
             usage_cache: Mutex::new(None),
             stores_cache: Mutex::new(None),
             info_cache: Mutex::new(HashMap::new()),
@@ -1440,7 +1443,8 @@ impl Placer {
     /// row hands its files to the others (`hfimport::Schedule`). Without
     /// `revision`, a repo the hub
     /// has is finished at its cached revision; a new one at its main branch,
-    /// whose ref is then written. Returns the job id.
+    /// whose ref is then written. Returns the job id, and whether it was
+    /// already running here for that commit (a second ask joins it).
     pub async fn hf_download_spread(
         self: &Arc<Self>,
         hub: String,
@@ -1449,7 +1453,7 @@ impl Placer {
         revision: Option<String>,
         hosts: Vec<String>,
         in_flight: usize,
-    ) -> NestResult<u64> {
+    ) -> NestResult<(u64, bool)> {
         use crate::hfimport::{FetchHost, FetchState};
         let mount_hub = self.mount_hub(&hub)?;
         let cached = crate::hfimport::cached_revision(&mount_hub, &repo, &kind);
@@ -1526,7 +1530,23 @@ impl Placer {
         };
         let assigned = crate::hfimport::assign_files(&missing, &fhosts);
 
-        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let key = (kind.clone(), repo.clone(), plan.sha.clone());
+        let (id, attached) = self.downloads.lock().claim(
+            &key,
+            // Not listed yet: claimed by a request still setting it up.
+            |j| {
+                self.jobs.lock().get(&j).is_none_or(|j| {
+                    let j = j.lock();
+                    !j.finished && !j.cancelled
+                })
+            },
+            || self.next_job.fetch_add(1, Ordering::Relaxed),
+        );
+        if attached {
+            tracing::info!(job = id, %repo, sha = %plan.sha, "hf download already running");
+            return Ok((id, true));
+        }
+
         let job = Arc::new(Mutex::new(ClusterJob {
             id,
             what: format!("hf download {}", at_revision(&repo, &revision)),
@@ -1743,8 +1763,10 @@ impl Placer {
             j.finished = true;
             j.finished_ms = Some(now_ms());
             tracing::info!(job = id, %repo, failed = failed.len(), cancelled = j.cancelled, "hf download finished");
+            drop(j);
+            me.downloads.lock().release(&key, id);
         });
-        Ok(id)
+        Ok((id, false))
     }
 
     /// Download a Hugging Face repo into an archive store (ADR-055), on

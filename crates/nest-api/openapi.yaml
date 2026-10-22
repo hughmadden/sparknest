@@ -1471,7 +1471,19 @@ paths:
                   description: Ignored; kept for older CLIs.
       responses:
         "200":
-          $ref: "#/components/responses/Job"
+          description: The job started, or the one already downloading that commit from this node (follow it with /v1/jobs/{id}).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job]
+                properties:
+                  job:
+                    type: integer
+                    description: Job id on the node that answered.
+                  attached:
+                    type: boolean
+                    description: True when this repo and commit were already downloading from this node; `job` is that download.
         default:
           $ref: "#/components/responses/Error"
 
