@@ -190,3 +190,29 @@ pushes 7.5–7.8 GB/s while each Spark records 15–27 M ECN marks and
 13–24 K sequence errors. Incast costs a source ~15%; the end of a load
 is set by the slower Spark disks (4.2–4.4 GB/s), which only placement
 (fewer bytes on them) can change.
+
+### MiMo V2.6 Pro after the plan fix (2026-10-22)
+
+The first MiMo V2.6 Pro TP6 push stalled at ~0.27 GB/s per Spark rank: its
+down-projection scales landed as 10–11 B runs 12 B apart, which never
+merge, so each 1 MiB slot carried ~1,877 fragments and the engine copied
+them out one at a time. CuteAFD made the scales contiguous (2.9 fragments
+per Spark slot through the real packer, full 1 MiB payload, 51 GB/s
+packing per source) and batched the copy-out. Load 4132356212719654,
+production 0.6.4, 475 GB over 7 sources to 8 ranks:
+
+| | Bytes | Done | Rate |
+|---|---|---|---|
+| each Spark rank (6) | 74.4–74.6 GB | 15.15 s | 4.9 GB/s |
+| raptor ranks 6, 7 | 15.6, 13.0 GB | 15.15 s | |
+| raptor source (10 files) | 63.5 GB | 8.5 s | 7.5 GB/s |
+| ostrich, dodo, emu, kiwi (14 files each) | 48.9 GB each | 9.0–10.0 s | 4.9–5.4 GB/s |
+| rhea (32 files) | 111.7 GB | 15.15 s | 7.4 GB/s |
+| moa (30 files) | 104.7 GB | 14.8 s | 7.1 GB/s |
+
+All 475 GB in 15.15 s (31.4 GB/s; 42–46 GB/s while all seven sources ran).
+Every ring kept 61–63 of its 64 grants free, so no rank held a source back.
+The last 5 s are rhea and moa alone at ~8 GB/s each: they hold more than
+twice the bytes of the other Sparks. Placed in proportion to each source's
+rate here, the same 475 GB would end in ~11 s; that is placement, not push. Two dips (at 4.0
+and 6.0 s) slowed every source but emu at once, to 1–4 GB/s for a bin or two.
