@@ -155,6 +155,42 @@ impl Default for FabricConfig {
 /// A refused dial's reason when both ends dialled at once (see `accept`).
 const SIMULTANEOUS: &str = "simultaneous dial";
 
+/// A refused dial's reason when the two hosts have no RoCE subnet in
+/// common: on a star fabric (ADR-070) two spokes reach each other only
+/// through the hub's IP forwarding, never by RDMA.
+const NO_SHARED_SUBNET: &str = "no rail shares a subnet";
+
+/// How long a peer stays known as unreachable by RDMA before a dial is
+/// tried again, in case its rails changed.
+const NO_PATH_RECHECK: Duration = Duration::from_secs(600);
+
+/// Peers with no RDMA path from this host, and when that was learned: they
+/// refused our offer, or we refused theirs, because no rail shares a subnet.
+#[derive(Default)]
+struct NoPath(Mutex<HashMap<NodeId, std::time::Instant>>);
+
+impl NoPath {
+    /// Record `peer` as unreachable; true when that is news (never known,
+    /// or known so long ago that it was being checked again).
+    fn record(&self, peer: NodeId, now: std::time::Instant) -> bool {
+        let fresh = !self.known(peer, now);
+        self.0.lock().insert(peer, now);
+        fresh
+    }
+
+    fn known(&self, peer: NodeId, now: std::time::Instant) -> bool {
+        self.0
+            .lock()
+            .get(&peer)
+            .is_some_and(|at| now.saturating_duration_since(*at) < NO_PATH_RECHECK)
+    }
+
+    /// A link was made after all (the rails changed): reachable again.
+    fn forget(&self, peer: NodeId) {
+        self.0.lock().remove(&peer);
+    }
+}
+
 /// The protocol links speak: the lower of the two hosts'.
 /// 2: imm carries the whole slot id, the length is the completion's count.
 /// 3: remote writes pulled by the owner (`WriteReq`/`WriteDone`).
@@ -737,6 +773,8 @@ pub struct Fabric {
     retry: Mutex<HashMap<NodeId, (std::time::Instant, Duration)>>,
     /// Link setups started (dialled), successful or not.
     attempts: AtomicU64,
+    /// Peers no rail of ours shares a subnet with (ADR-070).
+    no_path: NoPath,
     /// Waiters by (device, landing slot), with the lane the request used.
     pending: Mutex<HashMap<(u32, u32), Waiter>>,
     /// Staging slots held until their write-with-imm completes.
@@ -912,6 +950,7 @@ impl Fabric {
             connecting: Mutex::new(HashMap::new()),
             retry: Mutex::new(HashMap::new()),
             attempts: AtomicU64::new(0),
+            no_path: NoPath::default(),
             pending: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             source: Mutex::new(None),
@@ -1099,6 +1138,31 @@ impl Fabric {
             .is_some_and(|l| l.lanes.iter().all(|x| !x.dead.load(Ordering::SeqCst)))
     }
 
+    /// Whether `peer` has no RDMA path from this host: no rail of ours
+    /// shares a subnet with any of its rails (ADR-070). Learned at the first
+    /// link setup either way, and checked again after `NO_PATH_RECHECK`.
+    pub fn unpairable(&self, peer: NodeId) -> bool {
+        self.no_path.known(peer, std::time::Instant::now())
+    }
+
+    /// Whether this host knows how it reaches `peer`: a working link, or
+    /// none possible. `false` before the first link setup with it.
+    pub fn knows_path(&self, peer: NodeId) -> bool {
+        self.live_link(peer).is_some() || self.unpairable(peer)
+    }
+
+    /// Set up a link with `peer` unless there is one, so `unpairable` and
+    /// `has_link` answer for it. A failure is the link's, as for a read.
+    pub async fn probe(&self, peer: NodeId) {
+        let _ = self.link(peer).await;
+    }
+
+    fn learn_no_path(&self, peer: NodeId) {
+        if self.no_path.record(peer, std::time::Instant::now()) {
+            tracing::info!(%peer, "no RDMA path: no rail shares a subnet; its data goes over TCP");
+        }
+    }
+
     // ------------------------------------------------------------ lanes
 
     fn new_lane(&self, rail: &Rail, peer: NodeId) -> std::io::Result<Arc<Lane>> {
@@ -1214,8 +1278,10 @@ impl Fabric {
             made.push((rail.clone(), lane));
         }
         if made.is_empty() {
-            return FabricResp::Refused("no rail shares a subnet".into());
+            self.learn_no_path(peer);
+            return FabricResp::Refused(NO_SHARED_SUBNET.into());
         }
+        self.no_path.forget(peer);
         let link = Arc::new(Link {
             lanes: made.into_iter().map(|(_, l)| l).collect(),
             next: AtomicU32::new(0),
@@ -1300,6 +1366,9 @@ impl Fabric {
         if let Some(l) = self.live_link(peer) {
             return Ok(l);
         }
+        if self.unpairable(peer) {
+            return Err(no_path_error(peer));
+        }
         if let Some((at, _)) = self.retry.lock().get(&peer)
             && std::time::Instant::now() < *at
         {
@@ -1336,8 +1405,11 @@ impl Fabric {
                 if let Some((at, _)) = self.retry.lock().get_mut(&peer) {
                     *at = std::time::Instant::now();
                 }
+                self.no_path.forget(peer);
                 Ok(link)
             }
+            // No rail in common: not a failure to retry or warn about.
+            Err(e) if self.unpairable(peer) => Err(e),
             Err(e) => {
                 let wait = self.back_off(peer);
                 tracing::warn!(%peer, error = %e, retry_in = ?wait, "RDMA link setup failed");
@@ -1417,6 +1489,10 @@ impl Fabric {
                 Ok(FabricResp::Refused(why)) => {
                     for l in &lanes {
                         self.lanes.lock().remove(&l.id);
+                    }
+                    if why == NO_SHARED_SUBNET {
+                        self.learn_no_path(peer);
+                        return Err(no_path_error(peer));
                     }
                     return Err(NestError::Unavailable(format!(
                         "peer refused RDMA link: {why}"
@@ -2429,6 +2505,10 @@ fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
 
 /// The protocol a refusal says the peer speaks ("… (this host speaks N)",
 /// as every host since protocol 2 words it).
+fn no_path_error(peer: NodeId) -> NestError {
+    NestError::Unavailable(format!("no RDMA path to {peer}: {NO_SHARED_SUBNET}"))
+}
+
 fn peer_protocol(why: &str) -> Option<u32> {
     let rest = &why[why.find("speaks ")? + "speaks ".len()..];
     rest[..rest
@@ -2504,6 +2584,28 @@ mod tests {
             peer_protocol("read protocol 1 (this host speaks 17)"),
             Some(17)
         );
-        assert_eq!(peer_protocol("no rail shares a subnet"), None);
+        assert_eq!(peer_protocol(NO_SHARED_SUBNET), None);
+    }
+
+    #[test]
+    fn a_peer_without_a_shared_subnet_is_known_until_the_recheck() {
+        let p = NoPath::default();
+        let (a, b) = (NodeId(2), NodeId(3));
+        let t0 = std::time::Instant::now();
+        assert!(!p.known(a, t0));
+        // News once; telling it again within the window is not.
+        assert!(p.record(a, t0));
+        assert!(!p.record(a, t0 + Duration::from_secs(1)));
+        assert!(p.known(a, t0 + Duration::from_secs(1)));
+        assert!(!p.known(b, t0 + Duration::from_secs(1)));
+        // The last record counts: known until NO_PATH_RECHECK after it.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(p.known(a, t1 + NO_PATH_RECHECK - Duration::from_secs(1)));
+        assert!(!p.known(a, t1 + NO_PATH_RECHECK));
+        // Learned again after the recheck: news again.
+        assert!(p.record(a, t1 + NO_PATH_RECHECK));
+        // A link made after all forgets it.
+        p.forget(a);
+        assert!(!p.known(a, t1 + NO_PATH_RECHECK));
     }
 }
