@@ -206,9 +206,31 @@ pub struct FabricSection {
     /// cap). 0: 2 ms of this host's links, at least 64 MiB.
     #[serde(default)]
     pub inflight_mib: u64,
+    /// Landing slots per device (remote reads into this host land there),
+    /// each a 4 MiB chunk, pinned for the daemon's life. 0: the fabric's
+    /// default (128). A spoke of a star fabric reads from one hub within the
+    /// incast cap and needs far fewer (ADR-071).
+    #[serde(default)]
+    pub client_slots: u32,
+    /// Staging slots per device (this host's answers to remote reads), each
+    /// a chunk. 0: the fabric's default (64).
+    #[serde(default)]
+    pub server_slots: u32,
 }
 
 impl FabricSection {
+    /// Apply this section to the fabric's configuration.
+    pub fn configure(&self, fc: &mut nest_fabric::FabricConfig) {
+        fc.devices = self.devices.clone();
+        fc.inflight_bytes = self.inflight_bytes();
+        if self.client_slots > 0 {
+            fc.client_slots = self.client_slots;
+        }
+        if self.server_slots > 0 {
+            fc.server_slots = self.server_slots;
+        }
+    }
+
     /// The incast cap in bytes (0: the fabric's default).
     pub fn inflight_bytes(&self) -> u64 {
         match (self.inflight_mib, self.max_inflight) {
@@ -395,6 +417,25 @@ mod tests {
         let cfg: Config = toml::from_str(old).unwrap();
         assert_eq!(cfg.cluster.members[0].lan, None);
         assert!(!toml::to_string(&cfg).unwrap().contains("lan ="));
+    }
+
+    #[test]
+    fn fabric_slots_override_only_when_set() {
+        let mut fc = nest_fabric::FabricConfig::default();
+        let (client, server) = (fc.client_slots, fc.server_slots);
+        FabricSection::default().configure(&mut fc);
+        assert_eq!((fc.client_slots, fc.server_slots), (client, server));
+        let f: FabricSection = toml::from_str(
+            r#"
+            devices = ["mlx5_0"]
+            client_slots = 32
+            server_slots = 16
+        "#,
+        )
+        .unwrap();
+        f.configure(&mut fc);
+        assert_eq!((fc.client_slots, fc.server_slots), (32, 16));
+        assert_eq!(fc.devices, vec!["mlx5_0".to_string()]);
     }
 
     #[test]

@@ -2426,3 +2426,16 @@ pairability (a schema change for one topology); a setting naming the hub (wrong 
 hubs linked to each other); routing RoCE through the hub's kernel (no flow control, every drop a
 retransmit timeout, and the hub's CPU instead of its NIC); a copy on every spoke with pushes fed
 from it (a full duplicate of each model per spoke).
+
+## ADR-071 — RDMA pool sizes in node.toml (2026-10-26)
+
+**Context.** Every opened device pins its pools for the daemon's life: 952 MiB at the defaults
+(4 MiB × 128 landing and 64 staging slots, plus the small and write tiers). On a DGX Spark that
+memory comes out of the same unified RAM an engine budgets as MemAvailable minus a margin. A
+spoke of a star fabric (ADR-070) reads from one hub within the incast cap (64 MiB in flight on a
+100-200G link, 16 chunks) and serves almost nothing, so most of those slots never fill.
+
+**Decision.** `[fabric] client_slots` and `server_slots` set the 4 MiB landing and staging slots
+per device (0: the fabric's defaults, 128 and 64). On a four-Spark star cell, 32 and 16 pin
+0.38 GiB instead of 0.94 GiB per Spark; a remote read stayed at 5.5 GB/s and a 17 GB clone at
+3.99 GB/s.
