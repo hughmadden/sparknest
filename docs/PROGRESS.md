@@ -3,6 +3,36 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+
+## 2026-10-26 — Composition contracts and artifact lifecycle foundation
+
+- Added `nest-model`: strict module parsing, canonical preparation/prefix keys,
+  separate qualification identity, complete operand-group last-wins selection,
+  and bounded exact indexed-safetensors export. Preserves canonical base shard
+  names, headers, tensor inventories and offsets. Exact FP8/E8M0 companions are
+  supported; conversion, recalibration and LoRA remain explicit unsupported cases.
+- Unchanged files can reuse immutable pinned objects through ordinary hardlinks;
+  changed shards are independent. Receipts bind payload/index identity without a
+  hash cycle and account copied, reused, logical and generated metadata bytes.
+- Added replicated preparation epochs, immutable generation pins, single-use
+  usage tokens, deferred reset IDs/cancellation and retained reproducibility
+  evidence (ADR-072). Pins fence unseal, ownership, last unlink and last eviction.
+  Physical-loss reporting makes affected artifacts unavailable while preserving
+  users; duplicate reports do not delete unpublished replacement bytes.
+- Incoming snapshots migrate/check before installation, including retained older
+  schemas. Synthetic tests cover namespace/lifecycle fencing, leader and holder
+  restart, missing sole copies, duplicate loss, token/reset replay and rejected
+  snapshot preservation. New metadata/wire variants are appended (ADR-018).
+- Verification: 30 exporter fixtures; focused metadata and in-process recovery
+  tests; all-target Clippy and release build. The complete workspace gate passed
+  on a Linux 7.0 ARM64 CPU sandbox: Linux 6.14 independently fails the unchanged
+  upstream TCP_RTO_MIN_US assertion. Container syscall/locked-memory and HF test
+  dependency prerequisites are recorded in `docs/TOOLING.md`.
+- This is a foundation, not an enabled preparation service. Next: merge the
+  committed hub-topology fork, bind immutable snapshot namespaces, implement the
+  manager/API/CLI and qualification/usage wrapper, then assigned model tests.
+  No model qualification or serving deployment is claimed by this step.
+
 ## 2026-10-21 — 0.6.0, 0.6.1, 0.6.2 released and deployed; first production push loads
 
 - 0.6.0 on all ten hosts (cassowary joined as an off-grid host, node 10),

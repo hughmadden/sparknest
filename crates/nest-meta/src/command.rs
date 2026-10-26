@@ -259,6 +259,15 @@ pub enum Command {
         name: String,
         value: Option<u64>,
     },
+    /// Preparation ownership, artifact pins and explicit usage leases.
+    Model(crate::composition::ModelCommand),
+    /// A holder has established that this copy is missing or damaged. Unlike
+    /// intentional eviction this must remove a fictitious last replica too.
+    LostReplica {
+        file: FileId,
+        generation: Generation,
+        store: StoreId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,4 +367,5 @@ pub enum Reply {
     Batch(Vec<Result<Reply, nest_types::NestError>>),
     /// Id of a newly cataloged backup (appended after format 1).
     Backup(u64),
+    Model(crate::composition::ModelReply),
 }

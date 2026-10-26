@@ -5,10 +5,11 @@ use std::path::Path;
 
 /// Bumped whenever the schema changes. Snapshots carry the version so a node
 /// never installs a snapshot it cannot read.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Migrations from version N to N+1, applied in order at open.
 const MIGRATIONS: &[(i64, &str)] = &[
+    // New migrations stay in ascending order below.
     (
         1,
         r#"
@@ -32,6 +33,39 @@ CREATE TABLE IF NOT EXISTS backups (
 CREATE TABLE IF NOT EXISTS groups (
     name    TEXT PRIMARY KEY,
     members TEXT NOT NULL
+) WITHOUT ROWID;
+"#,
+    ),
+    (
+        3,
+        r#"
+CREATE TABLE model_artifacts (
+    key TEXT PRIMARY KEY,
+    epoch INTEGER NOT NULL,
+    owner TEXT,
+    state TEXT NOT NULL CHECK(state IN ('preparing', 'ready', 'failed', 'retired', 'unavailable')),
+    publication TEXT,
+    reset_seq INTEGER NOT NULL DEFAULT 0,
+    reset_pending INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+CREATE TABLE model_pins (
+    key TEXT NOT NULL,
+    file INTEGER NOT NULL,
+    gen INTEGER NOT NULL,
+    PRIMARY KEY(key, file, gen)
+) WITHOUT ROWID;
+CREATE INDEX model_pins_file ON model_pins(file);
+CREATE TABLE model_users (
+    key TEXT NOT NULL,
+    lease TEXT NOT NULL,
+    released INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(key, lease)
+) WITHOUT ROWID;
+CREATE TABLE model_receipts (
+    key TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    receipt TEXT NOT NULL,
+    PRIMARY KEY(key, epoch)
 ) WITHOUT ROWID;
 "#,
     ),
@@ -179,7 +213,9 @@ pub fn open_read(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-fn init(conn: &Connection) -> rusqlite::Result<()> {
+/// Validate/migrate a database before it is installed as a state-machine
+/// snapshot as well as when opening a local database.
+pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     match version {
         0 => {

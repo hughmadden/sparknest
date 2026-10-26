@@ -18,6 +18,7 @@ fn format_is_pinned() {
     let s = SessionId(1);
     let g = Generation(1);
     let e = Epoch(1);
+    let epoch = 1;
     let cmds: Vec<(Command, &str)> = vec![
         (
             Command::Mkdir {
@@ -271,6 +272,21 @@ fn format_is_pinned() {
             },
             "SetSetting",
         ),
+        (
+            Command::Model(ModelCommand::Claim {
+                key: String::new(),
+                owner: String::new(),
+            }),
+            "Model",
+        ),
+        (
+            Command::LostReplica {
+                file: f,
+                generation: g,
+                store: StoreId(1),
+            },
+            "LostReplica",
+        ),
     ];
     for (i, (c, name)) in cmds.iter().enumerate() {
         assert_eq!(tag(c) as usize, i, "Command::{name} moved");
@@ -306,6 +322,56 @@ fn format_is_pinned() {
     assert_eq!(tag(&Reply::Revision(1)), 7);
     assert_eq!(tag(&Reply::FileIds(f)), 8);
     assert_eq!(tag(&Reply::Backup(1)), 10);
+    assert_eq!(tag(&Reply::Model(ModelReply::Epoch(1))), 11);
+    let model_commands = [
+        ModelCommand::Claim {
+            key: String::new(),
+            owner: String::new(),
+        },
+        ModelCommand::Pin {
+            key: String::new(),
+            owner: String::new(),
+            epoch: 1,
+            files: vec![],
+        },
+        ModelCommand::Publish {
+            key: String::new(),
+            owner: String::new(),
+            epoch: 1,
+            publication: String::new(),
+        },
+        ModelCommand::Stop {
+            key: String::new(),
+            owner: String::new(),
+            epoch: 1,
+            receipt: String::new(),
+        },
+        ModelCommand::Use {
+            key: String::new(),
+            epoch: 1,
+            lease: String::new(),
+        },
+        ModelCommand::Release {
+            key: String::new(),
+            epoch: 1,
+            lease: String::new(),
+        },
+        ModelCommand::Reset {
+            epoch,
+            key: String::new(),
+            when_idle: false,
+        },
+        ModelCommand::CancelReset {
+            epoch,
+            reset: 1,
+            key: String::new(),
+        },
+    ];
+    for (i, command) in model_commands.iter().enumerate() {
+        assert_eq!(tag(command) as usize, i, "ModelCommand moved");
+    }
+    assert_eq!(tag(&ModelReply::Epoch(1)), 0);
+    assert_eq!(tag(&ModelReply::Reset(1)), 1);
     let errs = [
         NestError::NotFound,
         NestError::Exists,

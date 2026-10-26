@@ -358,7 +358,7 @@ impl Vfs {
                 let action = if !opts.repair {
                     Action::Reported
                 } else {
-                    match self.retire(key, true).await {
+                    match self.retire(key).await {
                         Ok(()) if other == 0 => Action::Lost { to: None },
                         Ok(()) => Action::Retired,
                         Err(e) => Action::Failed {
@@ -411,7 +411,7 @@ impl Vfs {
             let action = if !opts.repair {
                 Action::Reported
             } else if other > 0 {
-                match self.retire(key, false).await {
+                match self.retire(key).await {
                     Ok(()) => {
                         let _ = store.delete(key);
                         Action::Retired
@@ -422,7 +422,7 @@ impl Vfs {
                 }
             } else {
                 // The only copy: keep any bytes, stop claiming a good copy.
-                match self.retire(key, true).await {
+                match self.retire(key).await {
                     Ok(()) if found == 0 => {
                         let _ = store.delete(key);
                         Action::Lost { to: None }
@@ -451,12 +451,11 @@ impl Vfs {
         Ok(report)
     }
 
-    async fn retire(&self, key: ObjectKey, allow_last: bool) -> NestResult<()> {
-        self.propose(Command::RetireReplica {
+    async fn retire(&self, key: ObjectKey) -> NestResult<()> {
+        self.propose(Command::LostReplica {
             file: key.file,
             generation: key.generation,
             store: self.me().live_store(),
-            allow_last,
         })
         .await
         .map(|_| ())

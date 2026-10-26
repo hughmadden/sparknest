@@ -364,6 +364,16 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             if embedded.last_log_id != want {
                 return Err(rusqlite::Error::InvalidQuery);
             }
+            // A retained snapshot may predate an additive schema upgrade even
+            // when every node now runs the new binary. Migrate and check the
+            // incoming copy before replacing the serving connection.
+            {
+                let incoming_db = nest_meta::open_write(&incoming)?;
+                if !nest_meta::fsck::check(&incoming_db)?.is_empty() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                incoming_db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            }
             let mut c = db.lock();
             c.restore(MAIN_DB, &incoming, None::<fn(rusqlite::backup::Progress)>)?;
             c.execute_batch(SM_SCHEMA)?;
@@ -464,5 +474,180 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
             meta,
             snapshot: SnapshotFile(path),
         })
+    }
+}
+
+#[cfg(test)]
+mod schema_upgrade_tests {
+    use super::*;
+    use nest_meta::{Command, ModelCommand};
+    use nest_types::{FileId, NodeId, Timestamp};
+
+    #[tokio::test]
+    async fn installing_a_retained_v3_snapshot_migrates_before_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sm = StateMachine::open(dir.path(), Arc::new(|_: &SmEvent| {})).unwrap();
+        let incoming = sm.snap_dir().join("incoming-old.sqlite");
+        {
+            let c = nest_meta::open_write(&incoming).unwrap();
+            c.execute_batch(SM_SCHEMA).unwrap();
+            c.execute(
+                "INSERT INTO sm_state (k, v) VALUES ('snapshot_id', ?1)",
+                [b"old".as_slice()],
+            )
+            .unwrap();
+            let now = Timestamp(1);
+            let reply = nest_meta::apply(
+                &c,
+                &Command::Create {
+                    parent: FileId::ROOT,
+                    name: b"fixture".to_vec(),
+                    perm: 0o644,
+                    node: NodeId(1),
+                    exclusive: true,
+                    now,
+                },
+            )
+            .unwrap()
+            .0
+            .unwrap();
+            let Reply::Created(a) = reply else {
+                panic!("create")
+            };
+            nest_meta::apply(
+                &c,
+                &Command::Finalize {
+                    file: a.attr.id,
+                    epoch: a.attr.epoch,
+                    size: 0,
+                    mtime: now,
+                    now,
+                },
+            )
+            .unwrap()
+            .0
+            .unwrap();
+            c.execute_batch("DROP TABLE model_artifacts; DROP TABLE model_pins; DROP TABLE model_users; DROP TABLE model_receipts; PRAGMA user_version = 3; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let (meta, _) = snapshot_meta_of(&incoming).unwrap().unwrap();
+        sm.install_snapshot(&meta, SnapshotFile(incoming))
+            .await
+            .unwrap();
+        let c = sm.db.lock();
+        assert_eq!(
+            c.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            nest_meta::schema::SCHEMA_VERSION
+        );
+        let file = nest_meta::query::lookup(&c, FileId::ROOT, b"fixture")
+            .unwrap()
+            .unwrap();
+        nest_meta::apply(
+            &c,
+            &Command::AcquireOwner {
+                file,
+                node: NodeId(1),
+                expect_gen: nest_types::Generation(1),
+                truncate: true,
+                now: Timestamp(2),
+            },
+        )
+        .unwrap()
+        .0
+        .unwrap();
+        nest_meta::apply(
+            &c,
+            &Command::Unlink {
+                parent: FileId::ROOT,
+                name: b"fixture".to_vec(),
+                now: Timestamp(3),
+            },
+        )
+        .unwrap()
+        .0
+        .unwrap();
+        nest_meta::apply(
+            &c,
+            &Command::Model(ModelCommand::Claim {
+                key: "fixture".into(),
+                owner: "worker".into(),
+            }),
+        )
+        .unwrap()
+        .0
+        .unwrap();
+        assert!(nest_meta::fsck::check(&c).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_snapshots_preserve_the_live_database_and_snapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let resyncs = Arc::new(AtomicUsize::new(0));
+        let seen = resyncs.clone();
+        let mut sm = StateMachine::open(
+            dir.path(),
+            Arc::new(move |event: &SmEvent| {
+                if matches!(event, SmEvent::Resync { .. }) {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        )
+        .unwrap();
+        nest_meta::apply(
+            &sm.db.lock(),
+            &Command::Model(ModelCommand::Claim {
+                key: "live".into(),
+                owner: "worker".into(),
+            }),
+        )
+        .unwrap()
+        .0
+        .unwrap();
+        sm.get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let before = sm.current.lock().as_ref().unwrap().path.clone();
+        for future in [true, false] {
+            let incoming = sm.snap_dir().join("incoming-invalid.sqlite");
+            {
+                let c = nest_meta::open_write(&incoming).unwrap();
+                c.execute_batch(SM_SCHEMA).unwrap();
+                c.execute(
+                    "INSERT INTO sm_state (k, v) VALUES ('snapshot_id', ?1)",
+                    [b"bad".as_slice()],
+                )
+                .unwrap();
+                if future {
+                    c.pragma_update(None, "user_version", nest_meta::schema::SCHEMA_VERSION + 1)
+                        .unwrap();
+                } else {
+                    c.execute(
+                        "INSERT INTO model_pins (key, file, gen) VALUES ('absent', 42, 1)",
+                        [],
+                    )
+                    .unwrap();
+                }
+                c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            let (meta, _) = snapshot_meta_of(&incoming).unwrap().unwrap();
+            assert!(
+                sm.install_snapshot(&meta, SnapshotFile(incoming.clone()))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(sm.current.lock().as_ref().unwrap().path, before);
+            assert!(before.exists());
+            assert!(
+                nest_meta::composition::get(&sm.db.lock(), "live")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(nest_meta::fsck::check(&sm.db.lock()).unwrap().is_empty());
+            assert_eq!(resyncs.load(Ordering::SeqCst), 0);
+            std::fs::remove_file(incoming).unwrap();
+        }
     }
 }

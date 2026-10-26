@@ -91,6 +91,25 @@ pub fn check(c: &Connection) -> rusqlite::Result<Vec<String>> {
         "SELECT printf('file %d', f.id) FROM files f WHERE f.kind != 1 AND (f.gen_state != 0 OR f.owner IS NOT NULL OR f.sealed != 0)",
         "lifecycle state on non-regular file",
     )?;
+    q(
+        "SELECT printf('%s file %d gen %d', p.key, p.file, p.gen) FROM model_pins p \
+         LEFT JOIN files f ON f.id = p.file LEFT JOIN model_artifacts a ON a.key = p.key \
+         WHERE f.id IS NULL OR f.kind != 1 OR f.gen != p.gen OR f.gen_state != 0 \
+         OR f.sealed != 1 OR f.nlink = 0 OR a.key IS NULL OR a.state NOT IN ('preparing', 'ready', 'unavailable') \
+         OR (a.state = 'ready' AND NOT EXISTS (SELECT 1 FROM replicas r WHERE r.file = p.file AND r.gen = p.gen AND r.state = 1))",
+        "invalid prepared-artifact pin",
+    )?;
+    q(
+        "SELECT a.key FROM model_artifacts a WHERE \
+         (a.state = 'preparing') != (a.owner IS NOT NULL) OR \
+         (a.state = 'ready' AND (a.publication IS NULL OR NOT EXISTS (SELECT 1 FROM model_pins p WHERE p.key = a.key)))",
+        "invalid prepared-artifact state",
+    )?;
+    q(
+        "SELECT printf('%s lease %s', u.key, u.lease) FROM model_users u LEFT JOIN model_artifacts a \
+         ON a.key = u.key WHERE u.released = 0 AND (a.key IS NULL OR a.state NOT IN ('ready', 'unavailable'))",
+        "usage lease without a ready artifact",
+    )?;
     // Directory cycles: walk parents from every directory.
     let dirs: Vec<(i64, i64)> = c
         .prepare("SELECT id, parent FROM files WHERE kind = 2")?

@@ -13,6 +13,7 @@
 
 mod apply;
 mod command;
+pub mod composition;
 mod effect;
 pub mod fsck;
 pub mod query;
@@ -24,5 +25,6 @@ pub use apply::apply;
 /// replies, snapshots). A node refuses state written in another version.
 pub const FORMAT_VERSION: u32 = 1;
 pub use command::{Command, CreateReply, LockKind, RenameFlags, Reply, SealPolicy, StoreClass};
+pub use composition::{ModelCommand, ModelReply};
 pub use effect::Effect;
 pub use schema::{open_memory, open_read, open_write};

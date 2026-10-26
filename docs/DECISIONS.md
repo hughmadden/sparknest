@@ -2394,3 +2394,79 @@ load it through the mount. Two more gaps sat behind that one:
 stream: the gateway's fast disk would wait on the slow one. A per-source
 cap on grants: a fixed number is wrong for one source and for eight;
 fewest-held adapts to however many there are.
+
+## ADR-072 — Prepared model artifacts and immutable generation pins (2026-10-26)
+
+**Context.** An engine should load one complete checkpoint whose weights were
+selected from a pinned base and ordered alternate sources. Preparation is an
+explicit control-plane job, completed before acquiring serving hardware. The
+filesystem and push hot paths continue to serve ordinary whole-file generations.
+
+**Decision.**
+
+- A versioned module declares immutable content identities, complete operand
+  groups, ordered absolute replacements, explicit required references, a pinned
+  adapter recipe and a destination loader profile. The last selected source
+  wins for an entire group, including numerical companions. The base supplies
+  architecture, configuration, tokenizer and unselected groups. Full alternate
+  checkpoints replace all groups unless a selection is explicitly declared.
+- Start with bounded CPU export of byte-compatible indexed safetensors. Preserve
+  canonical shard names, tensor inventory, types and layout. Other conversions,
+  calibration and LoRA operations require separately implemented, deterministic,
+  qualified adapters; unsupported operations fail explicitly.
+- Preparation keys use versioned canonical encoding of verified content,
+  selections, references and byte-affecting recipe/profile inputs. Friendly
+  names and paths are excluded. Qualification identity is separate. Hash payload
+  files before writing their digest into index metadata; hash the final index in
+  a publication receipt that does not hash itself.
+- This narrowly extends ADR-008 for preparation provenance only. The artifact
+  catalog may retain opaque preparation/publication identities. File metadata,
+  replica identity, transfer acceptance and RDMA messages gain no checksums,
+  chunks or hash-addressed storage. PROPOSAL §11's whole-file invariants remain.
+- Replicated preparation ownership uses an explicit owner identity and increasing
+  epoch. Competing owners are refused; every pin, completion and cancellation
+  checks both owner and epoch. Worker death stays blocked until actual cleanup
+  is established; elapsed time never proves that a process has stopped.
+- Exact `(file_id, generation)` pins require named, sealed, STABLE files with a
+  live replica. Pins prevent unseal, mutation, removal of the last namespace
+  reference and eviction of the last replica, even an ordinary forced eviction.
+  Redundant replicas may still be retired. Shared dependencies remain protected
+  until every referring artifact releases its pin.
+- READY publication is one metadata transaction after verification, durable
+  output registration and sealing. The worker pins inputs before reading and
+  output generations before publication. The metadata layer enforces generation
+  availability; the manager is responsible for format/numerical verification,
+  quota admission, staging intents and evidence of completed worker cleanup.
+- Explicit usage leases survive daemon restart and are released only after the
+  caller's model/rank cleanup. They include the artifact epoch, fencing delayed
+  releases after a rebuild. Acquisition tokens are single-use: released tokens
+  remain tombstoned, preventing delayed releases/acquisitions and concurrent
+  users from sharing one protection. No heartbeat timeout deletes mapped weights.
+- Reset retires derived catalog entries and releases their pins; it does not
+  delete input checkpoints or receipts. Owned/used entries refuse reset unless
+  an explicit deferred reset is queued; new users cannot enter a pending reset.
+  Resetting a shared key affects all references. Reclamation separately proves
+  derived ownership and lack of other references. No live force-delete exists.
+  Each reset has a monotonic identity; cancellation matches it and the artifact
+  epoch, so a delayed cancellation cannot remove a subsequently queued reset.
+- Physical loss is distinct from intentional eviction. A holder's loss report
+  removes the fictitious replica even if pinned, marks affected READY artifacts
+  unavailable and retains their pins and active users. Restoration requires
+  verified rebuild; finding a file alone does not restore READY.
+- Retain the original publication identity through reset. Rebuilding the same
+  preparation key with different bytes is NON_REPRODUCIBLE_PREPARATION, never a
+  replacement of a prior result. Failures keep their receipt references.
+- Schema migration adds artifact, pin, usage and receipt tables. Persisted
+  Command and Reply variants are appended; existing variants/fields stay fixed
+  (ADR-018). A mixed-version deployment is not authorized by these additions;
+  nodes using the new commands must all understand them before enablement.
+  Retained older snapshots are migrated and checked before installation, not
+  just on local database open.
+
+**Consequences.** No inference arithmetic or tensor-layer runtime enters the
+engine. Consumer code changes require separate approval. All initial tests use
+synthetic generic checkpoints. Private checkpoint identities, operator module
+files, host paths and qualification receipts stay outside public source history.
+The first metadata/planner increment alone is not an enabled preparation service:
+API orchestration, resource admission, worker cancellation/recovery and external
+usage-wrapper integration must pass their gates before live promotion.

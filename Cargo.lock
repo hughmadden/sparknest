@@ -1124,6 +1124,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nest-model"
+version = "0.6.5"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "nest-place"
 version = "0.6.5"
 dependencies = [

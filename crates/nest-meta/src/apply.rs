@@ -16,7 +16,7 @@ pub(crate) const FLAG_READ_SCATTERED: i64 = 1 << 10;
 /// Always passthrough where a complete local copy exists (ADR-053).
 pub(crate) const FLAG_PASSTHROUGH: i64 = 1 << 11;
 
-enum Fail {
+pub(crate) enum Fail {
     Nest(NestError),
     Sql(rusqlite::Error),
 }
@@ -32,9 +32,9 @@ impl From<rusqlite::Error> for Fail {
     }
 }
 
-type R<T> = Result<T, Fail>;
+pub(crate) type R<T> = Result<T, Fail>;
 
-fn err<T>(e: NestError) -> R<T> {
+pub(crate) fn err<T>(e: NestError) -> R<T> {
     Err(Fail::Nest(e))
 }
 
@@ -78,6 +78,23 @@ fn apply_one(
 
 fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
     match cmd {
+        Command::Model(command) => crate::composition::exec(c, command),
+        Command::LostReplica {
+            file,
+            generation,
+            store,
+        } => {
+            // Physical loss is a fact, not permission to evict good bytes.
+            // Keep artifact/usage pins but stop advertising unusable READY work.
+            let result = retire_replica_lost(c, *file, *generation, *store, fx)?;
+            c.execute(
+                "UPDATE model_artifacts SET state = 'unavailable' WHERE state = 'ready' AND key IN \
+                (SELECT key FROM model_pins WHERE file = ?1 AND gen = ?2) AND NOT EXISTS \
+                (SELECT 1 FROM replicas WHERE file = ?1 AND gen = ?2 AND state = 1)",
+                params![file.0 as i64, generation.0 as i64],
+            )?;
+            Ok(result)
+        }
         Command::Mkdir {
             parent,
             name,
@@ -510,6 +527,11 @@ fn insert_file(
 /// A name for `f` was removed. Drop its link count and, at zero, orphan or
 /// delete the object.
 fn drop_link(c: &Connection, f: FileId, now: Timestamp, fx: &mut Vec<Effect>) -> R<()> {
+    if attr(c, f)?.nlink <= 1 && crate::composition::is_pinned(c, f)? {
+        return err(NestError::Busy(
+            "generation is pinned by a prepared artifact".into(),
+        ));
+    }
     let n = add_nlink(c, f, -1)?;
     touch_ctime(c, f, now, fx)?;
     if n <= 0 {
@@ -535,6 +557,11 @@ fn orphan_or_delete(c: &Connection, f: FileId, fx: &mut Vec<Effect>) -> R<()> {
 }
 
 fn delete_file(c: &Connection, f: FileId, fx: &mut Vec<Effect>) -> R<()> {
+    if crate::composition::is_pinned(c, f)? {
+        return err(NestError::Busy(
+            "generation is pinned by a prepared artifact".into(),
+        ));
+    }
     let a = attr(c, f)?;
     for r in query::replicas(c, f)? {
         fx.push(Effect::ReplicaInvalidated {
@@ -1016,6 +1043,11 @@ fn acquire_owner(
     fx: &mut Vec<Effect>,
 ) -> R<Reply> {
     let a = attr(c, file)?;
+    if crate::composition::is_pinned(c, file)? {
+        return err(NestError::Busy(
+            "generation is pinned by a prepared artifact".into(),
+        ));
+    }
     match a.kind {
         FileKind::Regular => {}
         FileKind::Directory => return err(NestError::IsDir),
@@ -1172,6 +1204,11 @@ fn seal(
     now: Timestamp,
     fx: &mut Vec<Effect>,
 ) -> R<Reply> {
+    if !sealed && crate::composition::is_pinned(c, file)? {
+        return err(NestError::Busy(
+            "generation is pinned by a prepared artifact".into(),
+        ));
+    }
     let a = attr(c, file)?;
     if a.kind != FileKind::Regular {
         return err(NestError::Invalid(
@@ -1232,7 +1269,10 @@ fn retire_replica(
         return err(NestError::NotFound);
     }
     let a = attr(c, file)?;
-    if !allow_last && a.gen_state == GenState::Stable && a.generation == generation {
+    if (!allow_last || crate::composition::is_pinned(c, file)?)
+        && a.gen_state == GenState::Stable
+        && a.generation == generation
+    {
         let live: i64 = c
             .prepare_cached(
                 "SELECT COUNT(*) FROM replicas WHERE file = ?1 AND gen = ?2 AND state = 1",
@@ -1242,13 +1282,28 @@ fn retire_replica(
             return err(NestError::Busy("last live copy".into()));
         }
     }
-    c.prepare_cached("DELETE FROM replicas WHERE file = ?1 AND gen = ?2 AND store = ?3")?
+    retire_replica_lost(c, file, generation, store, fx)
+}
+
+fn retire_replica_lost(
+    c: &Connection,
+    file: FileId,
+    generation: Generation,
+    store: StoreId,
+    fx: &mut Vec<Effect>,
+) -> R<Reply> {
+    let removed = c
+        .prepare_cached("DELETE FROM replicas WHERE file = ?1 AND gen = ?2 AND store = ?3")?
         .execute(params![file.0 as i64, generation.0 as i64, store.0 as i64])?;
-    fx.push(Effect::ReplicaInvalidated {
-        file,
-        generation,
-        store,
-    });
+    // A duplicate physical-loss report must not delete replacement bytes that
+    // have landed under this generation but have not yet been published.
+    if removed != 0 {
+        fx.push(Effect::ReplicaInvalidated {
+            file,
+            generation,
+            store,
+        });
+    }
     Ok(Reply::Done)
 }
 

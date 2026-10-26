@@ -19,6 +19,25 @@ Add a row the moment a new tool is introduced.
 
 Homebrew (`/home/linuxbrew/.linuxbrew`) is the preferred way to add tools.
 
+## Container test prerequisites
+
+- A minimal Rust toolchain needs `rustup component add clippy --toolchain 1.98.1`
+  and `rustfmt` for the required gates.
+- Direct-write tests need an io_uring-capable kernel and a container syscall
+  policy permitting io_uring, plus sufficient locked memory. Default Docker
+  seccomp policies can refuse it even when the host supports it.
+- Raise the open-file soft limit to the hard limit, as `scripts/build.sh --check`
+  does. Docker can inherit a 1024-descriptor soft limit; long in-process cluster
+  suites otherwise exhaust it while opening nodes' SQLite databases.
+- The control-socket test requires TCP_RTO_MIN_US. Some 6.14 kernels lack it
+  despite the test's version assertion; use a kernel that implements it rather
+  than treating a version string as capability evidence.
+- HF cache sharing tests require `huggingface_hub==2.2.0`; its HTTP dependencies
+  include `httpx2==2.0.0` and `httpcore2==2.0.0`. Use reviewed, digest-verified
+  wheels in an isolated test environment, without updating the host's packages.
+- On CPU-limited containers, `cargo test --workspace -- --test-threads=1`
+  keeps independent Raft timing tests from exhausting the container's CPU turn.
+
 ## When ghcr.io downloads stall
 
 Homebrew bottles come from ghcr.io, which sometimes resets long transfers

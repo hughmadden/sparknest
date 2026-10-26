@@ -687,11 +687,10 @@ impl DataNode {
             tracing::error!(?k, "replica missing from local store; retiring it");
             let r = self
                 .meta()
-                .propose(nest_meta::Command::RetireReplica {
+                .propose(nest_meta::Command::LostReplica {
                     file: k.file,
                     generation: k.generation,
                     store: self.id.live_store(),
-                    allow_last: true,
                 })
                 .await;
             if let Err(e) = r {
