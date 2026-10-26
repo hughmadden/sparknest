@@ -299,8 +299,7 @@ impl Node {
             (crate::config::FabricMode::Tcp, _) | (_, None) => None,
             (mode, Some(fc)) => {
                 let mut fc = fc.clone();
-                fc.devices = cfg.fabric.devices.clone();
-                fc.inflight_bytes = cfg.fabric.inflight_bytes();
+                cfg.fabric.configure(&mut fc);
                 match nest_fabric::Fabric::start(id, fc, rpc.clone()) {
                     Ok(Some(f)) => {
                         vfs.attach_fabric(f.clone());
@@ -359,8 +358,7 @@ impl Node {
             // looking for a while instead of staying on TCP until restart.
             let (slot, rpc2, vfs2) = (Arc::downgrade(&fabric), rpc.clone(), vfs.clone());
             let mut fc = tuning.fabric.clone().expect("checked");
-            fc.devices = cfg.fabric.devices.clone();
-            fc.inflight_bytes = cfg.fabric.inflight_bytes();
+            cfg.fabric.configure(&mut fc);
             tokio::spawn(async move {
                 for _ in 0..40 {
                     tokio::time::sleep(Duration::from_secs(15)).await;

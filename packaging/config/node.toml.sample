@@ -33,6 +33,10 @@ members = [
 [fabric]
 mode = "auto"      # auto | rdma | tcp
 devices = []       # optional filter, e.g. ["mlx5_0"]
+# Pinned RDMA pools per device, in 4 MiB slots (0: 128 landing, 64
+# staging). A star fabric's spokes need far fewer (ADR-071).
+# client_slots = 32
+# server_slots = 16
 
 [fuse]
 allow_other = true # needs user_allow_other in /etc/fuse.conf

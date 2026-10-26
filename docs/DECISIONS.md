@@ -2395,6 +2395,51 @@ stream: the gateway's fast disk would wait on the slow one. A per-source
 cap on grants: a fixed number is wrong for one source and for eight;
 fewest-held adapts to however many there are.
 
+## ADR-070 — A star fabric: spokes reach only the hub by RDMA (2026-10-26)
+
+**Context.** A cell of one host (the hub) and DGX Sparks, each Spark cabled point to point to its
+own port on the hub, no switch. Every link is its own subnet; the Sparks route to each other only
+through the hub's IP forwarding. Hosts pair only rails that share a subnet (ADR-016), so two
+spokes never get an RDMA link, yet nothing told the data paths: read stripes went to spoke
+holders, a copy could take a spoke first in its per-file rotation, and every attempt was refused,
+logged and retried on the link backoff, while the bytes crossed the hub's kernel over TCP (one
+stream 7-26 Gb/s, against 109-121 Gb/s of RDMA per link). Each spoke's only cable is to the hub,
+so routing through it never adds bandwidth; it only costs the hub CPU.
+
+**Decision.**
+1. **The fabric remembers peers it cannot pair with.** A dial refused, or an offer refused,
+   because no rail shares a subnet marks the peer (`Fabric::unpairable`). Links to it then fail at
+   once, with no new QPs, backoff or warning, and are tried again after 10 minutes in case the rails
+   changed; a link made later clears the mark. Nothing changes where every pair shares a subnet.
+2. **Reads and copies use holders with a path.** Unpairable peers are not part of an RDMA spread
+   (`route_for`), sort after every fabric holder (beside off-grid ones), and are read like off-grid
+   hosts: TCP lanes, else the control connection, without an RDMA attempt. A handle whose stripe
+   holder turns out unpairable routes again. Before a copy chooses its source it sets up links in
+   its own order up to the first that works, so a spoke found unpairable moves behind the hub.
+3. **Placement on a star: one copy, on the hub.** `nest rule set NAME SEL --hosts HUB --auto`.
+   Every spoke then reads and push-loads that copy over its own link by RDMA: no copy per spoke and
+   no kernel forwarding. Data a spoke writes still lives on that spoke; another spoke reads it over
+   TCP through the hub, without retrying RDMA first.
+
+**Alternatives.** Publishing every host's rail subnets in the metadata so any host could compute
+pairability (a schema change for one topology); a setting naming the hub (wrong for two cells, or
+hubs linked to each other); routing RoCE through the hub's kernel (no flow control, every drop a
+retransmit timeout, and the hub's CPU instead of its NIC); a copy on every spoke with pushes fed
+from it (a full duplicate of each model per spoke).
+
+## ADR-071 — RDMA pool sizes in node.toml (2026-10-26)
+
+**Context.** Every opened device pins its pools for the daemon's life: 952 MiB at the defaults
+(4 MiB × 128 landing and 64 staging slots, plus the small and write tiers). On a DGX Spark that
+memory comes out of the same unified RAM an engine budgets as MemAvailable minus a margin. A
+spoke of a star fabric (ADR-070) reads from one hub within the incast cap (64 MiB in flight on a
+100-200G link, 16 chunks) and serves almost nothing, so most of those slots never fill.
+
+**Decision.** `[fabric] client_slots` and `server_slots` set the 4 MiB landing and staging slots
+per device (0: the fabric's defaults, 128 and 64). On a four-Spark star cell, 32 and 16 pin
+0.38 GiB instead of 0.94 GiB per Spark; a remote read stayed at 5.5 GB/s and a 17 GB clone at
+3.99 GB/s.
+
 ## ADR-072 — Prepared model artifacts and immutable generation pins (2026-10-26)
 
 **Context.** An engine should load one complete checkpoint whose weights were

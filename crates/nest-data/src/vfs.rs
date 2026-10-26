@@ -536,6 +536,13 @@ impl Vfs {
         self.fabric().map_or(0, |f| f.link_bytes_per_s())
     }
 
+    /// Whether `peer` is known to have no RDMA path from here (another
+    /// spoke of a star fabric, ADR-070): it is read and copied from over
+    /// TCP, after every holder with a path, and never takes a stripe.
+    fn unpairable(&self, peer: NodeId) -> bool {
+        self.fabric().is_some_and(|f| f.unpairable(peer))
+    }
+
     /// The other fabric hosts a STABLE generation can be read from over
     /// RDMA (`None`: none, or no fabric).
     fn route_for(&self, a: &FileAttr) -> Option<Route> {
@@ -556,8 +563,10 @@ impl Vfs {
                     && NodeId(r.store.0) != me
             })
             .map(|r| NodeId(r.store.0))
-            // Off-grid hosts are not on the fabric: never part of a spread.
-            .filter(|n| !offgrid.contains(n))
+            // Off-grid hosts are not on the fabric, and hosts no rail of
+            // ours shares a subnet with have no RDMA path (ADR-070): never
+            // part of a spread.
+            .filter(|n| !offgrid.contains(n) && !self.unpairable(*n))
             .map(Source::Peer)
             .collect();
         (!sources.is_empty()).then_some(Route { sources })
@@ -619,7 +628,12 @@ impl Vfs {
         let crate::balance::Source::Peer(node) = ticket.source() else {
             return None;
         };
-        let reservation = fab.reserve(node, len.max(1))?;
+        let Some(reservation) = fab.reserve(node, len.max(1)) else {
+            if fab.unpairable(node) {
+                *h.route.lock() = None;
+            }
+            return None;
+        };
         Some(ScatteredRead {
             vfs: self.arc(),
             h,
@@ -724,11 +738,15 @@ impl Vfs {
     fn bulk_to(&self, peer: NodeId) -> Option<Arc<dyn crate::bulk::Bulk>> {
         let fabric = self.fabric();
         let lanes = self.lanes();
-        if (fabric.is_none() || self.offgrid_hosts().contains(&peer))
+        let no_rdma = self.unpairable(peer);
+        if (fabric.is_none() || no_rdma || self.offgrid_hosts().contains(&peer))
             && let Some(l) = &lanes
             && l.connected(peer) > 0
         {
             return Some(l.clone());
+        }
+        if no_rdma {
+            return None;
         }
         let fabric = fabric?;
         Some(match self.standby() {
@@ -1641,10 +1659,11 @@ impl Vfs {
             let k = (a.id.0 as usize) % nodes.len();
             nodes.rotate_left(k);
         }
-        // Off-grid holders answer over TCP: after every fabric holder (a
-        // stable sort keeps the rotation within each group).
+        // Off-grid holders answer over TCP, and so do hosts with no RDMA
+        // path from here (ADR-070): after every fabric holder (a stable sort
+        // keeps the rotation within each group).
         let offgrid = self.offgrid_hosts();
-        nodes.sort_by_key(|n| offgrid.contains(n));
+        nodes.sort_by_key(|n| offgrid.contains(n) || self.unpairable(*n));
         // Archive copies are read through their gateways, after live copies.
         for r in replicas.iter().filter(|r| crate::is_archive(r.store)) {
             if let Some((_, cfg)) = self.d.archive_row(r.store) {
@@ -2444,6 +2463,10 @@ impl Vfs {
                         // Fall through to the one-holder-at-a-time path.
                         Err(e) => {
                             ticket.fail();
+                            if self.unpairable(node) {
+                                // Route again without it (ADR-070).
+                                *h.route.lock() = None;
+                            }
                             last = e;
                         }
                     }
@@ -3126,12 +3149,15 @@ impl Vfs {
         copied: &Arc<AtomicU64>,
     ) -> NestResult<()> {
         dest.reserve_room(a.size).map_err(io)?;
-        let holders = self.holders(a)?;
-        let mut sources: Vec<Option<NodeId>> = Vec::new();
         let local = self.local_source(a).filter(|l| !Arc::ptr_eq(l, dest));
         // A local live copy goes first; a local archive copy only after the
         // live holders (see `own_read_source`).
         let local_first = self.own_read_source(a).is_some();
+        if !(local.is_some() && local_first) {
+            self.learn_paths(a).await?;
+        }
+        let holders = self.holders(a)?;
+        let mut sources: Vec<Option<NodeId>> = Vec::new();
         if local.is_some() && local_first {
             sources.push(None);
         }
@@ -3180,6 +3206,30 @@ impl Vfs {
         Err(last)
     }
 
+    /// Before a copy picks its source: a holder this host never linked with
+    /// may have no RDMA path from here (a star fabric's other spoke,
+    /// ADR-070). Set up links in the copy's own order up to the first that
+    /// works, so a holder found unreachable moves behind those with a path
+    /// and the copy comes over RDMA instead of TCP.
+    async fn learn_paths(&self, a: &FileAttr) -> NestResult<()> {
+        let Some(f) = self.fabric() else {
+            return Ok(());
+        };
+        let offgrid = self.offgrid_hosts();
+        for n in self.holders(a)? {
+            if offgrid.contains(&n) || f.unpairable(n) {
+                continue;
+            }
+            if !f.knows_path(n) {
+                f.probe(n).await;
+            }
+            if f.has_link(n) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     async fn copy_from(
         &self,
         src: NodeId,
@@ -3196,12 +3246,18 @@ impl Vfs {
         // Off the fabric (either end): TCP lanes, which need no slots. On
         // it: RDMA, or the standby lane while the RDMA link to `src` is
         // down (ADR-057).
+        let no_rdma = self.unpairable(src);
         let lanes = self.lanes().filter(|l| l.connected(src) > 0).filter(|_| {
             self.fabric().is_none()
+                || no_rdma
                 || self.offgrid_hosts().contains(&src)
                 || self.standby().is_some_and(|s| s.on_lane(src))
         });
-        let fab = if lanes.is_some() { None } else { self.fabric() };
+        let fab = if lanes.is_some() || no_rdma {
+            None
+        } else {
+            self.fabric()
+        };
         let chunk: u64 = match (&fab, &lanes) {
             (Some(f), _) => f.chunk() as u64,
             (None, Some(l)) => l.chunk() as u64,
