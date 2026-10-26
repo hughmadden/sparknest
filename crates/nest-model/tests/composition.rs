@@ -2019,3 +2019,252 @@ fn raw_reuse_pins_reject_replaced_bundle_files_before_staging() {
     );
     assert!(!output.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn detached_staging_crosses_filesystems_without_copying_reused_payloads() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = TempDir::new().unwrap();
+    let Ok(stage_parent) = tempfile::tempdir_in("/dev/shm") else {
+        return;
+    };
+    if fs::metadata(temp.path()).unwrap().dev() == fs::metadata(stage_parent.path()).unwrap().dev()
+    {
+        return;
+    }
+    let bp = temp.path().join("base-checkpoint");
+    let ap = temp.path().join("alternate-checkpoint");
+    split_snapshot(&bp, &[1, 2], &vec![7; 32768]);
+    split_snapshot(&ap, &[3, 4], &vec![7; 32768]);
+    fs::write(
+        ap.join("groups.json"),
+        br#"{"schema":"sparknest.model-selection.v1","groups":["a"]}"#,
+    )
+    .unwrap();
+    let base = inspect(&bp);
+    let alt = inspect(&ap);
+    let mut config = config(&base, &[(&alt, "producer-manifest")]);
+    config.cache.reuse_unchanged = true;
+    let staging = stage_parent.path().join("staging");
+    let staged = nest_model::export_staged(
+        &config,
+        &profile(false),
+        &base,
+        &[&alt],
+        &staging,
+        &ExportLimits::default(),
+    )
+    .unwrap();
+    assert!(!staging.join(SECOND).exists());
+    assert!(!staging.join("config.json").exists());
+    assert!(Snapshot::inspect(&staging, &ExportLimits::default()).is_err());
+    assert_eq!(
+        fs::read_dir(&staging).unwrap().count(),
+        staged.staged_files().len()
+    );
+    let allocated: u64 = fs::read_dir(&staging)
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().len())
+        .sum();
+    assert_eq!(allocated, staged.receipt.new_file_bytes);
+    assert!(allocated < staged.receipt.logical_file_bytes);
+    // Assemble ordinary complete files as the namespace manager must do. The
+    // source and destination are separate filesystems; unchanged payloads never
+    // visit the worker's native staging filesystem.
+    let assembled = temp.path().join("assembled");
+    fs::create_dir(&assembled).unwrap();
+    for name in &staged.receipt.reused_files {
+        fs::hard_link(bp.join(name), assembled.join(name)).unwrap();
+    }
+    for name in staged.staged_files() {
+        fs::copy(staging.join(&name), assembled.join(&name)).unwrap();
+    }
+    let complete = inspect(&assembled);
+    assert_eq!(complete.tensor_bytes("a", 2).unwrap(), [3, 4]);
+    assert_eq!(complete.tensor_bytes("b", 32768).unwrap(), vec![7; 32768]);
+    assert!(same_inode(&bp.join(SECOND), &assembled.join(SECOND)));
+    let native = temp.path().join("native");
+    let linked = export(
+        &config,
+        &profile(false),
+        &base,
+        &[&alt],
+        &native,
+        &ExportLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(linked.preparation_key, staged.receipt.preparation_key);
+    assert_eq!(linked.payload_manifest, staged.receipt.payload_manifest);
+    for name in linked
+        .files
+        .keys()
+        .chain(std::iter::once(&"composition.receipt.json".to_string()))
+    {
+        assert_eq!(
+            fs::read(native.join(name)).unwrap(),
+            fs::read(assembled.join(name)).unwrap()
+        );
+    }
+    // Admission is based on new regular-file bytes, independent of reused files.
+    config.cache.max_new_physical_bytes = allocated - 1;
+    let refused = stage_parent.path().join("refused");
+    assert!(
+        nest_model::export_staged(
+            &config,
+            &profile(false),
+            &base,
+            &[&alt],
+            &refused,
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+    assert!(!refused.exists());
+}
+
+#[test]
+fn detached_base_only_stages_metadata_and_full_copy_still_emits_a_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    snapshot(&bp, &[1], &[2]);
+    let base = inspect(&bp);
+    let mut config = config(&base, &[]);
+    config.cache.reuse_unchanged = true;
+    let staging = temp.path().join("staging");
+    let staged = nest_model::export_staged(
+        &config,
+        &profile(false),
+        &base,
+        &[],
+        &staging,
+        &ExportLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(staged.receipt.copied_file_bytes, 0);
+    assert_eq!(staged.receipt.copied_payload_bytes, 0);
+    assert_eq!(
+        staged.staged_files(),
+        BTreeSet::from([
+            "model.safetensors.index.json".into(),
+            "composition.payload.json".into(),
+            "composition.receipt.json".into()
+        ])
+    );
+    // Existing destinations refuse without replacing evidence.
+    let before = fs::read(staging.join("composition.receipt.json")).unwrap();
+    assert!(
+        nest_model::export_staged(
+            &config,
+            &profile(false),
+            &base,
+            &[],
+            &staging,
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read(staging.join("composition.receipt.json")).unwrap(),
+        before
+    );
+    config.cache.reuse_unchanged = false;
+    let copied = temp.path().join("copied");
+    let staged = nest_model::export_staged(
+        &config,
+        &profile(false),
+        &base,
+        &[],
+        &copied,
+        &ExportLimits::default(),
+    )
+    .unwrap();
+    assert!(staged.receipt.reused_files.is_empty());
+    assert_eq!(inspect(&copied).tensor_bytes("a", 1).unwrap(), [1]);
+}
+
+#[test]
+fn offline_worker_process_inspects_and_stages_without_publication() {
+    use nest_model::worker::{Input, OperandProfile, Request, Response};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    snapshot(&bp, &[1], &[2]);
+    let base = inspect(&bp);
+    let mut module = config(&base, &[]);
+    module.cache.reuse_unchanged = true;
+    let limits = ExportLimits {
+        metadata_bytes: 1024 * 1024,
+        ..ExportLimits::default()
+    };
+    let inspection = Request::Inspect {
+        inputs: vec![Input::Indexed { root: bp.clone() }],
+        limits: limits.clone(),
+    }
+    .run()
+    .unwrap();
+    let Response::Inspect { inputs } = inspection else {
+        panic!("inspection")
+    };
+    assert_eq!(inputs[0].content_manifest, *base.content_manifest());
+    let destination = temp.path().join("staging");
+    let request = Request::Stage {
+        module: Box::new(module),
+        profile: OperandProfile {
+            schema: "sparknest.operand-profile.v1".into(),
+            groups: profile(false)
+                .groups()
+                .iter()
+                .map(|(name, members)| (name.clone(), members.iter().cloned().collect()))
+                .collect(),
+            static_activation_calibration: false,
+        },
+        base: Input::Indexed { root: bp },
+        alternates: vec![],
+        destination: destination.clone(),
+        limits,
+    };
+    let bytes = serde_json::to_vec(&request).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nest-model-worker"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let Response::Stage { staged } = serde_json::from_slice(&output.stdout).unwrap() else {
+        panic!("stage")
+    };
+    assert_eq!(staged.receipt.qualification, "pending");
+    assert_eq!(staged.receipt.copied_payload_bytes, 0);
+    assert!(!destination.join(SHARD).exists());
+    assert!(Snapshot::inspect(&destination, &ExportLimits::default()).is_err());
+    // The process accepts a finite strict protocol, never checkpoint code or a
+    // caller-selected shell command. Invalid requests cannot touch new output.
+    assert!(Request::read(br#"{"operation":"inspect","operation":"stage"}"#.as_slice()).is_err());
+    let mut value = serde_json::to_value(request).unwrap();
+    value["profile"]["groups"]["a"] = json!(["a", "a"]);
+    value["destination"] = json!(temp.path().join("invalid"));
+    assert!(
+        Request::read(serde_json::to_vec(&value).unwrap().as_slice())
+            .unwrap()
+            .run()
+            .is_err()
+    );
+    assert!(!temp.path().join("invalid").exists());
+    value["profile"]["groups"]["a"] = json!(["a"]);
+    value["module"]["preparation"]["max_ram_bytes"] = json!(1024);
+    assert!(matches!(
+        Request::read(serde_json::to_vec(&value).unwrap().as_slice())
+            .unwrap()
+            .run(),
+        Err(nest_model::Error::Limit(_))
+    ));
+    assert!(!temp.path().join("invalid").exists());
+}

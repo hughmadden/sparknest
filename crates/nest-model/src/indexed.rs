@@ -19,7 +19,8 @@ const RECEIPT: &str = "composition.receipt.json";
 
 /// Explicit worker admission limits; these bound input metadata, open inventory,
 /// payload buffering and physical output. They are safety ceilings, not tuning.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExportLimits {
     pub metadata_bytes: u64,
     pub max_files: usize,
@@ -703,6 +704,28 @@ pub struct ExportReceipt {
     pub reused_files: BTreeSet<String>,
 }
 
+/// Private native staging, deliberately not a complete checkpoint or a READY
+/// result. The manager must assemble reused files as ordinary namespace links,
+/// verify the complete snapshot, bind its manifest and qualify before publishing.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedExport {
+    pub receipt: ExportReceipt,
+}
+
+impl StagedExport {
+    /// Files actually emitted to native staging, including the receipt itself.
+    pub fn staged_files(&self) -> BTreeSet<String> {
+        self.receipt
+            .files
+            .keys()
+            .filter(|name| !self.receipt.reused_files.contains(*name))
+            .cloned()
+            .chain(std::iter::once(RECEIPT.into()))
+            .collect()
+    }
+}
+
 #[derive(Serialize)]
 struct PayloadManifest<'a> {
     schema: &'static str,
@@ -736,6 +759,49 @@ pub fn export(
     alternates: &[&Snapshot],
     destination: &Path,
     limits: &ExportLimits,
+) -> Result<ExportReceipt> {
+    export_inner(
+        config,
+        profile,
+        base,
+        alternates,
+        destination,
+        limits,
+        false,
+    )
+}
+
+/// Emit only independent changed shards/assets and generated metadata to private
+/// native staging. Reused whole files are identified by the verified receipt;
+/// no native hardlink, symlink, placeholder or copy is created for them. This
+/// allows staging on a different filesystem from the pinned input mount.
+///
+/// The exact same caller pin contract as [`export`] applies. The returned staging
+/// is incomplete whenever files are reused; it must never be passed to a loader.
+/// The manager must link exact pinned generations into its complete namespace
+/// snapshot, import new files, validate that complete snapshot and bind its
+/// inventory. No virtual-file representation is introduced to the data plane.
+pub fn export_staged(
+    config: &ModuleConfig,
+    profile: &Profile,
+    base: &Snapshot,
+    alternates: &[&Snapshot],
+    destination: &Path,
+    limits: &ExportLimits,
+) -> Result<StagedExport> {
+    Ok(StagedExport {
+        receipt: export_inner(config, profile, base, alternates, destination, limits, true)?,
+    })
+}
+
+fn export_inner(
+    config: &ModuleConfig,
+    profile: &Profile,
+    base: &Snapshot,
+    alternates: &[&Snapshot],
+    destination: &Path,
+    limits: &ExportLimits,
+    detached: bool,
 ) -> Result<ExportReceipt> {
     let plan = resolve(config, profile, base, alternates, limits)?;
     let metadata_budget = config.preparation.max_ram_bytes;
@@ -939,7 +1005,7 @@ pub fn export(
     fs::create_dir(destination)?;
     // All required links must succeed before any changed shard is allocated.
     // EXDEV/unsupported links fail; there is no unadmitted copy fallback.
-    for name in &receipt.reused_files {
+    for name in receipt.reused_files.iter().filter(|_| !detached) {
         if base.stamps.get(name) != Some(&FileStamp::read(&base.root, name)?) {
             return Err(invalid("reused input changed"));
         }
@@ -1036,8 +1102,25 @@ pub fn export(
     }
     write_synced(destination, RECEIPT, &bytes)?;
     File::open(destination)?.sync_all()?;
-    // Validate the ordinary destination snapshot before handing it to its owner.
-    Snapshot::inspect_verified(destination, limits, &receipt.files)?;
+    if detached && !receipt.reused_files.is_empty() {
+        // New complete shards are still checked against the canonical base
+        // headers and full-range validator. Reused shards were inspected under
+        // lifetime pins. The final assembled namespace requires its own complete
+        // snapshot validation; this partial native directory cannot provide it.
+        let mut remaining = limits.metadata_bytes;
+        for (name, original) in &base.shards {
+            if !receipt.reused_files.contains(name) {
+                let (written, _, _) =
+                    inspect_shard(destination, name, &mut remaining, limits.max_tensors)?;
+                if written.header != original.header {
+                    return Err(invalid("staged shard header differs from canonical base"));
+                }
+            }
+        }
+    } else {
+        // Validate the ordinary complete destination before handing it to its owner.
+        Snapshot::inspect_verified(destination, limits, &receipt.files)?;
+    }
     if config.cache.reuse_unchanged {
         for input in std::iter::once(base).chain(alternates.iter().copied()) {
             input.revalidate_pins()?;
@@ -1078,7 +1161,7 @@ fn copy_exact(
 
 // serde_json normally accepts duplicate map keys. At a checkpoint trust boundary
 // that could make readers disagree about inventory, offsets or producer selection.
-fn unique_json(bytes: &[u8]) -> Result<Value> {
+pub(crate) fn unique_json(bytes: &[u8]) -> Result<Value> {
     struct Unique(Value);
     impl<'de> Deserialize<'de> for Unique {
         fn deserialize<D: de::Deserializer<'de>>(
@@ -1271,5 +1354,18 @@ mod tests {
         assert_eq!(receipt.reused_payload_bytes, 131072);
         assert_eq!(receipt.copied_payload_bytes, 0);
         assert_eq!(receipt.files[name], base.files[name]);
+        HASHED_FILE_BYTES.with(|total| total.set(0));
+        let staged = export_staged(
+            &config,
+            &profile,
+            &base,
+            &[],
+            &temp.path().join("staging"),
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(HASHED_FILE_BYTES.with(|total| total.get()), 0);
+        assert_eq!(staged.receipt.files[name], base.files[name]);
+        assert!(!temp.path().join("staging").join(name).exists());
     }
 }

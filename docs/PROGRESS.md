@@ -3,6 +3,26 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-26 — Detached export and offline CPU worker
+
+- Added detached export: native staging contains only changed independent files
+  and generated metadata; reused files stay as verified whole-file references.
+  Final namespace assembly and full snapshot verification remain manager gates.
+  The existing complete native-link exporter retains its cross-filesystem refusal.
+- Added a narrow offline worker executable with strict bounded JSON requests,
+  explicit indexed/raw inputs, a trusted whole-operand profile and aggregate
+  metadata admission. It performs no checkpoint code execution or publication;
+  responses retain qualification pending. CPU/RSS/runtime/pool/storage enforcement
+  belongs to the parent, not the executable's declarative module budget.
+- Synthetic coverage totals 45 tests. Cross-filesystem staging followed by
+  ordinary complete-file assembly matches native export byte-for-byte, enforces
+  new-file admission and avoids rehashing/reallocating reused payloads. A real
+  worker process test covers inspection, staging and invalid request refusal.
+- Verification: complete workspace tests, daemon/CLI and standalone worker
+  release builds, formatting and all-target Clippy passed in CPU sandboxes.
+- Next: bounded parent job execution, durable manager recovery, API/CLI and
+  qualification/usage integration. No serving integration is enabled by this step.
+
 ## 2026-10-26 — Sparse replacement input and immutable snapshot manifests
 
 - Integrated the existing hub-and-spoke fork, including configured fabric pool

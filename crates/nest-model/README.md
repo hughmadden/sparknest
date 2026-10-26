@@ -5,6 +5,9 @@ identity, whole operand-group resolution, and a synchronous CPU exact exporter.
 It has no daemon, metadata, CLI, cache, pin, lifecycle, network or execution
 integration. It never executes checkpoint code or imports pickle.
 
+`nest-model-worker` is a standalone offline process for a future admitted
+manager; it is not the management CLI and cannot publish or acquire pins.
+
 The owner resolves and pins immutable snapshots, assigns a trusted `Profile`
 partitioning **every** base tensor into complete numerical operand groups, and
 calls `Snapshot::inspect`, `ModuleConfig::parse`, `resolve`, then `export` on an
@@ -181,3 +184,45 @@ preparation key, payload manifest and finished index bytes unchanged. The
 manager compares those byte identities for reproducibility, not operational
 allocation counters. The manager owns reproducibility comparison, publication,
 sealing, leases, qualification and lifecycle recovery.
+
+## Detached staging and offline worker
+
+`export_staged` uses the same plan, output admission, input pin contract and
+byte-bound manifests as `export`, but emits only changed independent files and
+new metadata. Its `StagedExport` receipt lists reused whole-file identities;
+`staged_files()` lists the files actually written. It creates no native link,
+placeholder or copy for reused files, allowing native staging on another
+filesystem from the input mount. Canonical changed-shard headers and complete
+ranges are verified. Reused payloads are not rehashed. The manager must assemble
+ordinary namespace links to those exact pinned generations, import new files,
+verify the complete snapshot and bind its manifest before publication. Detached
+staging is intentionally incomplete and must never be supplied to a loader.
+Native-link `export` remains available and still refuses cross-filesystem links.
+
+Build the process with `cargo build --release -p nest-model --bin
+nest-model-worker`. Run it in the assigned worker environment with one JSON
+request on stdin and one JSON response on stdout:
+
+```sh
+nest-model-worker < request.json > response.json
+```
+
+The strict request is tagged by `operation`: `inspect` has `inputs` and `limits`;
+`stage` has `module`, `profile`, `base`, `alternates`, `destination` and `limits`.
+Inputs are tagged by `layout`: `indexed` has `root`; `sidecar` has `root`,
+`tensors` and optional `selection_manifest`. The operator's profile uses schema
+`sparknest.operand-profile.v1`, a `groups` map of complete tensor-name arrays,
+and `static_activation_calibration`. Every metadata, file/tensor, buffer and
+output budget is explicit in `limits`. Request bytes are capped at 64 MiB;
+duplicate JSON keys, unknown fields, duplicate group members and aggregate
+metadata ceilings exceeding module RAM admission fail before staging.
+
+The process runs one synchronous CPU operation without networking or checkpoint
+code execution. Success returns verified inspection identities or **private
+staging with qualification pending**. The process itself does not enforce the
+module image digest, CPU/RSS cgroup, wall-time deadline, fair pool assignment or
+storage reservation. Its parent must enforce those, mount only pinned inputs
+read-only, retain pins until confirmed process death/cleanup, and check exit
+status before accepting stdout. It must also own import/sealing, complete
+snapshot validation, qualification and READY publication. No daemon launch or
+serving integration is enabled by this executable.

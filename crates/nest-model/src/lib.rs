@@ -8,9 +8,12 @@
 mod config;
 mod indexed;
 mod plan;
+pub mod worker;
 
 pub use config::*;
-pub use indexed::{ExportLimits, ExportReceipt, FileIdentity, Snapshot, export};
+pub use indexed::{
+    ExportLimits, ExportReceipt, FileIdentity, Snapshot, StagedExport, export, export_staged,
+};
 pub use plan::{Plan, Profile, Shadowed, resolve};
 
 use serde::{Deserialize, Serialize, de};
