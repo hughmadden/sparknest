@@ -10,6 +10,7 @@ nest-types.workspace = true
 nest-meta.workspace = true
 nest-data.workspace = true
 nest-place.workspace = true
+nest-model.workspace = true
 nest-fabric.workspace = true
 nix = { workspace = true, features = ["time"] }
 axum.workspace = true

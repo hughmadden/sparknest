@@ -358,7 +358,7 @@ fn schema_v4_migration_preserves_existing_generation_pins() {
     )
     .unwrap();
     db.c.execute_batch(
-        "DROP TABLE model_snapshot_files; DROP TABLE model_snapshots; PRAGMA user_version = 4;",
+        "DROP TABLE model_modules; DROP TABLE model_publications; DROP TABLE model_owned_outputs; DROP TABLE model_snapshot_files; DROP TABLE model_snapshots; PRAGMA user_version = 4;",
     )
     .unwrap();
     nest_meta::schema::init(&db.c).unwrap();

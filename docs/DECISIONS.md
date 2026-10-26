@@ -2549,3 +2549,74 @@ before binding and return only their immutable explicit paths. Binding validates
 namespace/generation coverage; worker verification, resource admission, numerical
 qualification and proof of derived deletion ownership remain manager obligations.
 Legacy pin-only metadata primitives are not a public preparation interface.
+
+## ADR-074 — Explicit bounded preparation and exact CPU qualification
+
+**Status:** accepted, 2026-10-26.
+
+**Context.** A complete exporter and generation/namespace pins do not by
+themselves make a usable cache. Preparation needs assigned resources, durable
+worker ownership, provenance-bound qualification and an explicit user lifecycle.
+The changed shards can exceed the desired working RAM, so staging belongs on
+native disk rather than a model-sized RAM filesystem.
+
+**Decision.** The manager owns module CAS revisions, immutable input acquisition,
+worker control, output import and publication. It flattens already-sealed input
+namespace aliases into exact pinned regular-file snapshots. An explicitly assigned
+single-operation CPU pool runs the built-in worker from a pinned local Docker
+image configuration ID. The image identity in the module must match it. Nodes
+without a configured pool never acquire preparation resources automatically.
+
+A native pool lock and durable private launch/stop journals survive API cancellation
+and daemon restart. Containers have no network or GPU devices, use runc, a read-only
+root, read-only pinned inputs, CPU/RAM/swap/PID bounds and a PID1 runtime deadline.
+Actual Docker limits and mounts are checked before execution. CLI death or a deadline
+is not stop evidence; completion/reconciliation removes the exact owned container ID.
+An ambiguous create/removal remains blocked. A crash before the first launch journal
+also remains owned until independently reconciled; absence is never inferred death.
+
+Detached export emits only changed files and metadata. The trusted built-in exporter
+charges all new writes against one admitted regular-file byte ceiling. The parent
+reserves native capacity, block/directory overhead and the configured free-space
+reserve, then checks actual logical and allocated bytes after confirmed worker stop.
+This is not a kernel disk quota against arbitrary converter images. Native worker
+staging and the object store must share a filesystem for adoption; EXDEV refuses.
+No source checkpoint code or caller-selected converter program is executed.
+
+Output assembly uses ordinary namespace links for reused generations and imports
+fresh reserved IDs for new files. An epoch-fenced import records derived ownership
+atomically with the ordinary import effects; existing inputs cannot be relabelled as
+owned output. Task-owned native staging aliases are removed only after successful
+import, leaving sealed store/namespace references and retained receipts.
+
+The first trusted policy is `sparknest.exact-composition-cpu.v1`. It verifies layout,
+assets and provenance, then streams every actual output tensor against its intended
+winning source, including fallback. Unknown policies, lossy conversions, LoRA and
+static activation calibration are refused. The proof establishes exact preparation;
+it makes no behavioral, inference-engine, hardware or performance claim. A different
+model/numerical gate needs its own implemented policy. Qualification evidence is
+imported and pinned separately from the already-bound checkpoint, avoiding an
+inventory mutation or hash cycle. Complete publication binds exact output inventory,
+export/evidence references, artifact epoch and the module's qualification policy.
+
+`nest model` and the HTTP API call the same manager. Resolve returns only complete
+READY publications for the requested policy, with an immutable path/revision.
+Single-use usage tokens remain held through caller-owned container/rank cleanup;
+a launcher exiting is not automatic release evidence. Changing policy reuses the
+prepared key but requires its matching qualification, rather than claiming an old
+policy's proof passed the new policy.
+
+Reset retires first. The first reclaimer atomically unlinks only proven newly
+imported safetensors output shards at the exact stopped/retired epoch and alias.
+It preserves all inputs, reused files, JSON/assets and historical receipt references,
+including oddly named receipts. Ordinary shared-root, generation-pin and last-link
+guards still apply. Duplicate removal is harmless; replacement aliases/generations
+are stale. Reported reclaimed bytes are logical last-alias-unlinked sizes; open
+ordinary handles can delay physical disk release. Per-key `--all` results expose
+blocked/deferred entries and old orphaned keys, never claiming an incomplete purge.
+
+**Consequences.** The existing whole-file FUSE/RDMA/push path is unchanged. New wire
+commands remain append-only, schema v6 migrates retained snapshots, and all initial
+fixtures are generic. Trial configuration, source identities and qualification
+receipts remain private. Synthetic CPU/FUSE/Docker proof precedes any assigned real
+model or fabric test; an inference release requires its separate actual runtime gates.

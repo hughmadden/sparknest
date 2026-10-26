@@ -395,6 +395,11 @@ impl Node {
             });
         }
         let api = nest_api::Api {
+            composition: nest_place::composition::Manager::new(
+                vfs.clone(),
+                cfg.node.mountpoint.clone(),
+                cfg.composition_worker.clone(),
+            ),
             push: Some(push.clone()),
             vfs: vfs.clone(),
             placer: placer.clone(),

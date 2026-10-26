@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod model;
 mod push_bench;
 
 #[derive(Parser, Debug)]
@@ -32,6 +33,11 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Prepare and manage immutable checkpoint compositions.
+    Model {
+        #[command(subcommand)]
+        cmd: model::Command,
+    },
     /// Cluster, node and store overview.
     Status,
     /// Print a link to this node's web UI (with its access token).
@@ -1166,6 +1172,7 @@ async fn main() -> Result<()> {
         sock: find_socket(&cli)?,
     };
     let out = match &cli.cmd {
+        Cmd::Model { cmd } => return model::run(&c, cmd, cli.json).await,
         Cmd::Status => {
             let v = c.get("/v1/status").await?;
             if !cli.json {

@@ -52,6 +52,7 @@ tags:
   - name: cluster
   - name: web
   - name: counters
+  - name: composition
 
 paths:
   /:
@@ -2079,6 +2080,297 @@ paths:
               schema:
                 $ref: "#/components/schemas/CountersSnapshot"
 
+  /v1/model/cache/status:
+    get:
+      tags: [composition]
+      operationId: compositionCacheStatus
+      summary: All artifact keys including old unreferenced module revisions
+      responses:
+        "200":
+          description: Artifact states, epochs, pins, users and pending resets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {type: object}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/cache/reset:
+    post:
+      tags: [composition]
+      operationId: compositionResetAll
+      summary: Reset all derived artifact keys with independent blocked/deferred results
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompositionReset"
+      responses:
+        "200":
+          description: Per-key reset reports; shard bytes are logical last-alias-unlinked sizes, not measured physical disk release.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {type: object}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model:
+    get:
+      tags: [composition]
+      operationId: compositionList
+      summary: Registered composition modules and their lifecycle status
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/{name}:
+    get:
+      tags: [composition]
+      operationId: compositionStatus
+      summary: Composition status, owner epoch, pins and pending qualification
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+    put:
+      tags: [composition]
+      operationId: compositionPut
+      summary: Create or update a declarative composition using a module revision CAS
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompositionPut"
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/{name}/prepare:
+    post:
+      tags: [composition]
+      operationId: compositionPrepare
+      summary: Prepare ordinary immutable checkpoint files on the assigned CPU pool
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompositionPrepare"
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/{name}/resolve:
+    get:
+      tags: [composition]
+      operationId: compositionResolve
+      summary: Resolve only a complete READY publication matching this module policy
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/{name}/qualify:
+    post:
+      tags: [composition]
+      operationId: compositionQualify
+      summary: Run the explicit supported qualification policy; unsupported policies refuse
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/{name}/cache/reset:
+    post:
+      tags: [composition]
+      operationId: compositionReset
+      summary: Retire or defer a composition key; dry-run reports sharing and usage
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompositionReset"
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/{name}/cache/reset-cancel:
+    post:
+      tags: [composition]
+      operationId: compositionResetCancel
+      summary: Cancel only the matching pending reset and artifact epoch
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompositionResetCancel"
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/{name}/use:
+    post:
+      tags: [composition]
+      operationId: compositionUse
+      summary: Acquire a single-use artifact usage token before loading
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompositionUse"
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/usage/release:
+    post:
+      tags: [composition]
+      operationId: compositionRelease
+      summary: Release after all owned model containers and ranks have stopped
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompositionRelease"
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/{name}/jobs/stop:
+    post:
+      tags: [composition]
+      operationId: compositionStop
+      summary: Stop or reconcile only this preparation owner; retain ambiguous owners
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
+  /v1/model/{name}/jobs/recover:
+    post:
+      tags: [composition]
+      operationId: compositionRecover
+      summary: Recover using exact retained worker stop evidence without timeout expiry
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Operation result; preparation success is separate from qualification and READY.
+          content:
+            application/json:
+              schema: {}
+        default:
+          $ref: "#/components/responses/Error"
+
 components:
   securitySchemes:
     bearerToken:
@@ -2176,6 +2468,69 @@ components:
                 type: string
 
   schemas:
+    CompositionPut:
+      type: object
+      additionalProperties: false
+      required: [spec, profile, expected_revision]
+      properties:
+        spec:
+          type: object
+          description: Strict sparknest.model-composition.v1 module; see crates/nest-model/README.md for all tables and contracts.
+          required: [schema, name, base, output, preparation, cache]
+        profile:
+          type: object
+          additionalProperties: false
+          required: [schema, groups, static_activation_calibration]
+          properties:
+            schema:
+              const: sparknest.operand-profile.v1
+            groups:
+              type: object
+              description: Trusted complete operand groups partition every base tensor exactly once.
+              additionalProperties:
+                type: array
+                uniqueItems: true
+                minItems: 1
+                items: {type: string}
+            static_activation_calibration: {type: boolean}
+        expected_revision:
+          type: integer
+          minimum: 0
+          description: 0 creates; updates require the current module revision.
+    CompositionPrepare:
+      type: object
+      additionalProperties: false
+      properties:
+        wait: {type: boolean, default: false}
+    CompositionReset:
+      type: object
+      additionalProperties: false
+      properties:
+        when_idle: {type: boolean, default: false}
+        dry_run: {type: boolean, default: false}
+    CompositionResetCancel:
+      type: object
+      additionalProperties: false
+      required: [epoch, reset]
+      properties:
+        epoch: {type: integer, minimum: 1}
+        reset: {type: integer, minimum: 1}
+    CompositionUse:
+      type: object
+      additionalProperties: false
+      required: [lease]
+      properties:
+        lease:
+          type: string
+          description: Fresh single-use token; keep through model/rank shutdown and cleanup.
+    CompositionRelease:
+      type: object
+      additionalProperties: false
+      required: [key, epoch, lease]
+      properties:
+        key: {type: string}
+        epoch: {type: integer, minimum: 1}
+        lease: {type: string}
     PushLoad:
       type: object
       description: What a push load did, as its hub recorded it (ADR-063).

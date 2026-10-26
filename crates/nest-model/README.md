@@ -1,12 +1,13 @@
 # Offline model composition
 
-This crate is an independent first increment: strict configuration, content
-identity, whole operand-group resolution, and a synchronous CPU exact exporter.
-It has no daemon, metadata, CLI, cache, pin, lifecycle, network or execution
-integration. It never executes checkpoint code or imports pickle.
+This crate owns strict composition configuration, content identity, whole
+operand-group resolution, bounded CPU export and exact preparation qualification.
+It never executes checkpoint code or imports pickle. The daemon manager lives in
+`nest-place::composition`; replicated lifetime rules live in `nest-meta`.
 
-`nest-model-worker` is a standalone offline process for a future admitted
-manager; it is not the management CLI and cannot publish or acquire pins.
+`nest-model-worker` is the standalone offline process used by an explicitly
+assigned CPU pool. It cannot publish or acquire pins; the manager owns those
+transitions and exposes them through the management API and `nest model`.
 
 The owner resolves and pins immutable snapshots, assigns a trusted `Profile`
 partitioning **every** base tensor into complete numerical operand groups, and
@@ -221,8 +222,37 @@ The process runs one synchronous CPU operation without networking or checkpoint
 code execution. Success returns verified inspection identities or **private
 staging with qualification pending**. The process itself does not enforce the
 module image digest, CPU/RSS cgroup, wall-time deadline, fair pool assignment or
-storage reservation. Its parent must enforce those, mount only pinned inputs
-read-only, retain pins until confirmed process death/cleanup, and check exit
-status before accepting stdout. It must also own import/sealing, complete
-snapshot validation, qualification and READY publication. No daemon launch or
-serving integration is enabled by this executable.
+storage reservation. Its parent enforces those, mounts pinned inputs read-only, retains pins until
+confirmed process death/cleanup, and checks exit status before accepting stdout.
+It also owns import/sealing, complete snapshot validation and READY publication.
+The executable itself never starts a daemon or serving engine.
+
+
+## Explicit exact qualification
+
+`policy_identity()` names the supported versioned policy
+`sparknest.exact-composition-cpu.v1`. `qualify_exact` verifies complete canonical
+layout, base ancillary assets, payload/index/export provenance and **every tensor
+byte against its resolved winning source**, including unchanged fallback. It
+streams two bounded buffers and binds both the concrete policy identity and the
+module's separate qualification key. It retains the plan's qualification-required
+flag; proof satisfies this specific preparation policy rather than hiding it.
+
+Unknown policies, lossy/conversion/LoRA paths and static activation calibration
+are refused. This policy establishes exact preparation, with no behavioral,
+engine, hardware or inference-performance claim. Qualification evidence belongs
+outside the immutable checkpoint inventory. `publication_identity()` is the one
+formula for deterministic preparation/payload/finished-index identity, excluding
+operational copy/link counters.
+
+The worker's `qualify` operation takes the same module/profile/base/alternates
+as `stage`, plus a complete `output` snapshot root and explicit `limits`. It
+returns a qualification receipt after real verification; it accepts no caller
+pass boolean. The manager validates it, imports and pins the evidence separately,
+then uses complete-output publication before resolving a READY revision.
+
+The output writer shares one hard admitted regular-file byte budget across
+changed shards, copied assets and generated metadata. Native filesystem block
+and directory overhead is separately reserved and checked by the pool. This
+supports the trusted built-in exact worker, with no kernel disk-quota claim
+against arbitrary images. See `docs/MODEL-COMPOSITION.md` for operator workflow.

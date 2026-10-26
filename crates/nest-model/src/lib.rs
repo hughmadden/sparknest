@@ -8,6 +8,11 @@
 mod config;
 mod indexed;
 mod plan;
+mod qualification;
+pub use qualification::{
+    EXACT_POLICY_NAME, QualificationReceipt, TensorComparison, policy_identity,
+    publication_identity, qualify_exact,
+};
 pub mod worker;
 
 pub use config::*;
@@ -37,6 +42,12 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Decode declarative metadata without accepting duplicate object keys.
+/// The caller admits a finite byte buffer before invoking this parser.
+pub fn strict_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    Ok(serde_json::from_value(indexed::unique_json(bytes)?)?)
+}
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())

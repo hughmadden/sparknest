@@ -3,8 +3,10 @@
 //! and deletion. No wall-clock expiry can prove that a mapped model is dead.
 
 use crate::apply::{Fail, R, err};
-use crate::{Reply, query};
-use nest_types::{FileId, FileKind, GenState, Generation, NestError, ReplicaState};
+use crate::{Command, Effect, Reply, query};
+use nest_types::{
+    FileId, FileKind, GenState, Generation, NestError, NodeId, ReplicaState, Timestamp,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -67,6 +69,58 @@ pub enum ModelCommand {
         output: bool,
         files: Vec<(Vec<u8>, FileId, Generation)>,
     },
+    /// Validated declarative data, never executable code. The manager validates
+    /// the serialized spec/profile and computes their identities before apply.
+    PutModule {
+        name: String,
+        spec: String,
+        profile: String,
+        key: String,
+        qualification_policy: String,
+        expected_revision: u64,
+    },
+    /// Manager attestation after export and numerical verification. Metadata
+    /// checks exact inventory and durable references, not checkpoint numerics.
+    PublishComplete {
+        key: String,
+        owner: String,
+        epoch: u64,
+        root: FileId,
+        files: Vec<(Vec<u8>, FileId, Generation)>,
+        publication: String,
+        export_receipt: (FileId, Generation),
+        qualification_receipt: (FileId, Generation),
+        qualification_policy: String,
+    },
+    /// Import a NEW sealed derived generation and record ownership atomically.
+    /// The complete object must already be durable under its reserved file id.
+    /// Existing files/aliases are refused by the ordinary import primitive.
+    ImportOutput {
+        key: String,
+        owner: String,
+        epoch: u64,
+        parent: FileId,
+        name: Vec<u8>,
+        file: FileId,
+        perm: u32,
+        size: u64,
+        mtime: Timestamp,
+        node: NodeId,
+        now: Timestamp,
+    },
+    /// Explicit reclamation of one proven, retired/failed derived shard alias.
+    /// Historical import proof is retained; retries never delete a replacement.
+    /// Actual unlink returns the pre-unlink Attr; an absent alias returns Done.
+    /// Attr size is logical bytes, not proof of immediate physical disk release.
+    ReclaimOutputShard {
+        key: String,
+        epoch: u64,
+        parent: FileId,
+        name: Vec<u8>,
+        file: FileId,
+        generation: Generation,
+        now: Timestamp,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +149,85 @@ pub struct ModelSnapshot {
     pub root: FileId,
     pub output: bool,
     pub files: Vec<(Vec<u8>, FileId, Generation)>,
+}
+
+/// Query DTOs are not persisted log fields. Module revisions can change
+/// without rewriting an artifact's preparation or qualification identities.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelModule {
+    pub name: String,
+    pub revision: u64,
+    pub spec: String,
+    pub profile: String,
+    pub key: String,
+    pub qualification_policy: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPublication {
+    pub epoch: u64,
+    pub root: FileId,
+    pub publication: String,
+    pub export_receipt: (FileId, Generation),
+    pub qualification_receipt: (FileId, Generation),
+    pub qualification_policy: String,
+}
+
+/// Historical import proof, not permission to delete. ReclaimOutputShard
+/// atomically checks current alias/generation, lifetime and receipt exclusions
+/// before applying ordinary namespace and shared-reference guards.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelOwnedOutput {
+    pub epoch: u64,
+    pub parent: FileId,
+    pub name: Vec<u8>,
+    pub file: FileId,
+    pub generation: Generation,
+}
+
+pub fn module(c: &Connection, name: &str) -> rusqlite::Result<Option<ModelModule>> {
+    c.prepare_cached("SELECT name, revision, spec, profile, key, qualification_policy FROM model_modules WHERE name = ?1")?
+        .query_row([name], module_from_row).optional()
+}
+
+fn module_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelModule> {
+    Ok(ModelModule {
+        name: r.get(0)?,
+        revision: r.get::<_, i64>(1)? as u64,
+        spec: r.get(2)?,
+        profile: r.get(3)?,
+        key: r.get(4)?,
+        qualification_policy: r.get(5)?,
+    })
+}
+
+pub fn modules(c: &Connection) -> rusqlite::Result<Vec<ModelModule>> {
+    c.prepare_cached("SELECT name, revision, spec, profile, key, qualification_policy FROM model_modules ORDER BY name")?
+        .query_map([], module_from_row)?.collect()
+}
+
+/// Most recently completed qualification. Historical records survive reset;
+/// callers MUST also require the artifact to be READY in this exact epoch and
+/// the qualification policy to match the requesting module.
+pub fn complete_publication(
+    c: &Connection,
+    key: &str,
+) -> rusqlite::Result<Option<ModelPublication>> {
+    c.prepare_cached("SELECT epoch, root, publication, export_file, export_gen, qualification_file, qualification_gen, qualification_policy FROM model_publications WHERE key = ?1 ORDER BY epoch DESC LIMIT 1")?
+        .query_row([key], |r| Ok(ModelPublication { epoch: r.get::<_, i64>(0)? as u64,
+            root: FileId(r.get::<_, i64>(1)? as u64), publication: r.get(2)?,
+            export_receipt: (FileId(r.get::<_, i64>(3)? as u64), Generation(r.get::<_, i64>(4)? as u64)),
+            qualification_receipt: (FileId(r.get::<_, i64>(5)? as u64), Generation(r.get::<_, i64>(6)? as u64)),
+            qualification_policy: r.get(7)?,
+        })).optional()
+}
+
+pub fn owned_outputs(c: &Connection, key: &str) -> rusqlite::Result<Vec<ModelOwnedOutput>> {
+    c.prepare_cached("SELECT epoch, parent, name, file, gen FROM model_owned_outputs WHERE key = ?1 ORDER BY epoch, parent, name, file")?
+        .query_map([key], |r| Ok(ModelOwnedOutput { epoch: r.get::<_, i64>(0)? as u64,
+            parent: FileId(r.get::<_, i64>(1)? as u64), name: r.get(2)?,
+            file: FileId(r.get::<_, i64>(3)? as u64), generation: Generation(r.get::<_, i64>(4)? as u64),
+        }))?.collect()
 }
 
 pub fn snapshots(c: &Connection, key: &str) -> rusqlite::Result<Vec<ModelSnapshot>> {
@@ -182,6 +315,19 @@ pub fn get(c: &Connection, key: &str) -> rusqlite::Result<Option<ModelEntry>> {
     Ok(Some(row))
 }
 
+/// List every preparation key, including keys no longer named by a module.
+/// Hydration uses the same query as `get`, keeping lease/pin semantics in one
+/// place. Call inside the caller's read transaction for a consistent listing.
+pub fn entries(c: &Connection) -> rusqlite::Result<Vec<ModelEntry>> {
+    let keys = c
+        .prepare_cached("SELECT key FROM model_artifacts ORDER BY key")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    keys.iter()
+        .filter_map(|key| get(c, key).transpose())
+        .collect()
+}
+
 pub fn is_pinned(c: &Connection, file: FileId) -> rusqlite::Result<bool> {
     c.prepare_cached("SELECT EXISTS(SELECT 1 FROM model_pins WHERE file = ?1)")?
         .query_row([file.0 as i64], |r| r.get(0))
@@ -237,8 +383,204 @@ fn retire(c: &Connection, key: &str) -> R<()> {
     Ok(())
 }
 
-pub(crate) fn exec(c: &Connection, command: &ModelCommand) -> R<Reply> {
+pub(crate) fn exec(c: &Connection, command: &ModelCommand, fx: &mut Vec<Effect>) -> R<Reply> {
     match command {
+        ModelCommand::ReclaimOutputShard {
+            key,
+            epoch,
+            parent,
+            name,
+            file,
+            generation,
+            now,
+        } => {
+            let a = entry(c, key)?;
+            if a.epoch != *epoch {
+                return err(NestError::Stale);
+            }
+            if !matches!(a.state.as_str(), "failed" | "retired")
+                || a.owner.is_some()
+                || !a.leases.is_empty()
+            {
+                return err(NestError::Busy(
+                    "artifact must be stopped and unused before reclamation".into(),
+                ));
+            }
+            let proven: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM model_owned_outputs WHERE key = ?1 AND epoch = ?2 AND parent = ?3 AND name = ?4 AND file = ?5 AND gen = ?6)",
+                params![key, *epoch as i64, parent.0 as i64, name, file.0 as i64, generation.0 as i64], |r| r.get(0),
+            )?;
+            if !proven {
+                return err(NestError::NotPermitted(
+                    "no exact derived import ownership proof".into(),
+                ));
+            }
+            // v1 reclaims payload shards only. JSON/config/tokenizer assets and
+            // every historical publication receipt stay as durable evidence,
+            // even when an imported receipt has a shard-looking filename.
+            if !name.ends_with(b".safetensors") {
+                return err(NestError::NotPermitted(
+                    "only derived safetensors shard payloads may be reclaimed".into(),
+                ));
+            }
+            let receipt: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM model_publications WHERE (export_file = ?1 AND export_gen = ?2) OR (qualification_file = ?1 AND qualification_gen = ?2))",
+                params![file.0 as i64, generation.0 as i64], |r| r.get(0),
+            )?;
+            if receipt {
+                return err(NestError::NotPermitted(
+                    "publication receipts must be retained".into(),
+                ));
+            }
+            match query::lookup(c, *parent, name)? {
+                None => return Ok(Reply::Done),
+                Some(current) if current != *file => return err(NestError::Stale),
+                Some(_) => {}
+            }
+            let attr = query::getattr(c, *file)?.ok_or(Fail::Nest(NestError::Stale))?;
+            if attr.generation != *generation {
+                return err(NestError::Stale);
+            }
+            if attr.kind != FileKind::Regular || !attr.sealed || attr.gen_state != GenState::Stable
+            {
+                return err(NestError::Busy(
+                    "derived generation must remain sealed and stable".into(),
+                ));
+            }
+            // Reuse namespace/root, shared-pin and last-link guards, and emit
+            // the ordinary generation deletion effects in this savepoint.
+            crate::apply::exec(
+                c,
+                &Command::Unlink {
+                    parent: *parent,
+                    name: name.clone(),
+                    now: *now,
+                },
+                fx,
+            )?;
+            Ok(Reply::Attr(attr))
+        }
+        ModelCommand::PutModule {
+            name,
+            spec,
+            profile,
+            key,
+            qualification_policy,
+            expected_revision,
+        } => {
+            token(name)?;
+            token(key)?;
+            token(qualification_policy)?;
+            // Bound allocations at the replicated catalog boundary. Parsing and
+            // interpretation belong to the manager, not the metadata machine.
+            if [spec, profile]
+                .iter()
+                .any(|v| v.is_empty() || v.len() > 64 * 1024 * 1024)
+            {
+                return err(NestError::Invalid(
+                    "invalid serialized module declaration".into(),
+                ));
+            }
+            let current = module(c, name)?.map_or(0, |m| m.revision);
+            if current != *expected_revision {
+                return err(NestError::Stale);
+            }
+            let revision = current
+                .checked_add(1)
+                .filter(|r| *r < i64::MAX as u64)
+                .ok_or(Fail::Nest(NestError::Invalid(
+                    "module revision exhausted".into(),
+                )))?;
+            c.execute("INSERT INTO model_modules (name, revision, spec, profile, key, qualification_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(name) DO UPDATE SET revision = excluded.revision, spec = excluded.spec, profile = excluded.profile, key = excluded.key, qualification_policy = excluded.qualification_policy",
+                params![name, revision as i64, spec, profile, key, qualification_policy])?;
+            Ok(Reply::Revision(revision))
+        }
+        ModelCommand::PublishComplete {
+            key,
+            owner,
+            epoch,
+            root,
+            files,
+            publication,
+            export_receipt,
+            qualification_receipt,
+            qualification_policy,
+        } => {
+            let a = worker(c, key, owner, *epoch)?;
+            token(publication)?;
+            token(qualification_policy)?;
+            let output = snapshots(c, key)?
+                .into_iter()
+                .find(|s| s.output)
+                .ok_or(Fail::Nest(NestError::Invalid(
+                    "no bound output snapshot".into(),
+                )))?;
+            let mut inventory = files.clone();
+            inventory.sort();
+            if output.root != *root || output.files != inventory {
+                return err(NestError::Invalid(
+                    "publication differs from bound OUTPUT inventory".into(),
+                ));
+            }
+            for reference in [export_receipt, qualification_receipt] {
+                if !a.files.contains(reference) {
+                    return err(NestError::Invalid(
+                        "verification receipt is not pinned".into(),
+                    ));
+                }
+                validate_file(c, reference.0, reference.1)?;
+            }
+            // The legacy publication check also validates all generation pins,
+            // retains the first identity and handles a queued reset atomically.
+            exec(
+                c,
+                &ModelCommand::Publish {
+                    key: key.clone(),
+                    owner: owner.clone(),
+                    epoch: *epoch,
+                    publication: publication.clone(),
+                },
+                fx,
+            )?;
+            c.execute("INSERT INTO model_publications (key, epoch, root, publication, export_file, export_gen, qualification_file, qualification_gen, qualification_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![key, *epoch as i64, root.0 as i64, publication, export_receipt.0.0 as i64, export_receipt.1.0 as i64, qualification_receipt.0.0 as i64, qualification_receipt.1.0 as i64, qualification_policy])?;
+            Ok(Reply::Done)
+        }
+        ModelCommand::ImportOutput {
+            key,
+            owner,
+            epoch,
+            parent,
+            name,
+            file,
+            perm,
+            size,
+            mtime,
+            node,
+            now,
+        } => {
+            worker(c, key, owner, *epoch)?;
+            // Reuse ordinary import validation and effects inside the SAME
+            // outer command savepoint. Recording proof can never happen after
+            // a failed import or confer ownership on an existing input.
+            let reply = crate::apply::exec(
+                c,
+                &Command::Import {
+                    parent: *parent,
+                    name: name.clone(),
+                    file: *file,
+                    perm: *perm,
+                    size: *size,
+                    mtime: *mtime,
+                    node: *node,
+                    sealed: true,
+                    now: *now,
+                },
+                fx,
+            )?;
+            c.execute("INSERT INTO model_owned_outputs (key, epoch, parent, name, file, gen) VALUES (?1, ?2, ?3, ?4, ?5, 1)", params![key, *epoch as i64, parent.0 as i64, name, file.0 as i64])?;
+            Ok(reply)
+        }
         ModelCommand::Claim { key, owner } => {
             token(key)?;
             token(owner)?;

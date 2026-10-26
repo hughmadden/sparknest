@@ -19,6 +19,7 @@ nest-fabric = { path = "crates/nest-fabric" }
 nest-data = { path = "crates/nest-data" }
 nest-fuse = { path = "crates/nest-fuse" }
 nest-place = { path = "crates/nest-place" }
+nest-model = { path = "crates/nest-model" }
 nest-api = { path = "crates/nest-api" }
 nest-client = { path = "crates/nest-client" }
 nest-testkit = { path = "crates/nest-testkit" }

@@ -7,6 +7,7 @@
 
 pub mod counters;
 mod events;
+mod model;
 mod transfer;
 
 use axum::extract::{Path, Query, State};
@@ -31,6 +32,7 @@ pub struct Api {
     /// Push loads (ADR-063), for status.
     pub push: Option<Arc<nest_data::push::Push>>,
     pub placer: Arc<Placer>,
+    pub composition: Arc<nest_place::composition::Manager>,
     pub mountpoint: Option<String>,
     pub hub: String,
     /// Bearer token for the network listener (and the web UI).
@@ -151,6 +153,7 @@ impl Api {
 
 pub fn router(api: Api) -> Router {
     Router::new()
+        .merge(model::router())
         .route("/v1/status", get(status))
         .route("/v1/ls", get(ls))
         .route("/v1/seal", post(seal))

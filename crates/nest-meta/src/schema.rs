@@ -5,7 +5,7 @@ use std::path::Path;
 
 /// Bumped whenever the schema changes. Snapshots carry the version so a node
 /// never installs a snapshot it cannot read.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Migrations from version N to N+1, applied in order at open.
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -88,6 +88,42 @@ CREATE TABLE model_snapshot_files (
     file INTEGER NOT NULL,
     gen INTEGER NOT NULL,
     PRIMARY KEY(key, root, name)
+) WITHOUT ROWID;
+"#,
+    ),
+    (
+        5,
+        r#"
+-- Declarative modules and immutable verification/import evidence. None of
+-- these historical rows grants a live lease or authorizes deletion.
+CREATE TABLE model_modules (
+    name TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    spec TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    key TEXT NOT NULL,
+    qualification_policy TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE model_publications (
+    key TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    root INTEGER NOT NULL,
+    publication TEXT NOT NULL,
+    export_file INTEGER NOT NULL,
+    export_gen INTEGER NOT NULL,
+    qualification_file INTEGER NOT NULL,
+    qualification_gen INTEGER NOT NULL,
+    qualification_policy TEXT NOT NULL,
+    PRIMARY KEY(key, epoch)
+) WITHOUT ROWID;
+CREATE TABLE model_owned_outputs (
+    key TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    parent INTEGER NOT NULL,
+    name BLOB NOT NULL,
+    file INTEGER NOT NULL,
+    gen INTEGER NOT NULL,
+    PRIMARY KEY(key, epoch, file, gen)
 ) WITHOUT ROWID;
 "#,
     ),

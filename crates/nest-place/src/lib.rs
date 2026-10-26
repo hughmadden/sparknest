@@ -13,9 +13,11 @@
 
 pub mod admin;
 pub mod backup;
+pub mod composition;
 pub mod hfimport;
 pub mod import;
 pub mod logs;
+pub mod model_worker;
 pub mod placer;
 pub mod plan;
 pub mod selector;

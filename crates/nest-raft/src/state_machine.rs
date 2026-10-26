@@ -527,7 +527,7 @@ mod schema_upgrade_tests {
             .unwrap()
             .0
             .unwrap();
-            c.execute_batch("DROP TABLE model_snapshot_files; DROP TABLE model_snapshots; DROP TABLE model_artifacts; DROP TABLE model_pins; DROP TABLE model_users; DROP TABLE model_receipts; PRAGMA user_version = 3; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            c.execute_batch("DROP TABLE model_modules; DROP TABLE model_publications; DROP TABLE model_owned_outputs; DROP TABLE model_snapshot_files; DROP TABLE model_snapshots; DROP TABLE model_artifacts; DROP TABLE model_pins; DROP TABLE model_users; DROP TABLE model_receipts; PRAGMA user_version = 3; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
         }
         let (meta, _) = snapshot_meta_of(&incoming).unwrap().unwrap();
         sm.install_snapshot(&meta, SnapshotFile(incoming))

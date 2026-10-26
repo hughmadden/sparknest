@@ -6,6 +6,7 @@ use serde::{
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, File, OpenOptions},
@@ -44,7 +45,7 @@ impl Default for ExportLimits {
 }
 
 impl ExportLimits {
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.metadata_bytes == 0
             || self.max_files == 0
             || self.max_tensors == 0
@@ -100,7 +101,7 @@ pub(crate) struct Tensor {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Shard {
-    header: Vec<u8>,
+    pub(crate) header: Vec<u8>,
     payload_start: u64,
     pub metadata: BTreeMap<String, String>,
 }
@@ -592,7 +593,7 @@ impl Snapshot {
         })
     }
 
-    fn revalidate_pins(&self) -> Result<()> {
+    pub(crate) fn revalidate_pins(&self) -> Result<()> {
         if !fs::symlink_metadata(&self.root)?.file_type().is_dir() {
             return Err(invalid("pinned root changed"));
         }
@@ -666,7 +667,7 @@ impl Snapshot {
         Ok(bytes)
     }
 
-    fn tensor_reader(&self, tensor: &Tensor) -> Result<File> {
+    pub(crate) fn tensor_reader(&self, tensor: &Tensor) -> Result<File> {
         let mut file = regular(&self.root, &tensor.shard)?;
         file.seek(SeekFrom::Start(
             self.shards[&tensor.shard].payload_start + tensor.spec.data_offsets[0],
@@ -1003,6 +1004,7 @@ fn export_inner(
         return Err(Error::Limit("physical output admission exceeded".into()));
     }
     fs::create_dir(destination)?;
+    let output_budget = Cell::new(receipt.new_file_bytes);
     // All required links must succeed before any changed shard is allocated.
     // EXDEV/unsupported links fail; there is no unadmitted copy fallback.
     for name in receipt.reused_files.iter().filter(|_| !detached) {
@@ -1029,7 +1031,7 @@ fn export_inner(
             continue;
         }
         let mut input = regular(&base.root, name)?;
-        let mut output = new_file(destination, name)?;
+        let mut output = new_file(destination, name, &output_budget)?;
         copy_exact(
             &mut input,
             &mut output,
@@ -1042,7 +1044,7 @@ fn export_inner(
         if receipt.reused_files.contains(name) {
             continue;
         }
-        let mut output = new_file(destination, name)?;
+        let mut output = new_file(destination, name, &output_budget)?;
         output.write_all(&(shard.header.len() as u64).to_le_bytes())?;
         output.write_all(&shard.header)?;
         let mut tensors: Vec<_> = base
@@ -1074,13 +1076,13 @@ fn export_inner(
     }
     let manifest = payload_manifest(&payload)?;
     receipt.payload_manifest = Digest::of(&manifest);
-    write_synced(destination, PAYLOAD, &manifest)?;
+    write_synced(destination, PAYLOAD, &manifest, &output_budget)?;
     index.metadata.insert(
         "sparknest_payload_manifest".into(),
         Value::String(receipt.payload_manifest.to_string()),
     );
     let index = serde_json::to_vec(&index)?;
-    write_synced(destination, INDEX, &index)?;
+    write_synced(destination, INDEX, &index, &output_budget)?;
     receipt.files = payload;
     receipt.files.insert(
         PAYLOAD.into(),
@@ -1100,7 +1102,10 @@ fn export_inner(
     if bytes.len() as u64 != receipt_size {
         return Err(invalid("receipt admission size changed"));
     }
-    write_synced(destination, RECEIPT, &bytes)?;
+    write_synced(destination, RECEIPT, &bytes, &output_budget)?;
+    if output_budget.get() != 0 {
+        return Err(invalid("output writes differ from admitted allocation"));
+    }
     File::open(destination)?.sync_all()?;
     if detached && !receipt.reused_files.is_empty() {
         // New complete shards are still checked against the canonical base
@@ -1129,16 +1134,49 @@ fn export_inner(
     Ok(receipt)
 }
 
-fn new_file(root: &Path, name: &str) -> Result<File> {
-    safe_name(name)?;
-    Ok(OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(root.join(name))?)
+/// Every newly written byte, including metadata, consumes the same admitted
+/// budget. Pins/hardlinks consume no new payload bytes. Filesystem block and
+/// namespace overhead is reserved separately by the parent on native storage.
+struct BoundedFile<'a> {
+    file: File,
+    remaining: &'a Cell<u64>,
 }
 
-fn write_synced(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    let mut file = new_file(root, name)?;
+impl Write for BoundedFile<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > self.remaining.get() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "composition output allocation ceiling exceeded",
+            ));
+        }
+        let written = self.file.write(bytes)?;
+        self.remaining.set(self.remaining.get() - written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl BoundedFile<'_> {
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+fn new_file<'a>(root: &Path, name: &str, remaining: &'a Cell<u64>) -> Result<BoundedFile<'a>> {
+    safe_name(name)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join(name))?;
+    Ok(BoundedFile { file, remaining })
+}
+
+fn write_synced(root: &Path, name: &str, bytes: &[u8], remaining: &Cell<u64>) -> Result<()> {
+    let mut file = new_file(root, name, remaining)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -1224,6 +1262,31 @@ pub(crate) fn unique_json(bytes: &[u8]) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_files_share_a_ceiling_that_failed_writes_cannot_exceed() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let budget = Cell::new(3);
+        let mut first = new_file(temp.path(), "one.json", &budget).unwrap();
+        first.write_all(b"ab").unwrap();
+        let mut second = new_file(temp.path(), "two.json", &budget).unwrap();
+        assert_eq!(
+            second.write_all(b"cd").unwrap_err().kind(),
+            std::io::ErrorKind::StorageFull
+        );
+        assert_eq!(fs::metadata(temp.path().join("two.json")).unwrap().len(), 0);
+        second.write_all(b"c").unwrap();
+        assert_eq!(
+            first.write_all(b"d").unwrap_err().kind(),
+            std::io::ErrorKind::StorageFull
+        );
+        assert_eq!(budget.get(), 0);
+        assert_eq!(
+            fs::metadata(temp.path().join("one.json")).unwrap().len()
+                + fs::metadata(temp.path().join("two.json")).unwrap().len(),
+            3
+        );
+    }
     use super::*;
     use std::io::{self, Cursor};
 

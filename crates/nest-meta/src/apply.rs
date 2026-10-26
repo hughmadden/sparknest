@@ -76,9 +76,9 @@ fn apply_one(
     }
 }
 
-fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
+pub(crate) fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
     match cmd {
-        Command::Model(command) => crate::composition::exec(c, command),
+        Command::Model(command) => crate::composition::exec(c, command, fx),
         Command::LostReplica {
             file,
             generation,

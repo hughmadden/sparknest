@@ -51,7 +51,18 @@ pub struct OperandProfile {
 }
 
 impl OperandProfile {
-    fn profile(&self) -> Result<Profile> {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() as u64 > MAX_REQUEST_BYTES {
+            return Err(crate::Error::Limit(
+                "operand profile exceeds request ceiling".into(),
+            ));
+        }
+        let profile: Self = crate::strict_json(bytes)?;
+        profile.profile()?;
+        Ok(profile)
+    }
+
+    pub fn profile(&self) -> Result<Profile> {
         if self.schema != "sparknest.operand-profile.v1" {
             return Err(invalid("unknown operand profile schema"));
         }
@@ -85,6 +96,14 @@ pub enum Request {
         destination: PathBuf,
         limits: ExportLimits,
     },
+    Qualify {
+        module: Box<ModuleConfig>,
+        profile: OperandProfile,
+        base: Input,
+        alternates: Vec<Input>,
+        output: PathBuf,
+        limits: ExportLimits,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,8 +116,50 @@ pub struct InspectedInput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Response {
-    Inspect { inputs: Vec<InspectedInput> },
-    Stage { staged: Box<StagedExport> },
+    Inspect {
+        inputs: Vec<InspectedInput>,
+    },
+    Stage {
+        staged: Box<StagedExport>,
+    },
+    Qualify {
+        receipt: Box<crate::QualificationReceipt>,
+    },
+}
+
+fn inspect_inputs(
+    module: &ModuleConfig,
+    profile: OperandProfile,
+    base: Input,
+    alternates: Vec<Input>,
+    limits: &ExportLimits,
+    buffers: u64,
+) -> Result<(Profile, Snapshot, Vec<Snapshot>)> {
+    module.validate()?;
+    limits.validate()?;
+    if alternates.len() != module.alternates.len() {
+        return Err(invalid("worker alternate count differs from module"));
+    }
+    let metadata = (alternates.len() as u64)
+        .checked_add(2)
+        .and_then(|n| n.checked_mul(limits.metadata_bytes))
+        .and_then(|n| {
+            (limits.buffer_bytes as u64)
+                .checked_mul(buffers)
+                .and_then(|b| n.checked_add(b))
+        });
+    if metadata.is_none_or(|n| n > module.preparation.max_ram_bytes) {
+        return Err(crate::Error::Limit(
+            "aggregate worker metadata exceeds RAM admission".into(),
+        ));
+    }
+    let profile = profile.profile()?;
+    let base = base.inspect(limits)?;
+    let alternates = alternates
+        .into_iter()
+        .map(|input| input.inspect(limits))
+        .collect::<Result<_>>()?;
+    Ok((profile, base, alternates))
 }
 
 impl Request {
@@ -112,15 +173,31 @@ impl Request {
                 "worker request exceeds byte ceiling".into(),
             ));
         }
-        Ok(serde_json::from_value(crate::indexed::unique_json(
-            &bytes,
-        )?)?)
+        crate::strict_json(&bytes)
     }
 
     /// Synchronous and CPU-only: call in the dedicated worker process, never on
     /// a FUSE/management async executor. No networking or subprocess is started.
     pub fn run(self) -> Result<Response> {
         match self {
+            Self::Qualify {
+                module,
+                profile,
+                base,
+                alternates,
+                output,
+                limits,
+            } => {
+                let (profile, base, alternates) =
+                    inspect_inputs(&module, profile, base, alternates, &limits, 2)?;
+                let output = Snapshot::inspect(&output, &limits)?;
+                let references: Vec<_> = alternates.iter().collect();
+                let receipt =
+                    crate::qualify_exact(&module, &profile, &base, &references, &output, &limits)?;
+                Ok(Response::Qualify {
+                    receipt: Box::new(receipt),
+                })
+            }
             Self::Inspect { inputs, limits } => {
                 limits.validate()?;
                 if inputs.is_empty() {
@@ -146,29 +223,8 @@ impl Request {
                 destination,
                 limits,
             } => {
-                module.validate()?;
-                limits.validate()?;
-                if alternates.len() != module.alternates.len() {
-                    return Err(invalid("worker alternate count differs from module"));
-                }
-                // Reserve metadata ceilings for every retained inspected input
-                // and generated output, plus the bounded payload buffer. The
-                // parent still enforces actual RSS with its worker cgroup.
-                let metadata = (alternates.len() as u64)
-                    .checked_add(2)
-                    .and_then(|n| n.checked_mul(limits.metadata_bytes))
-                    .and_then(|n| n.checked_add(limits.buffer_bytes as u64));
-                if metadata.is_none_or(|n| n > module.preparation.max_ram_bytes) {
-                    return Err(crate::Error::Limit(
-                        "aggregate worker metadata exceeds RAM admission".into(),
-                    ));
-                }
-                let profile = profile.profile()?;
-                let base = base.inspect(&limits)?;
-                let alternates = alternates
-                    .into_iter()
-                    .map(|input| input.inspect(&limits))
-                    .collect::<Result<Vec<_>>>()?;
+                let (profile, base, alternates) =
+                    inspect_inputs(&module, profile, base, alternates, &limits, 1)?;
                 let references: Vec<_> = alternates.iter().collect();
                 let staged =
                     export_staged(&module, &profile, &base, &references, &destination, &limits)?;

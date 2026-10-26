@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 nest-types.workspace = true
+nest-model.workspace = true
 nest-meta.workspace = true
 nest-data.workspace = true
 nest-store.workspace = true
@@ -22,6 +23,7 @@ parking_lot.workspace = true
 futures.workspace = true
 bytes.workspace = true
 rand.workspace = true
+nix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

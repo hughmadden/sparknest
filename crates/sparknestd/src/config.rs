@@ -19,6 +19,10 @@ pub struct Config {
     pub hf: HfSection,
     #[serde(default)]
     pub push: PushSection,
+    /// Offline composition work is disabled unless this host is explicitly
+    /// assigned a bounded CPU worker pool. Existing serving nodes stay unassigned.
+    #[serde(default)]
+    pub composition_worker: Option<nest_place::model_worker::Pool>,
 }
 
 /// Push loads (ADR-063): the socket engines connect to.
@@ -319,6 +323,14 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.composition_worker.is_some() && self.node.mountpoint.is_none() {
+            bail!("composition_worker requires node.mountpoint for pinned namespace inputs");
+        }
+        if self.composition_worker.is_some() && !self.fuse.allow_other {
+            bail!(
+                "composition_worker requires fuse.allow_other so the Docker daemon can bind pinned namespace inputs"
+            );
+        }
         let mut ids: Vec<_> = self.cluster.members.iter().map(|m| m.id).collect();
         ids.sort();
         ids.dedup();

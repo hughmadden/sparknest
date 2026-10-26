@@ -131,6 +131,36 @@ pub fn check(c: &Connection) -> rusqlite::Result<Vec<String>> {
          WHERE NOT EXISTS(SELECT 1 FROM model_snapshot_files m WHERE m.key = s.key AND m.root = s.root AND m.name = d.name AND m.file = d.child)",
         "unbound prepared snapshot entry",
     )?;
+    q(
+        "SELECT name FROM model_modules WHERE revision <= 0 OR name = '' OR spec = '' OR profile = '' OR key = '' OR qualification_policy = ''",
+        "invalid model module declaration",
+    )?;
+    q(
+        "SELECT printf('%s epoch %d', p.key, p.epoch) FROM model_publications p \
+         LEFT JOIN model_artifacts a ON a.key = p.key \
+         WHERE a.key IS NULL OR p.epoch <= 0 OR p.epoch > a.epoch OR p.root <= 1 \
+         OR p.export_file <= 1 OR p.export_gen <= 0 OR p.qualification_file <= 1 OR p.qualification_gen <= 0 \
+         OR p.publication = '' OR p.qualification_policy = '' OR p.publication IS NOT a.publication",
+        "invalid complete publication evidence",
+    )?;
+    q(
+        "SELECT printf('%s epoch %d', p.key, p.epoch) FROM model_publications p \
+         JOIN model_artifacts a ON a.key = p.key AND a.epoch = p.epoch \
+         WHERE a.state IN ('ready', 'unavailable') AND ( \
+         NOT EXISTS(SELECT 1 FROM model_snapshots s WHERE s.key = p.key AND s.root = p.root AND s.output = 1) \
+         OR NOT EXISTS(SELECT 1 FROM model_pins r WHERE r.key = p.key AND r.file = p.export_file AND r.gen = p.export_gen) \
+         OR NOT EXISTS(SELECT 1 FROM model_pins r WHERE r.key = p.key AND r.file = p.qualification_file AND r.gen = p.qualification_gen))",
+        "complete publication lost its snapshot or receipt pins",
+    )?;
+    // Historical ownership is retained after cleanup; missing/renamed files
+    // are therefore valid. These rows prove an import, not current ownership.
+    q(
+        "SELECT printf('%s epoch %d file %d', o.key, o.epoch, o.file) FROM model_owned_outputs o \
+         LEFT JOIN model_artifacts a ON a.key = o.key \
+         WHERE a.key IS NULL OR o.epoch <= 0 OR o.epoch > a.epoch OR o.gen != 1 \
+         OR o.parent <= 0 OR o.file <= 1 OR length(o.name) = 0 OR length(o.name) > 255",
+        "invalid derived import proof",
+    )?;
     // Directory cycles: walk parents from every directory.
     let dirs: Vec<(i64, i64)> = c
         .prepare("SELECT id, parent FROM files WHERE kind = 2")?

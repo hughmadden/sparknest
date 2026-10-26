@@ -220,6 +220,7 @@ impl TestCluster {
                     .collect(),
             },
             fabric: FabricSection::default(),
+            composition_worker: None,
             fuse: FuseSection {
                 allow_other: false,
                 ttl_ms: 1000,

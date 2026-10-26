@@ -247,8 +247,12 @@ async fn hf_style_download_is_sealed_at_rename() {
     .await
     .unwrap();
     c.eventually("sealed after finalize", Duration::from_secs(3), |c| {
-        c.attr(1, a.id)
-            .is_some_and(|x| x.sealed && x.gen_state == GenState::Stable)
+        // Finalize is asynchronous after rename. The writable-open assertion
+        // below uses node 2's local applied state, so wait for it as well.
+        (1..=2).all(|id| {
+            c.attr(id, a.id)
+                .is_some_and(|x| x.sealed && x.gen_state == GenState::Stable)
+        })
     })
     .await;
     assert!(matches!(

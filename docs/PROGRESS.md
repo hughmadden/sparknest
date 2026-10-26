@@ -3,6 +3,35 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-26 — Managed composition and exact preparation proof
+
+- Added an explicitly assigned bounded CPU pool, durable launch/stop records,
+  actual Docker limit/mount verification, exact-container reconciliation and
+  native staging/adoption. All new exporter writes share one hard regular-file
+  byte ceiling; disk block/directory overhead is separately reserved and checked.
+- Added CAS module declarations, immutable input flattening, ordinary output
+  assembly, complete publication with separate pinned evidence, resolve/use/release,
+  safe-boundary cancellation and explicit recovery. Unknown worker death remains
+  pinned. Nodes without a pool never start preparation automatically (ADR-074).
+- Added the real exact CPU policy: it streams every output tensor against its
+  intended winner and validates layout/assets/provenance. Unknown/lossy/static
+  calibration gates refuse. This proves preparation only, with no engine,
+  behavioral, hardware or performance qualification claim.
+- Reset includes orphaned keys and reports per-key blocked/deferred results.
+  Atomic import proofs authorize only owned derived shard reclamation after
+  retirement, preserving sources, reused files, assets and receipt evidence.
+  Reported bytes are logical last-alias sizes rather than measured physical release.
+- Added `nest model`, the documented HTTP API, an opt-in worker configuration and
+  the operator workflow in `docs/MODEL-COMPOSITION.md`. Private modules/identities
+  and receipts stay outside public history. No cuteafd source changes were made.
+- Focused fault tests cover pre-start limits, uncertain launch/removal, abort/restart,
+  exact proof/corruption, policy/epoch/CAS/usage/reset and alias replacement. Two
+  actual CPU-only Docker/FUSE trials passed: staged assembly, proof, resolve,
+  usage/deferred reset, stable rebuild publication and zero launches on a cache hit.
+  Synthetic mounts/containers were removed. No model load or live storage deployment
+  is claimed; assigned real checkpoint/consumer/fabric tests remain a separate gate.
+
+
 ## 2026-10-26 — Detached export and offline CPU worker
 
 - Added detached export: native staging contains only changed independent files

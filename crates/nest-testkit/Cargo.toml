@@ -26,6 +26,8 @@ tracing-subscriber.workspace = true
 rusqlite.workspace = true
 
 [dev-dependencies]
+nest-model.workspace = true
+nest-fuse.workspace = true
 nest-push.workspace = true
 nix = { workspace = true, features = ["fs", "user"] }
 libc.workspace = true
