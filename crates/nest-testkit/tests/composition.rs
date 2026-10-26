@@ -9,11 +9,25 @@ use nest_types::*;
 async fn preparation_pins_and_usage_survive_leader_loss() {
     let mut c = TestCluster::start(3).await;
     let now = Timestamp::now();
+    let Reply::Attr(snapshot) = c
+        .node(1)
+        .meta
+        .propose(Command::Mkdir {
+            parent: FileId::ROOT,
+            name: b"snapshot".to_vec(),
+            perm: 0o755,
+            now,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("mkdir")
+    };
     let Reply::Created(created) = c
         .node(1)
         .meta
         .propose(Command::Create {
-            parent: FileId::ROOT,
+            parent: snapshot.id,
             name: b"fixture".to_vec(),
             perm: 0o644,
             node: NodeId(1),
@@ -62,11 +76,13 @@ async fn preparation_pins_and_usage_survive_leader_loss() {
         panic!("claim")
     };
     for op in [
-        ModelCommand::Pin {
+        ModelCommand::BindSnapshot {
             key: "fixture".into(),
             owner: "worker".into(),
             epoch,
-            files: vec![(a.id, a.generation)],
+            root: snapshot.id,
+            output: true,
+            files: vec![(b"fixture".to_vec(), a.id, a.generation)],
         },
         ModelCommand::Publish {
             key: "fixture".into(),
@@ -116,7 +132,25 @@ async fn preparation_pins_and_usage_survive_leader_loss() {
         assert_eq!(entry.state, "ready");
         assert_eq!(entry.leases, ["model-ranks"]);
         assert_eq!(entry.files, [(a.id, a.generation)]);
+        assert_eq!(
+            composition::snapshots(&reader, "fixture").unwrap()[0].root,
+            snapshot.id
+        );
     }
+    assert!(matches!(
+        c.node(survivor)
+            .meta
+            .propose(Command::Rename {
+                parent: FileId::ROOT,
+                name: b"snapshot".to_vec(),
+                new_parent: FileId::ROOT,
+                new_name: b"renamed".to_vec(),
+                flags: Default::default(),
+                now,
+            })
+            .await,
+        Err(NestError::Busy(_))
+    ));
     // Losing the sole physical copy must be reported by startup reconciliation
     // even while the generation is pinned. Its existing user remains protected.
     let path = c.node(1).data.store().path(object);
@@ -170,5 +204,10 @@ async fn preparation_pins_and_usage_survive_leader_loss() {
     assert_eq!(
         composition::get(&reader, "fixture").unwrap().unwrap().state,
         "retired"
+    );
+    assert!(
+        composition::snapshots(&reader, "fixture")
+            .unwrap()
+            .is_empty()
     );
 }

@@ -449,6 +449,7 @@ fn flags(c: &Connection, id: FileId) -> R<i64> {
 }
 
 fn insert_dentry(c: &Connection, parent: FileId, name: &[u8], child: FileId) -> R<()> {
+    crate::composition::writable_directory(c, parent)?;
     let cookie = kv_next(c, "next_cookie")?;
     c.prepare_cached("INSERT INTO dentries (parent, name, child, cookie) VALUES (?1, ?2, ?3, ?4)")?
         .execute(params![parent.0 as i64, name, child.0 as i64, cookie])?;
@@ -456,6 +457,7 @@ fn insert_dentry(c: &Connection, parent: FileId, name: &[u8], child: FileId) -> 
 }
 
 fn remove_dentry(c: &Connection, parent: FileId, name: &[u8]) -> R<()> {
+    crate::composition::writable_directory(c, parent)?;
     c.prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")?
         .execute(params![parent.0 as i64, name])?;
     Ok(())
@@ -874,6 +876,7 @@ fn remove_directory(
     if attr(c, child)?.kind != FileKind::Directory {
         return err(NestError::NotDir);
     }
+    crate::composition::movable_directory(c, child)?;
     if !query::dir_is_empty(c, child)? {
         return err(NestError::NotEmpty);
     }
@@ -921,6 +924,16 @@ fn rename(
     };
     let src_attr = attr(c, src)?;
     let dst = query::lookup(c, new_parent, new_name)?;
+    crate::composition::writable_directory(c, parent)?;
+    crate::composition::writable_directory(c, new_parent)?;
+    if src_attr.kind == FileKind::Directory {
+        crate::composition::movable_directory(c, src)?;
+    }
+    if let Some(dst) = dst
+        && attr(c, dst)?.kind == FileKind::Directory
+    {
+        crate::composition::movable_directory(c, dst)?;
+    }
 
     if flags.exchange {
         let Some(dst) = dst else {
@@ -1017,6 +1030,14 @@ fn setattr(
     fx: &mut Vec<Effect>,
 ) -> R<Reply> {
     attr(c, file)?;
+    if perm.is_some() {
+        if crate::composition::is_pinned(c, file)? {
+            return err(NestError::Busy(
+                "prepared file permissions are immutable".into(),
+            ));
+        }
+        crate::composition::movable_directory(c, file)?;
+    }
     c.prepare_cached(
         "UPDATE files SET perm = COALESCE(?2, perm), atime = COALESCE(?3, atime), mtime = COALESCE(?4, mtime), ctime = ?5 WHERE id = ?1",
     )?

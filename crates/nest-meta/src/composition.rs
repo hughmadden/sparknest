@@ -7,6 +7,7 @@ use crate::{Reply, query};
 use nest_types::{FileId, FileKind, GenState, Generation, NestError, ReplicaState};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Persisted inside Command::Model: append variants only (ADR-018).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +57,16 @@ pub enum ModelCommand {
         epoch: u64,
         reset: u64,
     },
+    /// Atomically protect an exact flat namespace inventory and pin its sealed
+    /// generations. Input acquisition aliases are resolved before this command.
+    BindSnapshot {
+        key: String,
+        owner: String,
+        epoch: u64,
+        root: FileId,
+        output: bool,
+        files: Vec<(Vec<u8>, FileId, Generation)>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +86,75 @@ pub struct ModelEntry {
     pub reset_id: Option<u64>,
     pub files: Vec<(FileId, Generation)>,
     pub leases: Vec<String>,
+}
+
+/// Query DTO, not a persisted log type. Names bind ordinary regular files;
+/// this is neither an extent map nor a different data-plane representation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSnapshot {
+    pub root: FileId,
+    pub output: bool,
+    pub files: Vec<(Vec<u8>, FileId, Generation)>,
+}
+
+pub fn snapshots(c: &Connection, key: &str) -> rusqlite::Result<Vec<ModelSnapshot>> {
+    let mut roots = c
+        .prepare_cached("SELECT root, output FROM model_snapshots WHERE key = ?1 ORDER BY root")?
+        .query_map([key], |r| {
+            Ok(ModelSnapshot {
+                root: FileId(r.get::<_, i64>(0)? as u64),
+                output: r.get(1)?,
+                files: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for root in &mut roots {
+        root.files = c.prepare_cached(
+            "SELECT name, file, gen FROM model_snapshot_files WHERE key = ?1 AND root = ?2 ORDER BY name",
+        )?.query_map(params![key, root.root.0 as i64], |r| Ok((
+            r.get(0)?, FileId(r.get::<_, i64>(1)? as u64), Generation(r.get::<_, i64>(2)? as u64),
+        )))?.collect::<rusqlite::Result<_>>()?;
+    }
+    Ok(roots)
+}
+
+pub(crate) fn writable_directory(c: &Connection, dir: FileId) -> R<()> {
+    let bound: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM model_snapshots WHERE root = ?1)",
+        [dir.0 as i64],
+        |r| r.get(0),
+    )?;
+    if bound {
+        return err(NestError::Busy(
+            "prepared snapshot inventory is immutable".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Moving a root or any of its ancestors changes the resolved snapshot path.
+pub(crate) fn movable_directory(c: &Connection, dir: FileId) -> R<()> {
+    let protected: bool = c.query_row(
+        "WITH RECURSIVE ancestors(id, parent) AS (\
+         SELECT f.id, f.parent FROM model_snapshots s JOIN files f ON f.id = s.root \
+         UNION SELECT f.id, f.parent FROM files f JOIN ancestors a ON f.id = a.parent) \
+         SELECT EXISTS(SELECT 1 FROM ancestors WHERE id = ?1)",
+        [dir.0 as i64],
+        |r| r.get(0),
+    )?;
+    if protected {
+        return err(NestError::Busy(
+            "prepared snapshot path is immutable".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn release_pins(c: &Connection, key: &str) -> R<()> {
+    c.execute("DELETE FROM model_snapshot_files WHERE key = ?1", [key])?;
+    c.execute("DELETE FROM model_snapshots WHERE key = ?1", [key])?;
+    c.execute("DELETE FROM model_pins WHERE key = ?1", [key])?;
+    Ok(())
 }
 
 pub fn get(c: &Connection, key: &str) -> rusqlite::Result<Option<ModelEntry>> {
@@ -153,7 +233,7 @@ fn retire(c: &Connection, key: &str) -> R<()> {
     // Retire the catalog reference before releasing its generation pins. The
     // manager may subsequently reclaim only its own unreferenced derived files.
     c.execute("UPDATE model_artifacts SET state = 'retired', owner = NULL, reset_pending = 0 WHERE key = ?1", [key])?;
-    c.execute("DELETE FROM model_pins WHERE key = ?1", [key])?;
+    release_pins(c, key)?;
     Ok(())
 }
 
@@ -204,6 +284,10 @@ pub(crate) fn exec(c: &Connection, command: &ModelCommand) -> R<Reply> {
         } => {
             token(publication)?;
             let a = worker(c, key, owner, *epoch)?;
+            let roots = snapshots(c, key)?;
+            if !roots.is_empty() && !roots.iter().any(|r| r.output) {
+                return err(NestError::Invalid("no bound output snapshot".into()));
+            }
             if a.files.is_empty() {
                 return err(NestError::Invalid("no pinned output generations".into()));
             }
@@ -235,7 +319,7 @@ pub(crate) fn exec(c: &Connection, command: &ModelCommand) -> R<Reply> {
                 "UPDATE model_artifacts SET state = 'failed', owner = NULL WHERE key = ?1",
                 [key],
             )?;
-            c.execute("DELETE FROM model_pins WHERE key = ?1", [key])?;
+            release_pins(c, key)?;
             if a.reset_pending {
                 retire(c, key)?;
             }
@@ -332,6 +416,67 @@ pub(crate) fn exec(c: &Connection, command: &ModelCommand) -> R<Reply> {
                 "UPDATE model_artifacts SET reset_pending = 0 WHERE key = ?1",
                 [key],
             )?;
+            Ok(Reply::Done)
+        }
+        ModelCommand::BindSnapshot {
+            key,
+            owner,
+            epoch,
+            root,
+            output,
+            files,
+        } => {
+            worker(c, key, owner, *epoch)?;
+            let directory = query::getattr(c, *root)?.ok_or(Fail::Nest(NestError::NotFound))?;
+            if *root == FileId::ROOT
+                || directory.kind != FileKind::Directory
+                || directory.nlink == 0
+                || files.is_empty()
+            {
+                return err(NestError::Invalid(
+                    "snapshot requires a named nonempty flat directory".into(),
+                ));
+            }
+            let mut names = BTreeSet::new();
+            for (name, file, generation) in files {
+                nest_types::validate_name(name)?;
+                if !names.insert(name) || query::lookup(c, *root, name)? != Some(*file) {
+                    return err(NestError::Invalid(
+                        "snapshot names differ from manifest".into(),
+                    ));
+                }
+                validate_file(c, *file, *generation)?;
+            }
+            let count: i64 = c.query_row(
+                "SELECT count(*) FROM dentries WHERE parent = ?1",
+                [root.0 as i64],
+                |r| r.get(0),
+            )?;
+            if count as usize != files.len() {
+                return err(NestError::Invalid(
+                    "snapshot manifest does not cover every entry".into(),
+                ));
+            }
+            if let Some(previous) = snapshots(c, key)?.iter().find(|r| r.root == *root) {
+                if previous.output != *output {
+                    return err(NestError::Invalid("snapshot role already bound".into()));
+                }
+                return Ok(Reply::Done);
+            }
+            if *output && snapshots(c, key)?.iter().any(|r| r.output) {
+                return err(NestError::Exists);
+            }
+            c.execute(
+                "INSERT INTO model_snapshots (key, root, output) VALUES (?1, ?2, ?3)",
+                params![key, root.0 as i64, output],
+            )?;
+            for (name, file, generation) in files {
+                c.execute("INSERT INTO model_snapshot_files (key, root, name, file, gen) VALUES (?1, ?2, ?3, ?4, ?5)", params![key, root.0 as i64, name, file.0 as i64, generation.0 as i64])?;
+                c.execute(
+                    "INSERT OR IGNORE INTO model_pins (key, file, gen) VALUES (?1, ?2, ?3)",
+                    params![key, file.0 as i64, generation.0 as i64],
+                )?;
+            }
             Ok(Reply::Done)
         }
     }

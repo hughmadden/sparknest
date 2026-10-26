@@ -110,6 +110,27 @@ pub fn check(c: &Connection) -> rusqlite::Result<Vec<String>> {
          ON a.key = u.key WHERE u.released = 0 AND (a.key IS NULL OR a.state NOT IN ('ready', 'unavailable'))",
         "usage lease without a ready artifact",
     )?;
+    q(
+        "SELECT printf('%s root %d', s.key, s.root) FROM model_snapshots s \
+         LEFT JOIN model_artifacts a ON a.key = s.key LEFT JOIN files f ON f.id = s.root \
+         WHERE a.key IS NULL OR a.state NOT IN ('preparing', 'ready', 'unavailable') \
+         OR f.id IS NULL OR f.kind != 2 OR f.nlink = 0 OR s.root = 1 \
+         OR NOT EXISTS(SELECT 1 FROM model_snapshot_files m WHERE m.key = s.key AND m.root = s.root)",
+        "invalid prepared snapshot root",
+    )?;
+    q(
+        "SELECT printf('%s root %d file %d', m.key, m.root, m.file) FROM model_snapshot_files m \
+         LEFT JOIN model_snapshots s ON s.key = m.key AND s.root = m.root \
+         LEFT JOIN dentries d ON d.parent = m.root AND d.name = m.name \
+         LEFT JOIN model_pins p ON p.key = m.key AND p.file = m.file AND p.gen = m.gen \
+         WHERE s.key IS NULL OR d.child IS NULL OR d.child != m.file OR p.key IS NULL",
+        "invalid prepared snapshot manifest",
+    )?;
+    q(
+        "SELECT printf('%s root %d', s.key, s.root) FROM model_snapshots s JOIN dentries d ON d.parent = s.root \
+         WHERE NOT EXISTS(SELECT 1 FROM model_snapshot_files m WHERE m.key = s.key AND m.root = s.root AND m.name = d.name AND m.file = d.child)",
+        "unbound prepared snapshot entry",
+    )?;
     // Directory cycles: walk parents from every directory.
     let dirs: Vec<(i64, i64)> = c
         .prepare("SELECT id, parent FROM files WHERE kind = 2")?

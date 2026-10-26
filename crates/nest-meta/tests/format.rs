@@ -366,6 +366,14 @@ fn format_is_pinned() {
             reset: 1,
             key: String::new(),
         },
+        ModelCommand::BindSnapshot {
+            key: String::new(),
+            owner: String::new(),
+            epoch,
+            root: f,
+            output: false,
+            files: vec![],
+        },
     ];
     for (i, command) in model_commands.iter().enumerate() {
         assert_eq!(tag(command) as usize, i, "ModelCommand moved");

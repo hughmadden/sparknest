@@ -1470,3 +1470,552 @@ fn reuse_refuses_replaced_input_inode_before_staging() {
     );
     assert!(!output.exists());
 }
+
+const SIDECAR: &str = "alternate-checkpoint.safetensors";
+
+fn raw_sidecar(root: &Path, header: serde_json::Value, payload: &[u8], groups: Option<&[&str]>) {
+    fs::create_dir_all(root).unwrap();
+    rewrite_shard(root, SIDECAR, header, payload);
+    if let Some(groups) = groups {
+        fs::write(
+            root.join("groups.json"),
+            serde_json::to_vec(&json!({
+                "schema":"sparknest.model-selection.v1", "groups":groups
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+fn inspect_raw(root: &Path, selection: bool) -> Snapshot {
+    Snapshot::inspect_sidecar(
+        root,
+        SIDECAR,
+        selection.then_some("groups.json"),
+        &ExportLimits::default(),
+    )
+    .unwrap()
+}
+
+fn replacement_config(base: &Snapshot, alternates: &[(&Snapshot, &str)]) -> ModuleConfig {
+    let mut result = config(base, alternates);
+    for alternate in &mut result.alternates {
+        alternate.kind = nest_model::SourceKind::Replacement;
+    }
+    result
+}
+
+#[test]
+fn raw_sparse_replacement_falls_back_and_preserves_base_metadata_and_identity_binding() {
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    let ap = temp.path().join("alternate-checkpoint");
+    snapshot(&bp, &[1, 2], &[3]);
+    raw_sidecar(
+        &ap,
+        json!({"a":{"dtype":"U8","shape":[2],"data_offsets":[0,2]}}),
+        &[8, 9],
+        None,
+    );
+    let base = inspect(&bp);
+    let alt = inspect_raw(&ap, false);
+    assert!(alt.is_sidecar());
+    assert!(!base.is_sidecar());
+    assert_eq!(alt.files().len(), 1);
+    let mut config = replacement_config(&base, &[(&alt, "all")]);
+    let plan = resolve(
+        &config,
+        &profile(false),
+        &base,
+        &[&alt],
+        &ExportLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.winners()["a"], Some(0));
+    assert_eq!(plan.winners()["b"], None);
+    for reuse in [false, true] {
+        config.cache.reuse_unchanged = reuse;
+        let output = temp.path().join(if reuse { "reuse" } else { "copy" });
+        let receipt = export(
+            &config,
+            &profile(false),
+            &base,
+            &[&alt],
+            &output,
+            &ExportLimits::default(),
+        )
+        .unwrap();
+        let result = inspect(&output);
+        assert!(!result.is_sidecar());
+        assert_eq!(result.tensor_bytes("a", 2).unwrap(), [8, 9]);
+        assert_eq!(result.tensor_bytes("b", 1).unwrap(), [3]);
+        for name in ["config.json", "tokenizer.json"] {
+            assert_eq!(
+                fs::read(output.join(name)).unwrap(),
+                fs::read(bp.join(name)).unwrap()
+            );
+        }
+        let before = fs::read(bp.join(SHARD)).unwrap();
+        let after = fs::read(output.join(SHARD)).unwrap();
+        let prefix = 8 + u64::from_le_bytes(before[..8].try_into().unwrap()) as usize;
+        assert_eq!(&before[..prefix], &after[..prefix]);
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("model.safetensors.index.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            index["metadata"]["sparknest_payload_manifest"],
+            receipt.payload_manifest.to_string()
+        );
+        assert_eq!(receipt.files[SHARD].digest, Digest::of(&after));
+        assert_ne!(receipt.files[SHARD], base.files()[SHARD]);
+    }
+    assert_eq!(fs::read_dir(&ap).unwrap().count(), 1);
+}
+
+#[test]
+fn raw_payload_and_scale_offsets_can_differ_from_canonical_output() {
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    let ap = temp.path().join("alternate-checkpoint");
+    snapshot(&bp, &[1, 2], &[3]);
+    rewrite_shard(
+        &bp,
+        SHARD,
+        json!({
+            "a":{"dtype":"F8_E4M3","shape":[2],"data_offsets":[0,2]},
+            "b":{"dtype":"F8_E8M0","shape":[1],"data_offsets":[2,3]}
+        }),
+        &[1, 2, 3],
+    );
+    raw_sidecar(
+        &ap,
+        json!({
+            "a":{"dtype":"F8_E4M3","shape":[2],"data_offsets":[1,3]},
+            "b":{"dtype":"F8_E8M0","shape":[1],"data_offsets":[0,1]}
+        }),
+        &[6, 4, 5],
+        Some(&["a"]),
+    );
+    let base = inspect(&bp);
+    let alt = inspect_raw(&ap, true);
+    let config = replacement_config(&base, &[(&alt, "producer-manifest")]);
+    let output = temp.path().join("output");
+    export(
+        &config,
+        &profile(true),
+        &base,
+        &[&alt],
+        &output,
+        &ExportLimits::default(),
+    )
+    .unwrap();
+    let result = inspect(&output);
+    assert_eq!(result.tensor_bytes("a", 2).unwrap(), [4, 5]);
+    assert_eq!(result.tensor_bytes("b", 1).unwrap(), [6]);
+}
+
+#[test]
+fn raw_ordering_and_reference_and_kind_contracts() {
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    let ap = temp.path().join("alternate-checkpoint");
+    let ap2 = temp.path().join("second/alternate-checkpoint");
+    snapshot(&bp, &[1], &[2]);
+    let header = json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}});
+    raw_sidecar(&ap, header.clone(), &[3], None);
+    raw_sidecar(&ap2, header, &[4], None);
+    let base = inspect(&bp);
+    let alt = inspect_raw(&ap, false);
+    let alt2 = inspect_raw(&ap2, false);
+    let mut config = replacement_config(&base, &[(&alt, "all"), (&alt2, "all")]);
+    config.alternates[1].requires =
+        nest_model::Reference::LowerCompositionKey(config.prefix_key(&profile(false), 1).unwrap());
+    let plan = resolve(
+        &config,
+        &profile(false),
+        &base,
+        &[&alt, &alt2],
+        &ExportLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.winners()["a"], Some(1));
+    assert_eq!(plan.winners()["b"], None);
+    assert_eq!(plan.shadowed().len(), 1);
+    config.alternates[1].requires = nest_model::Reference::BaseManifest(Digest::of(b"wrong"));
+    assert!(
+        resolve(
+            &config,
+            &profile(false),
+            &base,
+            &[&alt, &alt2],
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+    config.alternates.truncate(1);
+    config.alternates[0].kind = nest_model::SourceKind::Checkpoint;
+    assert!(
+        resolve(
+            &config,
+            &profile(false),
+            &base,
+            &[&alt],
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+    config.alternates[0].kind = nest_model::SourceKind::Lora;
+    assert!(matches!(
+        resolve(
+            &config,
+            &profile(false),
+            &base,
+            &[&alt],
+            &ExportLimits::default()
+        ),
+        Err(nest_model::Error::Unsupported(_))
+    ));
+    let config = replacement_config(&alt, &[]);
+    let single = Profile::new(
+        BTreeMap::from([("a".into(), BTreeSet::from(["a".into()]))]),
+        false,
+    )
+    .unwrap();
+    assert!(resolve(&config, &single, &alt, &[], &ExportLimits::default()).is_err());
+}
+
+#[test]
+fn raw_incomplete_companion_and_unknown_groups_and_tensors_refuse() {
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    let ap = temp.path().join("alternate-checkpoint");
+    snapshot(&bp, &[1], &[2]);
+    raw_sidecar(
+        &ap,
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        &[3],
+        Some(&["b"]),
+    );
+    let base = inspect(&bp);
+    let alt = inspect_raw(&ap, true);
+    for selection in ["all", "producer-manifest"] {
+        let config = replacement_config(&base, &[(&alt, selection)]);
+        assert!(
+            resolve(
+                &config,
+                &profile(true),
+                &base,
+                &[&alt],
+                &ExportLimits::default()
+            )
+            .is_err()
+        );
+    }
+    let config = replacement_config(&base, &[(&alt, "producer-manifest")]);
+    assert!(
+        resolve(
+            &config,
+            &profile(false),
+            &base,
+            &[&alt],
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn raw_bundle_confinement_and_complete_byte_coverage() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("alternate-checkpoint");
+    raw_sidecar(
+        &root,
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        &[1],
+        None,
+    );
+    assert!(
+        Snapshot::inspect_sidecar(
+            &root,
+            "../alternate-checkpoint.safetensors",
+            None,
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+    assert!(
+        Snapshot::inspect_sidecar(
+            &root,
+            SIDECAR,
+            Some("../groups.json"),
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+    let original = fs::read(root.join(SIDECAR)).unwrap();
+    for bytes in [
+        original[..original.len() - 1].to_vec(),
+        [original.clone(), vec![9]].concat(),
+        vec![255; 8],
+    ] {
+        fs::write(root.join(SIDECAR), bytes).unwrap();
+        assert!(Snapshot::inspect_sidecar(&root, SIDECAR, None, &ExportLimits::default()).is_err());
+    }
+    fs::write(root.join(SIDECAR), original).unwrap();
+    fs::write(root.join("checkpoint.py"), b"raise Exception()").unwrap();
+    assert!(Snapshot::inspect_sidecar(&root, SIDECAR, None, &ExportLimits::default()).is_err());
+}
+
+#[test]
+fn raw_content_identity_uses_file_roles_not_acquisition_filenames() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("alternate-checkpoint");
+    raw_sidecar(
+        &root,
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        &[1],
+        Some(&["a"]),
+    );
+    let first = inspect_raw(&root, true);
+    fs::rename(root.join(SIDECAR), root.join("renamed.safetensors")).unwrap();
+    fs::rename(root.join("groups.json"), root.join("selection.json")).unwrap();
+    let second = Snapshot::inspect_sidecar(
+        &root,
+        "renamed.safetensors",
+        Some("selection.json"),
+        &ExportLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(first.content_manifest(), second.content_manifest());
+    let roles = BTreeMap::from([
+        ("selection", first.files()["groups.json"].clone()),
+        ("tensors", first.files()[SIDECAR].clone()),
+    ]);
+    assert_eq!(
+        *second.content_manifest(),
+        Digest::of(&serde_json::to_vec(&("sparknest.sidecar-input-manifest.v1", roles)).unwrap())
+    );
+}
+
+#[test]
+fn raw_unknown_tensor_cannot_extend_base_inventory() {
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    let ap = temp.path().join("alternate-checkpoint");
+    snapshot(&bp, &[1], &[]);
+    rewrite_shard(
+        &bp,
+        SHARD,
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        &[1],
+    );
+    fs::write(
+        bp.join("model.safetensors.index.json"),
+        serde_json::to_vec(&json!({"metadata":{"total_size":1},"weight_map":{"a":SHARD}})).unwrap(),
+    )
+    .unwrap();
+    raw_sidecar(
+        &ap,
+        json!({"b":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        &[2],
+        None,
+    );
+    let base = inspect(&bp);
+    let alt = inspect_raw(&ap, false);
+    let config = replacement_config(&base, &[(&alt, "all")]);
+    let single = Profile::new(
+        BTreeMap::from([("a".into(), BTreeSet::from(["a".into()]))]),
+        false,
+    )
+    .unwrap();
+    assert!(
+        matches!(resolve(&config,&single,&base,&[&alt],&ExportLimits::default()),Err(nest_model::Error::Invalid(message)) if message.contains("unknown alternate tensor"))
+    );
+}
+
+#[test]
+fn raw_shape_dtype_and_representation_mismatches_refuse() {
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    let ap = temp.path().join("alternate-checkpoint");
+    snapshot(&bp, &[1], &[2]);
+    let base = inspect(&bp);
+    for header in [
+        json!({"a":{"dtype":"U8","shape":[1,1],"data_offsets":[0,1]}}),
+        json!({"a":{"dtype":"I8","shape":[1],"data_offsets":[0,1]}}),
+        json!({"__metadata__":{"format":"alternate"},"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+    ] {
+        raw_sidecar(&ap, header, &[3], None);
+        let alt = inspect_raw(&ap, false);
+        let config = replacement_config(&base, &[(&alt, "all")]);
+        assert!(
+            resolve(
+                &config,
+                &profile(false),
+                &base,
+                &[&alt],
+                &ExportLimits::default()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn raw_selection_is_strict_and_digest_bound() {
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    let ap = temp.path().join("alternate-checkpoint");
+    snapshot(&bp, &[1], &[2]);
+    raw_sidecar(
+        &ap,
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        &[3],
+        Some(&["a"]),
+    );
+    let base = inspect(&bp);
+    let alt = inspect_raw(&ap, true);
+    let mut config = replacement_config(&base, &[(&alt, "producer-manifest")]);
+    config.alternates[0].selection_manifest_digest = Some(Digest::of(b"wrong"));
+    assert!(
+        resolve(
+            &config,
+            &profile(false),
+            &base,
+            &[&alt],
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+    for selection in [
+        br#"{"schema":"sparknest.model-selection.v2","groups":["a"]}"#.as_slice(),
+        br#"{"schema":"sparknest.model-selection.v1","groups":["a","a"]}"#,
+        br#"{"schema":"sparknest.model-selection.v1","groups":[""]}"#,
+        br#"{"schema":"sparknest.model-selection.v1","groups":["a"],"extra":true}"#,
+        br#"{"schema":"sparknest.model-selection.v1","groups":["a"],"groups":["b"]}"#,
+    ] {
+        fs::write(ap.join("groups.json"), selection).unwrap();
+        assert!(
+            Snapshot::inspect_sidecar(&ap, SIDECAR, Some("groups.json"), &ExportLimits::default())
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn raw_limits_and_header_schema_validation() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("alternate-checkpoint");
+    raw_sidecar(
+        &root,
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"b":{"dtype":"U8","shape":[1],"data_offsets":[1,2]}}),
+        &[1, 2],
+        Some(&["a"]),
+    );
+    for limits in [
+        ExportLimits {
+            max_files: 1,
+            ..ExportLimits::default()
+        },
+        ExportLimits {
+            max_tensors: 1,
+            ..ExportLimits::default()
+        },
+        ExportLimits {
+            metadata_bytes: 8,
+            ..ExportLimits::default()
+        },
+    ] {
+        assert!(Snapshot::inspect_sidecar(&root, SIDECAR, Some("groups.json"), &limits).is_err());
+    }
+    for header in [
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[1,2]}}),
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"b":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1],"extra":true}}),
+        json!({"a":{"dtype":"unknown","shape":[1],"data_offsets":[0,1]}}),
+    ] {
+        rewrite_shard(&root, SIDECAR, header, &[1, 2]);
+        assert!(
+            Snapshot::inspect_sidecar(
+                &root,
+                SIDECAR,
+                Some("groups.json"),
+                &ExportLimits::default()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_bundle_refuses_declared_symlinks_and_undeclared_json() {
+    use std::os::unix::fs::symlink;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("alternate-checkpoint");
+    raw_sidecar(
+        &root,
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        &[1],
+        None,
+    );
+    let actual = temp.path().join("actual.safetensors");
+    fs::rename(root.join(SIDECAR), &actual).unwrap();
+    symlink(&actual, root.join(SIDECAR)).unwrap();
+    assert!(Snapshot::inspect_sidecar(&root, SIDECAR, None, &ExportLimits::default()).is_err());
+    let root2 = temp.path().join("second/alternate-checkpoint");
+    raw_sidecar(
+        &root2,
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        &[1],
+        Some(&["a"]),
+    );
+    assert!(Snapshot::inspect_sidecar(&root2, SIDECAR, None, &ExportLimits::default()).is_err());
+    let selection = temp.path().join("selection.json");
+    fs::rename(root2.join("groups.json"), &selection).unwrap();
+    symlink(&selection, root2.join("groups.json")).unwrap();
+    assert!(
+        Snapshot::inspect_sidecar(
+            &root2,
+            SIDECAR,
+            Some("groups.json"),
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn raw_reuse_pins_reject_replaced_bundle_files_before_staging() {
+    let temp = TempDir::new().unwrap();
+    let bp = temp.path().join("base-checkpoint");
+    let ap = temp.path().join("alternate-checkpoint");
+    snapshot(&bp, &[1], &[2]);
+    raw_sidecar(
+        &ap,
+        json!({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}),
+        &[3],
+        None,
+    );
+    let base = inspect(&bp);
+    let alt = inspect_raw(&ap, false);
+    let mut config = replacement_config(&base, &[(&alt, "all")]);
+    config.cache.reuse_unchanged = true;
+    let replacement = temp.path().join("replacement.safetensors");
+    fs::write(&replacement, fs::read(ap.join(SIDECAR)).unwrap()).unwrap();
+    fs::rename(replacement, ap.join(SIDECAR)).unwrap();
+    let output = temp.path().join("output");
+    assert!(
+        export(
+            &config,
+            &profile(false),
+            &base,
+            &[&alt],
+            &output,
+            &ExportLimits::default()
+        )
+        .is_err()
+    );
+    assert!(!output.exists());
+}

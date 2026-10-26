@@ -2515,3 +2515,37 @@ files, host paths and qualification receipts stay outside public source history.
 The first metadata/planner increment alone is not an enabled preparation service:
 API orchestration, resource admission, worker cancellation/recovery and external
 usage-wrapper integration must pass their gates before live promotion.
+
+## ADR-073 — Bind prepared snapshot names as well as generations
+
+**Status:** accepted, 2026-10-26.
+
+**Context.** An exact generation pin prevents changing bytes or deleting their
+last namespace reference. It does not prevent replacing one snapshot alias when
+another alias exists, adding unexpected files, or moving the snapshot's parent.
+An explicit checkpoint path therefore needs its own namespace lifetime.
+
+**Decision.** Append an epoch/owner-fenced snapshot binding command. It checks
+the complete flat inventory of names and sealed current regular generations,
+then atomically records that manifest and its generation pins. No symlinks,
+subdirectories, missing or extra names, duplicate names, or mutable generations
+are admitted. A preparation may bind several inputs and one output. A preparation
+using snapshot bindings cannot publish an input-only inventory.
+
+While any artifact binds a root, namespace insertion/removal/replacement within
+it is refused, including import and rename exchange. Moving the root or any
+ancestor and changing protected path/file permissions is also refused. Siblings
+and external aliases remain ordinary namespace entries; generation pins still
+guard their bytes. Bindings persist through READY, unavailable state, consumer
+usage and deferred reset. Only actual worker-stop cleanup or artifact retirement
+releases that artifact's bindings. Shared roots stay protected by other artifacts.
+
+Schema version 5 adds root and inventory tables; log variants remain append-only.
+Metadata fsck and incoming snapshot validation reject broken bindings. This
+records a namespace manifest, not content checksums or a new data-plane format.
+
+**Consequences.** Managers must assemble private, flat regular-file snapshots
+before binding and return only their immutable explicit paths. Binding validates
+namespace/generation coverage; worker verification, resource admission, numerical
+qualification and proof of derived deletion ownership remain manager obligations.
+Legacy pin-only metadata primitives are not a public preparation interface.

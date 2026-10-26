@@ -74,6 +74,15 @@ struct Index {
     weight_map: BTreeMap<String, String>,
 }
 
+#[derive(Debug)]
+enum SourceLayout {
+    Indexed(Index),
+    Sidecar {
+        tensor_filename: String,
+        selection_filename: Option<String>,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TensorSpec {
@@ -102,7 +111,7 @@ pub struct Snapshot {
     root: PathBuf,
     identity: Digest,
     files: BTreeMap<String, FileIdentity>,
-    index: Index,
+    layout: SourceLayout,
     pub(crate) tensors: BTreeMap<String, Tensor>,
     pub(crate) shards: BTreeMap<String, Shard>,
     selection_files: BTreeSet<String>,
@@ -234,9 +243,206 @@ fn dtype_bytes(dtype: &str) -> Result<u64> {
     }
 }
 
+/// Common indexed/raw validation. Every byte after the header must belong to
+/// exactly one tensor range; neither format can smuggle trailing payloads.
+fn inspect_shard(
+    root: &Path,
+    name: &str,
+    remaining: &mut u64,
+    max_tensors: usize,
+) -> Result<(Shard, BTreeMap<String, Tensor>, u64)> {
+    let mut file = regular(root, name)?;
+    let file_size = file.metadata()?.len();
+    let mut prefix = [0; 8];
+    file.read_exact(&mut prefix)?;
+    let header_size = u64::from_le_bytes(prefix);
+    if header_size == 0 || header_size % 8 != 0 {
+        return Err(invalid("invalid safetensors header alignment"));
+    }
+    let payload_start = header_size
+        .checked_add(8)
+        .ok_or_else(|| invalid("header length overflow"))?;
+    if payload_start > file_size {
+        return Err(invalid("header beyond shard length"));
+    }
+    let header = take_metadata(&mut file, header_size, remaining)?;
+    if header.first() != Some(&b'{') {
+        return Err(invalid("safetensors header must begin with object"));
+    }
+    let mut entries: BTreeMap<String, Value> = serde_json::from_value(unique_json(&header)?)?;
+    let metadata = match entries.remove("__metadata__") {
+        Some(value) => serde_json::from_value(value)?,
+        None => BTreeMap::new(),
+    };
+    if entries.is_empty() {
+        return Err(invalid("empty safetensors inventory"));
+    }
+    if entries.len() > max_tensors {
+        return Err(Error::Limit("tensor count budget exceeded".into()));
+    }
+    let mut tensors = BTreeMap::new();
+    let mut ranges = Vec::new();
+    for (tensor_name, value) in entries {
+        if tensor_name.is_empty() {
+            return Err(invalid("empty tensor name"));
+        }
+        let spec: TensorSpec = serde_json::from_value(value)?;
+        let size = spec
+            .shape
+            .iter()
+            .try_fold(dtype_bytes(&spec.dtype)?, |size, dimension| {
+                size.checked_mul(*dimension)
+                    .ok_or_else(|| invalid("tensor size overflow"))
+            })?;
+        if spec.data_offsets[0].checked_add(size) != Some(spec.data_offsets[1]) {
+            return Err(invalid("tensor shape/offset byte length mismatch"));
+        }
+        ranges.push((spec.data_offsets[0], spec.data_offsets[1]));
+        tensors.insert(
+            tensor_name,
+            Tensor {
+                spec,
+                shard: name.into(),
+            },
+        );
+    }
+    ranges.sort_unstable();
+    let mut end = 0;
+    for (start, next) in ranges {
+        if start != end {
+            return Err(invalid("shard gaps or overlapping tensor ranges"));
+        }
+        end = next;
+    }
+    if payload_start.checked_add(end) != Some(file_size) {
+        return Err(invalid("shard payload is not completely covered"));
+    }
+    Ok((
+        Shard {
+            header,
+            payload_start,
+            metadata,
+        },
+        tensors,
+        end,
+    ))
+}
+
 impl Snapshot {
     pub fn inspect(root: &Path, limits: &ExportLimits) -> Result<Self> {
         Self::inspect_verified(root, limits, &BTreeMap::new())
+    }
+
+    /// Inspect a private flat replacement bundle containing ONLY the declared
+    /// safetensors file and optional strict producer selection JSON. No index,
+    /// config or tokenizer is invented. The caller pins these exact files under
+    /// the same immutability contract as indexed inputs. Filenames are confined
+    /// acquisition hints; identity binds role-labelled actual file bytes.
+    pub fn inspect_sidecar(
+        root: &Path,
+        tensor_filename: &str,
+        selection_filename: Option<&str>,
+        limits: &ExportLimits,
+    ) -> Result<Self> {
+        limits.validate()?;
+        safe_name(tensor_filename)?;
+        if !tensor_filename.ends_with(".safetensors") {
+            return Err(invalid("sidecar requires a safetensors filename"));
+        }
+        let mut names = BTreeSet::from([tensor_filename.to_string()]);
+        if let Some(name) = selection_filename {
+            safe_name(name)?;
+            if !name.ends_with(".json") || !names.insert(name.to_string()) {
+                return Err(invalid(
+                    "sidecar selection requires a distinct JSON filename",
+                ));
+            }
+        }
+        if names.len() > limits.max_files {
+            return Err(Error::Limit("sidecar file budget exceeded".into()));
+        }
+        if !fs::symlink_metadata(root)?.file_type().is_dir() {
+            return Err(invalid("sidecar root must be a non-symlink directory"));
+        }
+        let root = root.canonicalize()?;
+        let mut found = BTreeSet::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| invalid("non-UTF8 sidecar filename"))?;
+            if !names.contains(&name) || !entry.file_type()?.is_file() {
+                return Err(invalid(
+                    "sidecar bundle contains undeclared or non-regular files",
+                ));
+            }
+            found.insert(name);
+        }
+        if found != names {
+            return Err(invalid("missing declared sidecar file"));
+        }
+        let mut remaining = limits.metadata_bytes;
+        let mut selection_files = BTreeSet::new();
+        if let Some(name) = selection_filename {
+            let mut file = regular(&root, name)?;
+            let bytes = file.metadata()?.len();
+            let selection: crate::plan::SelectionManifest = serde_json::from_value(unique_json(
+                &take_metadata(&mut file, bytes, &mut remaining)?,
+            )?)?;
+            selection.validate()?;
+            selection_files.insert(name.to_string());
+        }
+        let (shard, tensors, _) =
+            inspect_shard(&root, tensor_filename, &mut remaining, limits.max_tensors)?;
+        let mut files = BTreeMap::new();
+        let mut stamps = BTreeMap::new();
+        let mut buffer = vec![0; limits.buffer_bytes];
+        for name in names {
+            stamps.insert(name.clone(), FileStamp::read(&root, &name)?);
+            files.insert(
+                name.clone(),
+                digest_reader(&mut regular(&root, &name)?, &mut buffer)?,
+            );
+        }
+        let mut roles = BTreeMap::from([("tensors", &files[tensor_filename])]);
+        if let Some(name) = selection_filename {
+            roles.insert("selection", &files[name]);
+        }
+        let identity = Digest::canonical(&("sparknest.sidecar-input-manifest.v1", roles))?;
+        Ok(Self {
+            root,
+            identity,
+            files,
+            stamps,
+            tensors,
+            selection_files,
+            shards: BTreeMap::from([(tensor_filename.into(), shard)]),
+            layout: SourceLayout::Sidecar {
+                tensor_filename: tensor_filename.into(),
+                selection_filename: selection_filename.map(str::to_string),
+            },
+        })
+    }
+
+    /// Raw sidecars can supply replacement groups, never a base/full checkpoint.
+    pub fn is_sidecar(&self) -> bool {
+        matches!(self.layout, SourceLayout::Sidecar { .. })
+    }
+
+    fn reinspect(&self, limits: &ExportLimits) -> Result<Self> {
+        match &self.layout {
+            SourceLayout::Indexed(_) => Self::inspect(&self.root, limits),
+            SourceLayout::Sidecar {
+                tensor_filename,
+                selection_filename,
+            } => Self::inspect_sidecar(
+                &self.root,
+                tensor_filename,
+                selection_filename.as_deref(),
+                limits,
+            ),
+        }
     }
 
     // Only the exporter can supply identities here. They cover either linked,
@@ -332,88 +538,24 @@ impl Snapshot {
         let mut shards = BTreeMap::new();
         let mut payload_bytes = 0u64;
         for name in shard_names {
-            let mut file = regular(&root, &name)?;
-            let file_size = file.metadata()?.len();
-            let mut prefix = [0; 8];
-            file.read_exact(&mut prefix)?;
-            let header_size = u64::from_le_bytes(prefix);
-            if header_size == 0 || header_size % 8 != 0 {
-                return Err(invalid("invalid safetensors header alignment"));
-            }
-            let payload_start = header_size
-                .checked_add(8)
-                .ok_or_else(|| invalid("header length overflow"))?;
-            if payload_start > file_size {
-                return Err(invalid("header beyond shard length"));
-            }
-            let header = take_metadata(&mut file, header_size, &mut remaining)?;
-            if header.first() != Some(&b'{') {
-                return Err(invalid("safetensors header must begin with object"));
-            }
-            let mut entries: BTreeMap<String, Value> =
-                serde_json::from_value(unique_json(&header)?)?;
-            let metadata: BTreeMap<String, String> = match entries.remove("__metadata__") {
-                Some(value) => serde_json::from_value(value)?,
-                None => BTreeMap::new(),
-            };
-            let mut ranges = Vec::new();
-            for (tensor_name, value) in entries {
-                if tensor_name.is_empty() || index.weight_map.get(&tensor_name) != Some(&name) {
+            let (shard, entries, bytes) = inspect_shard(
+                &root,
+                &name,
+                &mut remaining,
+                limits.max_tensors - tensors.len(),
+            )?;
+            for (tensor_name, tensor) in entries {
+                if index.weight_map.get(&tensor_name) != Some(&name) {
                     return Err(invalid("shard tensor missing from index or wrong shard"));
                 }
-                let spec: TensorSpec = serde_json::from_value(value)?;
-                let size =
-                    spec.shape
-                        .iter()
-                        .try_fold(dtype_bytes(&spec.dtype)?, |size, dimension| {
-                            size.checked_mul(*dimension)
-                                .ok_or_else(|| invalid("tensor size overflow"))
-                        })?;
-                if spec.data_offsets[0].checked_add(size) != Some(spec.data_offsets[1]) {
-                    return Err(invalid("tensor shape/offset byte length mismatch"));
-                }
-                ranges.push((spec.data_offsets[0], spec.data_offsets[1]));
-                if tensors
-                    .insert(
-                        tensor_name,
-                        Tensor {
-                            spec,
-                            shard: name.clone(),
-                        },
-                    )
-                    .is_some()
-                {
+                if tensors.insert(tensor_name, tensor).is_some() {
                     return Err(invalid("duplicate tensor across shards"));
                 }
-                if tensors.len() > limits.max_tensors {
-                    return Err(Error::Limit("tensor count budget exceeded".into()));
-                }
-            }
-            ranges.sort_unstable();
-            if ranges.is_empty() {
-                return Err(invalid("empty canonical shard"));
-            }
-            let mut end = 0;
-            for (start, next) in ranges {
-                if start != end {
-                    return Err(invalid("shard gaps or overlapping tensor ranges"));
-                }
-                end = next;
-            }
-            if payload_start.checked_add(end) != Some(file_size) {
-                return Err(invalid("shard payload is not completely covered"));
             }
             payload_bytes = payload_bytes
-                .checked_add(end)
+                .checked_add(bytes)
                 .ok_or_else(|| invalid("payload size overflow"))?;
-            shards.insert(
-                name,
-                Shard {
-                    header,
-                    payload_start,
-                    metadata,
-                },
-            );
+            shards.insert(name, shard);
         }
         if tensors.keys().ne(index.weight_map.keys()) {
             return Err(invalid("indexed tensor missing from shard"));
@@ -441,7 +583,7 @@ impl Snapshot {
             root,
             identity,
             files,
-            index,
+            layout: SourceLayout::Indexed(index),
             tensors,
             shards,
             selection_files,
@@ -625,11 +767,14 @@ pub fn export(
     for input in std::iter::once(base).chain(alternates.iter().copied()) {
         if config.cache.reuse_unchanged {
             input.revalidate_pins()?;
-        } else if Snapshot::inspect(&input.root, limits)?.identity != input.identity {
+        } else if input.reinspect(limits)?.identity != input.identity {
             return Err(invalid("input changed since inspection"));
         }
     }
-    let mut index = base.index.clone();
+    let SourceLayout::Indexed(base_index) = &base.layout else {
+        return Err(invalid("output requires indexed base layout"));
+    };
+    let mut index = base_index.clone();
     // Upper bound the new metadata before creating staging, with fixed-width
     // placeholder digests, so large metadata cannot bypass disk admission.
     index.metadata.insert(

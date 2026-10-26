@@ -73,9 +73,23 @@ impl Plan {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SelectionManifest {
+pub(crate) struct SelectionManifest {
     schema: String,
     groups: Vec<String>,
+}
+
+impl SelectionManifest {
+    pub(crate) fn validate(self) -> Result<BTreeSet<String>> {
+        if self.schema != "sparknest.model-selection.v1" {
+            return Err(invalid("unknown selection schema"));
+        }
+        let count = self.groups.len();
+        let groups: BTreeSet<_> = self.groups.into_iter().collect();
+        if groups.len() != count || groups.is_empty() || groups.iter().any(String::is_empty) {
+            return Err(invalid("empty or duplicate group selection"));
+        }
+        Ok(groups)
+    }
 }
 
 pub fn resolve(
@@ -87,6 +101,9 @@ pub fn resolve(
 ) -> Result<Plan> {
     config.validate()?;
     limits.validate()?;
+    if base.is_sidecar() {
+        return Err(invalid("base requires a complete indexed checkpoint"));
+    }
     if config.base.content_manifest != *base.content_manifest()
         || config.alternates.len() != alternates.len()
     {
@@ -117,6 +134,11 @@ pub fn resolve(
         if declaration.kind == SourceKind::Lora {
             return Err(Error::Unsupported("LoRA merge".into()));
         }
+        if input.is_sidecar() && declaration.kind != SourceKind::Replacement {
+            return Err(invalid(
+                "raw sidecar is only an absolute replacement source",
+            ));
+        }
         if declaration.content_manifest != *input.content_manifest() {
             return Err(invalid("alternate content identity mismatch"));
         }
@@ -143,17 +165,29 @@ pub fn resolve(
         }
         // Architecture/encoding semantics remain fixed even when the operator
         // explicitly chooses the base tokenizer or generation defaults.
-        if input.files().get("config.json") != base.files().get("config.json") {
+        if !input.is_sidecar()
+            && input.files().get("config.json") != base.files().get("config.json")
+        {
             return Err(invalid(
                 "alternate architecture/configuration differs from base",
             ));
         }
-        if config.output.non_weight_mismatch == NonWeightMismatch::Reject
+        if !input.is_sidecar()
+            && config.output.non_weight_mismatch == NonWeightMismatch::Reject
             && input.ancillary() != base.ancillary()
         {
             return Err(invalid("alternate non-weight semantics differ from base"));
         }
         let selected: BTreeSet<String> = match declaration.selection {
+            // "all" on a sparse raw replacement means all groups touched by
+            // that source inventory, never a value comparison/difference job.
+            // Whole-group validation below still refuses partial companions.
+            Selection::All if input.is_sidecar() => profile
+                .groups
+                .iter()
+                .filter(|(_, members)| members.iter().any(|name| input.tensors.contains_key(name)))
+                .map(|(group, _)| group.clone())
+                .collect(),
             Selection::All => profile.groups.keys().cloned().collect(),
             Selection::ProducerManifest => {
                 let name = declaration
@@ -166,15 +200,7 @@ pub fn resolve(
                     return Err(invalid("selected producer manifest identity mismatch"));
                 }
                 let manifest: SelectionManifest = input.read_json(name, limits)?;
-                if manifest.schema != "sparknest.model-selection.v1" {
-                    return Err(invalid("unknown selection schema"));
-                }
-                let count = manifest.groups.len();
-                let groups: BTreeSet<_> = manifest.groups.into_iter().collect();
-                if groups.len() != count || groups.is_empty() {
-                    return Err(invalid("empty or duplicate group selection"));
-                }
-                groups
+                manifest.validate()?
             }
         };
         // Validate even shadowed selections. An invalid whole-group declaration

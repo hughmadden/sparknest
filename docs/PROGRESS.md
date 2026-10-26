@@ -3,6 +3,27 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-26 — Sparse replacement input and immutable snapshot manifests
+
+- Integrated the existing hub-and-spoke fork, including configured fabric pool
+  sizes (ADR-070/071), and retained composition fencing alongside it.
+- Raw replacement bundles now use bounded strict safetensors inspection without
+  inventing an index/config/tokenizer. Identity binds actual files by role;
+  acquisition filenames stay outside preparation identity. Whole-group replacement
+  and canonical indexed export remain enforced. Exporter fixtures total 42.
+- Added atomic exact snapshot inventory/generation bindings (ADR-073). They fence
+  alias replacement, extra files, import, rename exchange, root/ancestor moves and
+  permission changes. Shared references, active users and queued reset retain the
+  bound path. Schema migration and incoming snapshot fsck cover the new tables.
+- Seven metadata cases cover inventory validation, namespace fencing, shared
+  roots, deferred reset, persistence and migration; the real three-node failover
+  test now exercises a bound output path through leader and holder restart.
+- Verification: focused tests, release build, format and all-target Clippy passed;
+  the complete workspace suite passed in the same Linux 7.0 ARM64 CPU sandbox.
+- This remains preparation infrastructure. Resource admission, managed jobs,
+  publication/qualification orchestration, API/CLI and consumer usage integration
+  are required before any serving promotion or model performance claim.
+
 
 ## 2026-10-26 — Composition contracts and artifact lifecycle foundation
 

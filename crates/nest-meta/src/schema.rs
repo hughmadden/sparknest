@@ -5,7 +5,7 @@ use std::path::Path;
 
 /// Bumped whenever the schema changes. Snapshots carry the version so a node
 /// never installs a snapshot it cannot read.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Migrations from version N to N+1, applied in order at open.
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -66,6 +66,28 @@ CREATE TABLE model_receipts (
     epoch INTEGER NOT NULL,
     receipt TEXT NOT NULL,
     PRIMARY KEY(key, epoch)
+) WITHOUT ROWID;
+"#,
+    ),
+    (
+        4,
+        r#"
+-- Exact flat namespace inventories, retained for the same lifetime as pins.
+CREATE TABLE model_snapshots (
+    key TEXT NOT NULL,
+    root INTEGER NOT NULL,
+    output INTEGER NOT NULL CHECK(output IN (0, 1)),
+    PRIMARY KEY(key, root)
+) WITHOUT ROWID;
+CREATE INDEX model_snapshots_root ON model_snapshots(root);
+CREATE UNIQUE INDEX model_snapshots_output ON model_snapshots(key) WHERE output = 1;
+CREATE TABLE model_snapshot_files (
+    key TEXT NOT NULL,
+    root INTEGER NOT NULL,
+    name BLOB NOT NULL,
+    file INTEGER NOT NULL,
+    gen INTEGER NOT NULL,
+    PRIMARY KEY(key, root, name)
 ) WITHOUT ROWID;
 "#,
     ),

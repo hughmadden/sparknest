@@ -527,7 +527,7 @@ mod schema_upgrade_tests {
             .unwrap()
             .0
             .unwrap();
-            c.execute_batch("DROP TABLE model_artifacts; DROP TABLE model_pins; DROP TABLE model_users; DROP TABLE model_receipts; PRAGMA user_version = 3; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            c.execute_batch("DROP TABLE model_snapshot_files; DROP TABLE model_snapshots; DROP TABLE model_artifacts; DROP TABLE model_pins; DROP TABLE model_users; DROP TABLE model_receipts; PRAGMA user_version = 3; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
         }
         let (meta, _) = snapshot_meta_of(&incoming).unwrap().unwrap();
         sm.install_snapshot(&meta, SnapshotFile(incoming))
@@ -610,7 +610,7 @@ mod schema_upgrade_tests {
             .await
             .unwrap();
         let before = sm.current.lock().as_ref().unwrap().path.clone();
-        for future in [true, false] {
+        for invalid in [0, 1, 2] {
             let incoming = sm.snap_dir().join("incoming-invalid.sqlite");
             {
                 let c = nest_meta::open_write(&incoming).unwrap();
@@ -620,12 +620,18 @@ mod schema_upgrade_tests {
                     [b"bad".as_slice()],
                 )
                 .unwrap();
-                if future {
+                if invalid == 0 {
                     c.pragma_update(None, "user_version", nest_meta::schema::SCHEMA_VERSION + 1)
                         .unwrap();
-                } else {
+                } else if invalid == 1 {
                     c.execute(
                         "INSERT INTO model_pins (key, file, gen) VALUES ('absent', 42, 1)",
+                        [],
+                    )
+                    .unwrap();
+                } else {
+                    c.execute(
+                        "INSERT INTO model_snapshots (key, root, output) VALUES ('absent', 42, 1)",
                         [],
                     )
                     .unwrap();

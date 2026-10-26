@@ -35,6 +35,49 @@ including headers, indexes, selection files and non-weight semantics. The
 manager must translate other verified object identities to this adapter's
 manifest contract; arbitrary source strings are acquisition hints only.
 
+Standalone sparse replacements use the new API:
+
+```rust,ignore
+Snapshot::inspect_sidecar(root, "alternate-checkpoint.safetensors", None, &limits)?;
+// Or declare the bundle's sole optional producer-selection JSON:
+Snapshot::inspect_sidecar(root, "alternate-checkpoint.safetensors", Some("groups.json"), &limits)?;
+```
+
+The root must be a private flat bundle containing **only** those declared
+regular, non-symlink files. No checkpoint config, index, tokenizer or other
+semantics are fabricated or included in its identity. Tensor and selection
+files use their existing strict bounded schemas; the optional selection file
+is validated even if the module ultimately requests `selection = "all"`.
+
+Raw content identity is SHA-256 of compact JSON for
+`["sparknest.sidecar-input-manifest.v1", roles]`, where `roles` is a sorted map
+with required `tensors` and optional `selection` entries, each a full-file
+`{bytes, digest}`. Unlike the indexed contract, raw filenames have no layout
+meaning, so both filenames and the root path are acquisition hints excluded
+from this role-based identity. Renaming declared files preserves the identity.
+The module's selected-manifest digest still must match the actual declared
+selection file. `files()` retains actual filenames for the owner's pins and
+file acquisition. `is_sidecar()` distinguishes raw bundles at the API boundary.
+
+A raw input is accepted only as `kind = "replacement"`, never as the base or
+a full checkpoint. Its typed `requires` reference is still mandatory. Missing
+non-weight semantics mean the base supplies them; indexed sources continue to
+reject incompatible present semantics. For raw `selection = "all"`, select
+every profile group touched by the raw tensor inventory and require **all**
+members of each touched group. Untouched base groups fall back. This is inventory
+selection, without comparing values, extracting differences, or using epsilons.
+A producer manifest can instead explicitly name the selected groups. Missing
+companions/tied members, unknown groups/tensors, and shape/dtype/representation
+mismatches still fail. Source ranges may differ from base ranges; export always
+uses complete canonical base shards and headers. Raw files never appear as
+output shards or overwrite base ancillary metadata.
+
+This extends `Snapshot` rather than adding a parallel adapter pipeline: raw and
+indexed inputs share one safetensors header/range validator, group resolver,
+bounded exporter and pin/revalidation rules. Full-copy reinspection dispatches
+on the original representation; reuse checks the exact declared bundle files
+under the existing immutable input and output-lifetime pin contract.
+
 Preparation keys use a versioned JSON struct and sorted maps/sets. They include
 base content, ordered alternate content/kind/selection/reference, selected
 manifest digest, profile groups, image **digest**, recipe, exact string
